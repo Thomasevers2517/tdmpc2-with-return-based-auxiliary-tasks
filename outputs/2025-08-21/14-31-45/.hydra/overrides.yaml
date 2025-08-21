@@ -1,0 +1,12 @@
+- task=cartpole-swingup
+- model_size=5
+- batch_size=8096
+- steps=500000
+- eval_freq=10000
+- enable_wandb=true
+- wandb_project=auxilary
+- wandb_entity=thomasevers9
+- save_video=true
+- compile=true
+- data_dir=/tmp
+- exp_name=cartpole-1024-compile

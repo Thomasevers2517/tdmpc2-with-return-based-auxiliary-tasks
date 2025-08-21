@@ -76,6 +76,25 @@ save_video: true
 save_agent: true
 seed: 1
 
+# ---------------------------------------------------------------------------
+# Multi-gamma auxiliary value supervision (RESEARCH FEATURE)
+# ---------------------------------------------------------------------------
+# Goal: improve representation learning by supervising additional discounted
+#       state-value predictions at multiple discount factors (gammas) WITHOUT
+#       affecting action selection, planning, or policy targets.
+# Invariants:
+#   * Primary (existing) Q ensemble remains unchanged and drives planning.
+#   * Auxiliary heads are training-only. Gradients flow into shared trunk.
+#   * When disabled or only 1 gamma is given, behavior matches baseline.
+# ---------------------------------------------------------------------------
+multi_gamma_enabled: true          # Master switch; False => ignore all other options.
+multi_gamma_gammas: []              # Ordered list of discounts [gamma_primary, gamma_aux1, ...].
+                                     # If enabled: non-empty, length ≤ 6, first SHOULD equal heuristic primary γ.
+multi_gamma_head: joint             # Head architecture: 'joint' (single Linear -> G_aux*K) or 'separate' (one Linear per aux γ).
+multi_gamma_loss_weight: 0.5        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
+multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics (heavier overhead).
+multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
+
 # convenience
 work_dir: ???
 task_title: ???
