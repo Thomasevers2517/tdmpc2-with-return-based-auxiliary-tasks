@@ -44,25 +44,24 @@ class WorldModel(nn.Module):
 		self._num_aux_gamma = 0  # number of auxiliary (non-primary) gammas
 		self._aux_joint_Qs = None      # Ensemble producing all aux gammas jointly
 		self._aux_separate_Qs = None   # ModuleList[Ensemble] per aux gamma
-		if cfg.multi_gamma_enabled:
-			gammas = cfg.multi_gamma_gammas
-			if len(gammas) > 1:
-				self._num_aux_gamma = len(gammas) - 1
-				in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
-				if cfg.multi_gamma_head == 'joint':
-					self._aux_joint_Qs = layers.Ensemble([
-						layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+		if getattr(cfg, 'multi_gamma_gammas', None):
+			gammas = cfg.multi_gamma_gammas  # auxiliary discounts only
+			self._num_aux_gamma = len(gammas)
+			in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
+			if cfg.multi_gamma_head == 'joint':
+				self._aux_joint_Qs = layers.Ensemble([
+					layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+					for _ in range(cfg.num_q)
+				])
+			elif cfg.multi_gamma_head == 'separate':
+				self._aux_separate_Qs = torch.nn.ModuleList([
+					layers.Ensemble([
+						layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
 						for _ in range(cfg.num_q)
-					])
-				elif cfg.multi_gamma_head == 'separate':
-					self._aux_separate_Qs = torch.nn.ModuleList([
-						layers.Ensemble([
-							layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
-							for _ in range(cfg.num_q)
-						]) for _ in range(self._num_aux_gamma)
-					])
-				else:
-					raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
+					]) for _ in range(self._num_aux_gamma)
+				])
+			else:
+				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
 
 		self.apply(init.weight_init)
 		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
@@ -224,14 +223,15 @@ class WorldModel(nn.Module):
 		})
 		return action, info
 
-	def Q_aux(self, z, a, task, return_type='all'):
+	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
 		"""Predict auxiliary state-action value distributions for each auxiliary gamma.
 
 		Args:
 			z (torch.Tensor): Latent states, shape (T,B,L) OR (B,L) OR (L,) analogous to Q.
 			a (torch.Tensor): Actions aligned with z in leading dims (time/batch broadcast semantics as in Q usage).
 			task: task index (multi-task only) or None.
-			return_type (str): currently only 'all' is supported for auxiliaries.
+			return_type (str): One of {'all','min','avg'} specifying raw logits or
+				reduction (min/avg over two sampled ensemble members after two-hot inversion).
 
 		Returns:
 			(torch.Tensor | None): If active, logits shaped (num_q, T, B, G_aux, K) for 'all'.
@@ -239,33 +239,33 @@ class WorldModel(nn.Module):
 		"""
 		if self._num_aux_gamma == 0:
 			return None
-		assert return_type == 'all', 'Auxiliary Q only supports return_type="all" (logits) at present.'
-		# Normalize shapes to time-major (T,B,*) like primary Q forward path expects when called in update.
+		assert not target and not detach, 'target/detach not implemented for auxiliary Q.'
+		assert return_type in {'all','min','avg'}
 		added_time = False
 		if z.ndim == 2:  # (B,L)
 			z = z.unsqueeze(0); a = a.unsqueeze(0); added_time = True
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
-		# Concat action like primary Q
 		za = torch.cat([z, a], dim=-1)
 		if self._aux_joint_Qs is not None:
-			out = self._aux_joint_Qs(za)  # (num_q, T,B,G_aux*K)
-			num_q = out.shape[0]
-			T, B = out.shape[1], out.shape[2]
+			out = self._aux_joint_Qs(za)  # (num_q,T,B,G_aux*K)
+			num_q, T, B = out.shape[0], out.shape[1], out.shape[2]
 			out = out.view(num_q, T, B, self._num_aux_gamma, self.cfg.num_bins)
-		elif self._aux_separate_Qs is not None:
-			outs = []
-			for ens in self._aux_separate_Qs:
-				outs.append(ens(za))  # (num_q, T,B,K)
-			out = torch.stack(outs, dim=3)  # (num_q, T,B,G_aux,K)
-		if added_time:
-			# retain shape consistency; caller can squeeze if needed
-			return out
-		return out
+		else:  # separate
+			outs = [ens(za) for ens in self._aux_separate_Qs]  # list[(num_q,T,B,K)]
+			out = torch.stack(outs, dim=3)  # (num_q,T,B,G_aux,K)
+		if return_type == 'all':
+			return out if not added_time else out  # keep shape
+		# Sample two ensemble heads
+		qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
+		q_logits = out[qidx]  # (2,T,B,G_aux,K)
+		q_vals = math.two_hot_inv(q_logits, self.cfg)  # (2,T,B,G_aux,1)
+		if return_type == 'min':
+			return q_vals.min(0).values  # (T,B,G_aux,1)
+		return q_vals.sum(0) / 2  # avg (T,B,G_aux,1)
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):
-		"""
-		Predict state-action value.
+		"""Predict state-action value.
 		`return_type` can be one of [`min`, `avg`, `all`]:
 			- `min`: return the minimum of two randomly subsampled Q-values.
 			- `avg`: return the average of two randomly subsampled Q-values.

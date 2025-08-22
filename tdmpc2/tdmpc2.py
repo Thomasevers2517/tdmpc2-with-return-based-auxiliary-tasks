@@ -7,6 +7,53 @@ from common.world_model import WorldModel
 from common.layers import api_model_conversion
 from tensordict import TensorDict
 
+# -----------------------------------------------------------------------------
+# File: tdmpc2.py
+# Purpose: Main TD-MPC2 agent class (model-free + model-based planning hybrid).
+#
+# Conventions & Notation (single-task unless stated multi-task):
+#   T  = horizon (cfg.horizon)
+#   B  = batch size (cfg.batch_size)
+#   A  = action_dim (cfg.action_dim)
+#   L  = latent_dim (cfg.latent_dim)
+#   K  = num_bins (distributional support for reward & Q-value regression)
+#   Qe = num_q (ensemble size for Q-functions)
+#   G_aux = number of auxiliary discounts (len(cfg.multi_gamma_gammas))
+#
+# Shapes Summary (core tensors used during update):
+#   obs              : (T+1, B, *obs_shape)            raw observations subsequence
+#   action           : (T,   B, A)                     actions aligned with first T obs
+#   reward           : (T,   B, 1)                     scalar rewards (pre two-hot projection)
+#   terminated       : (T,   B, 1)                     binary termination flags (0/1)
+#   next_z           : (T,   B, L)                     encoded latents for time steps 1..T
+#   zs               : (T+1, B, L)                     latent rollout (predicted) with zs[0] = encode(obs[0])
+#   _zs              : (T,   B, L)                     alias zs[:-1] for action-aligned states
+#   qs (primary)     : (Qe,  T, B, K)                  distributional Q logits per ensemble head
+#   td_targets       : (T,   B, K)                     primary distributional TD target (two-hot supervision)
+#   reward_preds     : (T,   B, K)                     reward prediction logits
+#   termination_pred : (T,   B, 1) (episodic only)     termination logits
+#   q_aux_logits     : (Qe,  T, B, G_aux, K)           auxiliary multi-gamma Q logits (if enabled)
+#   aux_td_targets   : (G_aux, T, B, 1)                scalar TD targets per auxiliary gamma
+#
+# Loss Terms:
+#   consistency_loss : latent prediction consistency (averaged over T)
+#   reward_loss      : distributional CE over reward bins
+#   value_loss       : distributional CE over value bins (primary)
+#   aux_value_losses : vector (G_aux,) distributional CE vs scalar targets (aux)
+#   termination_loss : BCE (episodic only)
+#   total_loss       : weighted sum including optional auxiliary mean loss
+#
+# Planner (_plan): Uses MPPI/CEM style sampling with mixture of policy prior
+# trajectories & Gaussian noise. Q-values used for value estimation via model.
+#
+# Policy Update: Optimizes expected Q (scaled) + entropy bonus along latent
+# trajectory produced by world model (not environment).
+#
+# Multi-Gamma Extension: Adds auxiliary action-value ensembles predicting
+# discounted returns for alternative γ's; training-only supervision improves
+# representation without affecting planner or policy targets directly.
+# -----------------------------------------------------------------------------
+
 
 class TDMPC2(torch.nn.Module):
 	"""
@@ -19,25 +66,48 @@ class TDMPC2(torch.nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
-		self.model = WorldModel(cfg).to(self.device)
-		self.optim = torch.optim.Adam([
+		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
+		# ------------------------------------------------------------------
+		# Optimizer parameter groups
+		# Base groups mirror original implementation; we now optionally append
+		# auxiliary Q ensemble parameters (joint or separate) so they are
+		# trained with identical learning rate / schedule semantics.
+		# NOTE: No auxiliary target networks exist yet; if added later they'd
+		# require their own soft-update call.
+		# ------------------------------------------------------------------
+		param_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
 			{'params': self.model._dynamics.parameters()},
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Qs.parameters()},
-			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []
-			 }
-		], lr=self.cfg.lr, capturable=True)
+			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
+		]
+		if getattr(self.cfg, 'multi_gamma_gammas', None) and len(self.cfg.multi_gamma_gammas) > 0:
+			# Append auxiliary ensemble params (joint or per-gamma separate ensembles)
+			if self.model._aux_joint_Qs is not None:
+				param_groups.append({'params': self.model._aux_joint_Qs.parameters()})
+			elif self.model._aux_separate_Qs is not None:
+				for ens in self.model._aux_separate_Qs:
+					param_groups.append({'params': ens.parameters()})
+		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		self.model.eval()
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
+		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda:0'
 		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
+		# Compose full gamma list internally: primary discount first + auxiliary gammas from config.
+		# New semantics: cfg.multi_gamma_gammas contains ONLY auxiliary discounts.
+		if getattr(self.cfg, 'multi_gamma_gammas', None):
+			self._all_gammas = [float(self.discount)] + list(self.cfg.multi_gamma_gammas)
+		else:
+			self._all_gammas = [float(self.discount)]
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
+		# Buffer for MPPI warm-start action mean; shape (T, A)
 		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
@@ -98,10 +168,10 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def act(self, obs, t0=False, eval_mode=False, task=None):
 		"""
-		Select an action by planning in the latent space of the world model.
+		Select an action by planning in latent space (MPPI) or by single policy prior.
 
 		Args:
-			obs (torch.Tensor): Observation from the environment.
+			obs (torch.Tensor): Observation from environment. Shape (obs_dim,) or already batched.
 			t0 (bool): Whether this is the first observation in the episode.
 			eval_mode (bool): Whether to use the mean of the action distribution.
 			task (int): Task index (only used for multi-task experiments).
@@ -122,7 +192,15 @@ class TDMPC2(torch.nn.Module):
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
-		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
+		"""Estimate value of a candidate action sequence.
+
+		Args:
+			z (B,L) latent start (B=num_samples)
+			actions (T,B,A) sampled candidate actions
+			task: optional task index
+		Returns:
+			(B,1) scalar value estimates
+		"""
 		G, discount = 0, 1
 		termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
 		for t in range(self.cfg.horizon):
@@ -150,7 +228,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
-		# Sample policy trajectories
+		# Sample policy trajectories: roll forward policy prior to seed action set
 		z = self.model.encode(obs, task)
 		if self.cfg.num_pi_trajs > 0:
 			pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
@@ -170,7 +248,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.num_pi_trajs > 0:
 			actions[:, :self.cfg.num_pi_trajs] = pi_actions
 
-		# Iterate MPPI
+		# Iterate MPPI optimization loop (update mean/std over elite trajectories)
 		for _ in range(self.cfg.iterations):
 
 			# Sample actions
@@ -197,7 +275,7 @@ class TDMPC2(torch.nn.Module):
 				mean = mean * self.model._action_masks[task]
 				std = std * self.model._action_masks[task]
 
-		# Select action
+		# Select first action from sampled distribution; add exploration noise if training
 		rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
 		actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
 		a, std = actions[0], std[0]
@@ -255,77 +333,161 @@ class TDMPC2(torch.nn.Module):
 		"""
 		action, _ = self.model.pi(next_z, task)
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
+		# Primary TD target distribution (still stored as distributional bins via CE loss)
+		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)  # (T,B,K)
+
+	@torch.no_grad()
+	def _td_target_aux(self, next_z, reward, terminated, task):
+		"""Compute auxiliary TD targets per gamma using Q_aux(min) bootstrap.
+
+		Uses a conservative (min over two sampled ensemble members) per-gamma
+		bootstrap produced internally by `Q_aux(return_type='min')`.
+
+		TODO: Potential enhancement: use full distributional auxiliary logits
+		as targets (would require adapting loss to compare distributions). Also do this in normal td target comp
+
+		Args:
+			next_z (torch.Tensor): Latent states at t+1. Shape (T,B,L).
+			reward (torch.Tensor): Immediate rewards at t. Shape (T,B,1).
+			terminated (torch.Tensor): Termination flags (T,B,1).
+			task: Task index tensor or None.
+
+		Returns:
+			(torch.Tensor | None): (G_aux,T,B,1) scalar TD targets or None if no auxiliaries.
+		"""
+		G_aux = len(self._all_gammas) - 1
+		if G_aux <= 0:
+			return None
+		action, _ = self.model.pi(next_z, task)
+		bootstrap = self.model.Q_aux(next_z, action, task, return_type='min')  # (T,B,G_aux,1) scalar per gamma (conservative)
+		if bootstrap is None:
+			return None
+		aux_targets = []
+		for g in range(G_aux):
+			gamma = self._all_gammas[g+1]
+			boot_g = bootstrap[..., g, :]  # (T,B,1)
+			aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
+		return torch.stack(aux_targets, dim=0)
 
 	def _update(self, obs, action, reward, terminated, task=None):
-		# Compute targets
+		"""Single gradient update step.
+
+		Args:
+			obs: (T+1, B, *obs_shape)
+			action: (T, B, A)
+			reward: (T, B, 1) scalar rewards
+			terminated: (T, B, 1) binary (0/1)
+			task: (optional) task index tensor for multi-task mode
+		"""
+		# ------------------------------ Targets (no grad) ------------------------------
 		with torch.no_grad():
-			next_z = self.model.encode(obs[1:], task)
-			td_targets = self._td_target(next_z, reward, terminated, task)
+			# Encode next observations (time steps 1..T) → latent sequence next_z
+			next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
+			# Distributional TD targets (primary gamma) vs Q logits
+			td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
+			# Auxiliary scalar TD targets per gamma (optional)
+			aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
 
-		# Prepare for update
+		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
-
-		# Latent rollout
-		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)
-		z = self.model.encode(obs[0], task)
+		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
+		z = self.model.encode(obs[0], task)  # initial latent (B,L)
 		zs[0] = z
-		consistency_loss = 0
-		for t, (_action, _next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):
-			z = self.model.next(z, _action, task)
-			consistency_loss = consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+		consistency_loss = 0.
+		for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
+			z = self.model.next(z, _a, task)            # model prediction z_{t+1}
+			# Consistency MSE between predicted & encoded next latent
+			consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
 			zs[t+1] = z
 
-		# Predictions
-		_zs = zs[:-1]
-		qs = self.model.Q(_zs, action, task, return_type='all')
-		reward_preds = self.model.reward(_zs, action, task)
+		# ------------------------------ Model predictions for losses ------------------------------
+		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
+		qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
+		reward_preds = self.model.reward(_zs, action, task)                 # (T,B,K)
 		if self.cfg.episodic:
-			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)
+			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)  # (T,B,1)
+		else:
+			termination_pred = None
+		# Auxiliary logits (if enabled)
+		q_aux_logits = None
+		if aux_td_targets is not None:
+			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (Qe,T,B,G_aux,K)
 
-		# Compute losses
-		reward_loss, value_loss = 0, 0
-		for t, (rew_pred_unbind, rew_unbind, td_targets_unbind, qs_unbind) in enumerate(zip(reward_preds.unbind(0), reward.unbind(0), td_targets.unbind(0), qs.unbind(1))):
-			reward_loss = reward_loss + math.soft_ce(rew_pred_unbind, rew_unbind, self.cfg).mean() * self.cfg.rho**t
-			for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
-				value_loss = value_loss + math.soft_ce(qs_unbind_unbind, td_targets_unbind, self.cfg).mean() * self.cfg.rho**t
+		# ------------------------------ Loss computation ------------------------------
+		reward_loss = 0.; value_loss = 0.
+		aux_value_losses = None
+		if q_aux_logits is not None:
+			G_aux = aux_td_targets.shape[0]
+			aux_value_losses = torch.zeros(G_aux, device=self.device)
+		for t, (rew_logit_t, reward_t, td_target_t, q_logits_t) in enumerate(zip(
+			reward_preds.unbind(0),         # (B,K) reward logits at t
+			reward.unbind(0),               # (B,1) scalar rewards at t
+			td_targets.unbind(0),           # (B,K) primary TD target (two-hot bins)
+			qs.unbind(1)                    # (Qe,B,K) ensemble logits at t
+		)):
+			# Reward CE (distributional two-hot) vs scalar reward_t
+			reward_loss = reward_loss + math.soft_ce(rew_logit_t, reward_t, self.cfg).mean() * (self.cfg.rho**t)
+			# Value ensemble CE vs distributional td_target_t
+			for q_head_logits in q_logits_t.unbind(0):  # each q_head_logits: (B,K)
+				value_loss = value_loss + math.soft_ce(q_head_logits, td_target_t, self.cfg).mean() * (self.cfg.rho**t)
+			# Auxiliary (per gamma) losses (scalar targets) if present
+			if q_aux_logits is not None:
+				q_aux_t = q_aux_logits[:, t]              # (Qe,B,G_aux,K)
+				aux_targets_t = aux_td_targets[:, t]      # (G_aux,B,1)
+				for g in range(G_aux):
+					q_aux_tg = q_aux_t[:, :, g, :]         # (Qe,B,K)
+					aux_target_g = aux_targets_t[g]        # (B,1)
+					for q_head_logits in q_aux_tg.unbind(0):
+						loss_g = math.soft_ce(q_head_logits, aux_target_g, self.cfg).mean()
+						aux_value_losses[g] = aux_value_losses[g] + loss_g * (self.cfg.rho**t)
 
+		# Normalize losses
 		consistency_loss = consistency_loss / self.cfg.horizon
 		reward_loss = reward_loss / self.cfg.horizon
+		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
 		if self.cfg.episodic:
 			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
 		else:
-			termination_loss = 0.
-		value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
+			termination_loss = torch.tensor(0., device=self.device)
+		if aux_value_losses is not None:
+			aux_value_losses = aux_value_losses / (self.cfg.horizon * self.cfg.num_q)  # normalize like primary value
+			aux_value_loss_mean = aux_value_losses.mean()
+		else:
+			aux_value_loss_mean = torch.tensor(0., device=self.device)
+
+		# Total loss (auxiliary added with its own weight separate from value_coef)
 		total_loss = (
 			self.cfg.consistency_coef * consistency_loss +
 			self.cfg.reward_coef * reward_loss +
 			self.cfg.termination_coef * termination_loss +
-			self.cfg.value_coef * value_loss
+			self.cfg.value_coef * value_loss +
+			self.cfg.multi_gamma_loss_weight * aux_value_loss_mean
 		)
 
-		# Update model
+		# ------------------------------ Backprop & updates ------------------------------
 		total_loss.backward()
 		grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
-		self.optim.step()
-		self.optim.zero_grad(set_to_none=True)
+		self.optim.step(); self.optim.zero_grad(set_to_none=True)
 
-		# Update policy
+		# Policy update (detached latent sequence)
 		pi_info = self.update_pi(zs.detach(), task)
-
-		# Update target Q-functions
 		self.model.soft_update_target_Q()
 
-		# Return training statistics
+		# ------------------------------ Logging tensor dict ------------------------------
 		self.model.eval()
 		info = TensorDict({
 			"consistency_loss": consistency_loss,
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
+			"aux_value_loss_mean": aux_value_loss_mean,
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
 			"grad_norm": grad_norm,
 		})
+		if aux_value_losses is not None:
+			for g, loss_g in enumerate(aux_value_losses):
+				gamma_val = self._all_gammas[g+1]
+				info.update({f"aux_value_loss/g{g}_gamma{gamma_val:.4f}": loss_g})
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]))
 		info.update(pi_info)

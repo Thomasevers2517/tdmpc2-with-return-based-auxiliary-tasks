@@ -87,9 +87,8 @@ seed: 1
 #   * Auxiliary heads are training-only. Gradients flow into shared trunk.
 #   * When disabled or only 1 gamma is given, behavior matches baseline.
 # ---------------------------------------------------------------------------
-multi_gamma_enabled: true          # Master switch; False => ignore all other options.
-multi_gamma_gammas: []              # Ordered list of discounts [gamma_primary, gamma_aux1, ...].
-                                     # If enabled: non-empty, length ≤ 6, first SHOULD equal heuristic primary γ.
+multi_gamma_gammas: []              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
+                                     # Non-empty length ≤ 6. Primary discount auto-prepended internally.
 multi_gamma_head: joint             # Head architecture: 'joint' (single Linear -> G_aux*K) or 'separate' (one Linear per aux γ).
 multi_gamma_loss_weight: 0.5        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
 multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics (heavier overhead).

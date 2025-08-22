@@ -1,0 +1,71 @@
+# Weights & Biases sweep config for multi-gamma auxiliary experiments
+# Sweep dimensions:
+#   1. Number & values of auxiliary gammas (list)
+#   2. multi_gamma_loss_weight
+#   3. Baseline case (no auxiliaries)
+#
+# Fixed settings (as per request):
+#   task = cartpole-swingup
+#   model_size = 5
+#   batch_size = 8096
+#   steps = 5000
+#   compile = true
+#   seed = 1 (fixed)
+#
+# Notes:
+# - Primary discount is derived heuristically; auxiliary list should NOT repeat it.
+# - Baseline included via multi_gamma_enabled=false.
+# - For multi_gamma_loss_weight=0 we still enable auxiliaries to isolate purely representation effect with zero gradient weight.
+# - Use command line override variables; Hydra parses flattened keys.
+#
+# Launch example:
+#   wandb sweep wandb_sweeps/multi_gamma_sweep.yaml
+#   wandb agent <entity>/<project>/<sweep_id>
+# Ensure train.py handles these CLI args (already supported via Hydra overrides).
+
+program: tdmpc2/train.py
+method: random
+command:
+  - ${env}
+  - /space/thomasevers/conda-envs/tdmpc2/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/return_mean
+  goal: maximize
+parameters:
+  # Baseline: supply empty list (no auxiliaries).
+  multi_gamma_gammas:
+    values:
+      - []
+      - [0.90]
+      - [0.90, 0.95]
+      - [0.90, 0.95, 0.985]
+  multi_gamma_loss_weight:
+    values: [0.0, 0.01, 0.1, 1.0]
+
+  # Fixed / near-fixed (kept as constants but exposed for clarity)
+  task:
+    value: cartpole-swingup
+  model_size:
+    value: 5
+  batch_size:
+    value: 8096
+  steps:
+    value: 5000
+  eval_freq:
+    value: 1000
+  compile:
+    value: true
+  seed:
+    value: 1
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: auxilary
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+# Baseline runs use multi_gamma_gammas=[] (no auxiliary discounts).

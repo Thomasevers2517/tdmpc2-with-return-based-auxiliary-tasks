@@ -86,8 +86,7 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# sets defaults; here we just guarantee presence & perform lightweight
 	# static validation that does not depend on the agent state.
 	# Added keys:
-	#   multi_gamma_enabled          : master boolean switch
-	#   multi_gamma_gammas           : list[float] of discount factors (first should match primary γ)
+	#   multi_gamma_gammas           : list[float] of *auxiliary* discount factors (primary excluded)
 	#   multi_gamma_head             : 'joint' | 'separate' head style
 	#   multi_gamma_loss_weight      : λ applied to mean auxiliary loss (excludes primary)
 	#   multi_gamma_debug_logging    : toggles verbose diagnostics
@@ -95,8 +94,6 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# NOTE: Actual assertion that gammas[0] == primary discount occurs later
 	# in the agent (where the computed heuristic discount is accessible).
 	# ----------------------------------------------------------------------
-	if not hasattr(cfg, 'multi_gamma_enabled'):
-		cfg.multi_gamma_enabled = False
 	if not hasattr(cfg, 'multi_gamma_gammas'):
 		cfg.multi_gamma_gammas = []
 	if not hasattr(cfg, 'multi_gamma_head'):
@@ -109,21 +106,9 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		cfg.multi_gamma_log_num_examples = 8
 
 	# Basic syntactic validation (cannot depend on agent internals yet)
-	if cfg.multi_gamma_enabled:
-		gammas = list(cfg.multi_gamma_gammas) if cfg.multi_gamma_gammas is not None else []
-		assert len(gammas) > 0, 'multi_gamma_enabled=True but multi_gamma_gammas is empty.'
-		assert len(gammas) <= 6, f'multi_gamma supports at most 6 gammas (got {len(gammas)}).'
-		# If only one gamma provided we keep it for reproducibility but emit a note.
-		if len(gammas) == 1:
-			print('[multi_gamma] Only one gamma provided; feature acts as baseline (no auxiliary heads).')
-		# Head architecture sanity check
+	if hasattr(cfg, 'multi_gamma_gammas') and cfg.multi_gamma_gammas:
+		gammas = list(cfg.multi_gamma_gammas)
+		assert len(gammas) <= 6, f'multi_gamma supports at most 6 auxiliary gammas (got {len(gammas)}).'
 		assert cfg.multi_gamma_head in {'joint', 'separate'}, f"Invalid multi_gamma_head {cfg.multi_gamma_head}."
-		# Soft check: compute heuristic primary discount and warn if mismatch.
-		# (We cannot fail hard here because user might intentionally deviate.)
-		if not cfg.multitask and len(gammas) > 0:
-			frac = cfg.episode_length / cfg.discount_denom
-			primary_discount = min(max((frac - 1) / (frac), cfg.discount_min), cfg.discount_max)
-			if abs(gammas[0] - primary_discount) > 1e-6:
-				print(f"[multi_gamma][warning] First gamma {gammas[0]} != primary discount heuristic {primary_discount:.6f}. Will re-check inside agent initialization.")
 
 	return cfg_to_dataclass(cfg)
