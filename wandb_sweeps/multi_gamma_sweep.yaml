@@ -8,9 +8,9 @@
 #   task = cartpole-swingup
 #   model_size = 5
 #   batch_size = 8096
-#   steps = 5000
+#   steps = 25000
 #   compile = true
-#   seed = 1 (fixed)
+#   seed = (random per run; we omit fixed seed so each agent gets a different seed via Python random if not overridden)
 #
 # Notes:
 # - Primary discount is derived heuristically; auxiliary list should NOT repeat it.
@@ -40,9 +40,8 @@ parameters:
       - []
       - [0.90]
       - [0.90, 0.95]
-      - [0.90, 0.95, 0.985]
   multi_gamma_loss_weight:
-    values: [0.0, 0.01, 0.1, 1.0]
+    values: [0.01, 0.1, 1.0]
 
   # Fixed / near-fixed (kept as constants but exposed for clarity)
   task:
@@ -52,13 +51,16 @@ parameters:
   batch_size:
     value: 8096
   steps:
-    value: 5000
+    value: 25000
   eval_freq:
     value: 1000
   compile:
     value: true
-  seed:
-    value: 1
+  # Omit explicit seed to allow randomness; if Hydra requires presence, you can also supply a distribution.
+  # seed:
+  #   distribution: int_uniform
+  #   min: 1
+  #   max: 1000000
   enable_wandb:
     value: true
   wandb_project:
