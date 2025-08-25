@@ -32,7 +32,7 @@ from tensordict import TensorDict
 #   td_targets       : (T,   B, K)                     primary distributional TD target (two-hot supervision)
 #   reward_preds     : (T,   B, K)                     reward prediction logits
 #   termination_pred : (T,   B, 1) (episodic only)     termination logits
-#   q_aux_logits     : (Qe,  T, B, G_aux, K)           auxiliary multi-gamma Q logits (if enabled)
+#   q_aux_logits     : (T, B, G_aux, K)                auxiliary multi-gamma Q logits (if enabled; no ensemble)
 #   aux_td_targets   : (G_aux, T, B, 1)                scalar TD targets per auxiliary gamma
 #
 # Loss Terms:
@@ -84,12 +84,12 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
 		]
 		if getattr(self.cfg, 'multi_gamma_gammas', None) and len(self.cfg.multi_gamma_gammas) > 0:
-			# Append auxiliary ensemble params (joint or per-gamma separate ensembles)
+			# Append auxiliary head params (single heads, not ensembles)
 			if self.model._aux_joint_Qs is not None:
 				param_groups.append({'params': self.model._aux_joint_Qs.parameters()})
 			elif self.model._aux_separate_Qs is not None:
-				for ens in self.model._aux_separate_Qs:
-					param_groups.append({'params': ens.parameters()})
+				for head in self.model._aux_separate_Qs:
+					param_groups.append({'params': head.parameters()})
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		self.model.eval()
@@ -359,7 +359,7 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 		action, _ = self.model.pi(next_z, task)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='min')  # (T,B,G_aux,1) scalar per gamma (conservative)
+		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg')  # (T,B,G_aux,1) scalar per gamma (single head)
 		if bootstrap is None:
 			return None
 		aux_targets = []
@@ -411,7 +411,7 @@ class TDMPC2(torch.nn.Module):
 		# Auxiliary logits (if enabled)
 		q_aux_logits = None
 		if aux_td_targets is not None:
-			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (Qe,T,B,G_aux,K)
+			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (T,B,G_aux,K)
 
 		# ------------------------------ Loss computation ------------------------------
 		reward_loss = 0.; value_loss = 0.
@@ -432,14 +432,13 @@ class TDMPC2(torch.nn.Module):
 				value_loss = value_loss + math.soft_ce(q_head_logits, td_target_t, self.cfg).mean() * (self.cfg.rho**t)
 			# Auxiliary (per gamma) losses (scalar targets) if present
 			if q_aux_logits is not None:
-				q_aux_t = q_aux_logits[:, t]              # (Qe,B,G_aux,K)
+				q_aux_t = q_aux_logits[t]                # (B,G_aux,K)
 				aux_targets_t = aux_td_targets[:, t]      # (G_aux,B,1)
 				for g in range(G_aux):
-					q_aux_tg = q_aux_t[:, :, g, :]         # (Qe,B,K)
+					q_aux_tg = q_aux_t[:, g, :]            # (B,K)
 					aux_target_g = aux_targets_t[g]        # (B,1)
-					for q_head_logits in q_aux_tg.unbind(0):
-						loss_g = math.soft_ce(q_head_logits, aux_target_g, self.cfg).mean()
-						aux_value_losses[g] = aux_value_losses[g] + loss_g * (self.cfg.rho**t)
+					loss_g = math.soft_ce(q_aux_tg, aux_target_g, self.cfg).mean()
+					aux_value_losses[g] = aux_value_losses[g] + loss_g * (self.cfg.rho**t)
 
 		# Normalize losses
 		consistency_loss = consistency_loss / self.cfg.horizon
@@ -450,7 +449,7 @@ class TDMPC2(torch.nn.Module):
 		else:
 			termination_loss = torch.tensor(0., device=self.device)
 		if aux_value_losses is not None:
-			aux_value_losses = aux_value_losses / (self.cfg.horizon * self.cfg.num_q)  # normalize like primary value
+			aux_value_losses = aux_value_losses / self.cfg.horizon  # no ensemble normalization
 			aux_value_loss_mean = aux_value_losses.mean()
 		else:
 			aux_value_loss_mean = torch.tensor(0., device=self.device)

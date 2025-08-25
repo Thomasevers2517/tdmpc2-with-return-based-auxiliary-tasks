@@ -45,7 +45,7 @@ parameters:
 
   # Task sweep: compare two harder dynamics tasks under pixel (rgb) observations
   task:
-    values: [acrobot-swingup, reacher-easy]
+     values: [acrobot-swingup] #, reacher-easy]
 
   # Fixed / near-fixed
   model_size:

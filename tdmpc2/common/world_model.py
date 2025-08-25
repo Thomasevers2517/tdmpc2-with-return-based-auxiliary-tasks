@@ -30,35 +30,28 @@ class WorldModel(nn.Module):
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
 
 		# ------------------------------------------------------------------
-		# Auxiliary multi-gamma action-value ensembles (training-only)
-		# User requirement: behave ANALOGOUS to primary Q ensemble (_Qs).
+		# Auxiliary multi-gamma action-value heads (training-only)
+		# Simplified (no ensemble dimension) per user request.
 		# We construct either:
-		#   joint: a single Ensemble whose per-member MLP outputs (G_aux * K)
-		#          logits for all auxiliary gammas, reshaped to (G_aux, K).
-		#   separate: a ModuleList of Ensembles, one per auxiliary gamma,
-		#            each mirroring primary architecture (num_q members).
-		# Primary planner/policy continue to consume ONLY the primary (_Qs).
-		# No target networks for auxiliaries (not used for bootstrapping);
-		# if later needed, can mirror target/detach mechanism.
+		#   joint: a single MLP outputting (G_aux * K) logits reshaped to (G_aux,K)
+		#   separate: ModuleList of G_aux MLP heads each outputting K logits
+		# These heads are used only for auxiliary supervision and never for
+		# planning or policy bootstrapping. Therefore, we do not maintain
+		# target networks or ensembles (min/avg collapse to identity).
 		# ------------------------------------------------------------------
-		self._num_aux_gamma = 0  # number of auxiliary (non-primary) gammas
-		self._aux_joint_Qs = None      # Ensemble producing all aux gammas jointly
-		self._aux_separate_Qs = None   # ModuleList[Ensemble] per aux gamma
+		self._num_aux_gamma = 0
+		self._aux_joint_Qs = None      # now a single MLP head (not an Ensemble)
+		self._aux_separate_Qs = None   # ModuleList[MLP]
 		if getattr(cfg, 'multi_gamma_gammas', None):
-			gammas = cfg.multi_gamma_gammas  # auxiliary discounts only
+			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
 			in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Qs = layers.Ensemble([
-					layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
-					for _ in range(cfg.num_q)
-				])
+				self._aux_joint_Qs = layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
 				self._aux_separate_Qs = torch.nn.ModuleList([
-					layers.Ensemble([
-						layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
-						for _ in range(cfg.num_q)
-					]) for _ in range(self._num_aux_gamma)
+					layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
+					for _ in range(self._num_aux_gamma)
 				])
 			else:
 				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
@@ -224,45 +217,34 @@ class WorldModel(nn.Module):
 		return action, info
 
 	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
-		"""Predict auxiliary state-action value distributions for each auxiliary gamma.
+		"""Predict auxiliary state-action value distributions (no ensemble).
 
 		Args:
-			z (torch.Tensor): Latent states, shape (T,B,L) OR (B,L) OR (L,) analogous to Q.
-			a (torch.Tensor): Actions aligned with z in leading dims (time/batch broadcast semantics as in Q usage).
-			task: task index (multi-task only) or None.
-			return_type (str): One of {'all','min','avg'} specifying raw logits or
-				reduction (min/avg over two sampled ensemble members after two-hot inversion).
-
-		Returns:
-			(torch.Tensor | None): If active, logits shaped (num_q, T, B, G_aux, K) for 'all'.
-			None if no auxiliary gammas configured.
+			z: (T,B,L) or (B,L) latent states
+			a: aligned actions
+			return_type: 'all' -> logits (T,B,G_aux,K); 'min'/'avg' -> scalar values (T,B,G_aux,1)
 		"""
 		if self._num_aux_gamma == 0:
 			return None
 		assert not target and not detach, 'target/detach not implemented for auxiliary Q.'
 		assert return_type in {'all','min','avg'}
 		added_time = False
-		if z.ndim == 2:  # (B,L)
+		if z.ndim == 2:
 			z = z.unsqueeze(0); a = a.unsqueeze(0); added_time = True
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
 		za = torch.cat([z, a], dim=-1)
 		if self._aux_joint_Qs is not None:
-			out = self._aux_joint_Qs(za)  # (num_q,T,B,G_aux*K)
-			num_q, T, B = out.shape[0], out.shape[1], out.shape[2]
-			out = out.view(num_q, T, B, self._num_aux_gamma, self.cfg.num_bins)
-		else:  # separate
-			outs = [ens(za) for ens in self._aux_separate_Qs]  # list[(num_q,T,B,K)]
-			out = torch.stack(outs, dim=3)  # (num_q,T,B,G_aux,K)
+			out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+			T, B = out.shape[0], out.shape[1]
+			out = out.view(T, B, self._num_aux_gamma, self.cfg.num_bins)
+		else:
+			outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
+			out = torch.stack(outs, dim=2)  # (T,B,G_aux,K)
 		if return_type == 'all':
-			return out if not added_time else out  # keep shape
-		# Sample two ensemble heads
-		qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
-		q_logits = out[qidx]  # (2,T,B,G_aux,K)
-		q_vals = math.two_hot_inv(q_logits, self.cfg)  # (2,T,B,G_aux,1)
-		if return_type == 'min':
-			return q_vals.min(0).values  # (T,B,G_aux,1)
-		return q_vals.sum(0) / 2  # avg (T,B,G_aux,1)
+			return out
+		vals = math.two_hot_inv(out, self.cfg)  # (T,B,G_aux,1)
+		return vals  # 'min'/'avg' identical with single head
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):
 		"""Predict state-action value.
