@@ -37,10 +37,9 @@ parameters:
   # Baseline: supply empty list (no auxiliaries).
   multi_gamma_gammas:
     values:
-      - []
-      - [0.90]
+      # - []
       - [0.90, 0.95]
-      - [0.90, 0.95, 0.80, 0.99]
+      
   multi_gamma_loss_weight:
     values: [0.1, 0.5]
 
