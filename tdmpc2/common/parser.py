@@ -1,5 +1,7 @@
 import dataclasses
 import re
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +56,14 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			pass
 
 	# Convenience
-	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / cfg.task / str(cfg.seed) / cfg.exp_name
+	# Logging directory structure: logs/<timestamp>/<task>/<seed>/<exp_name>
+	# Optional override: set env LOG_TIMESTAMP to reuse same timestamp across multiple processes.
+	log_ts = os.environ.get('LOG_TIMESTAMP')
+	if not log_ts:
+		log_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+		os.environ['LOG_TIMESTAMP'] = log_ts  # propagate to child processes
+	# Note: we avoid attaching new attribute (log_timestamp) to cfg to keep struct safety.
+	cfg.work_dir = Path(hydra.utils.get_original_cwd()) / 'logs' / log_ts / cfg.task / str(cfg.seed) / cfg.exp_name
 	cfg.task_title = cfg.task.replace("-", " ").title()
 	cfg.bin_size = (cfg.vmax - cfg.vmin) / (cfg.num_bins-1) # Bin size for discrete regression
 

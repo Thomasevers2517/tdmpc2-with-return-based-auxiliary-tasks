@@ -45,7 +45,7 @@ parameters:
 
   # Task sweep: compare two harder dynamics tasks under pixel (rgb) observations
   task:
-     values: [acrobot-swingup] #, reacher-easy]
+     values: [cheetah-run, reacher-easy, walker-run]
 
   # Fixed / near-fixed
   model_size:
@@ -55,9 +55,9 @@ parameters:
   batch_size:
     value: 256
   steps:
-    value: 250000
+    value: 1000000
   eval_freq:
-    value: 1000
+    value: 25000
   compile:
     value: true
   seed:
