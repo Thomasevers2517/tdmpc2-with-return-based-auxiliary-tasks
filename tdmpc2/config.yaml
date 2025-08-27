@@ -76,9 +76,8 @@ save_video: true
 save_agent: true
 seed: 1
 
-# debug / profiling (disabled by default to keep torch.compile graphs clean)
-debug_logging: false           # If true: disable compile, record per-section timings + tensor summaries.
-debug_log_filename: debug.log  # Placed under work_dir/wandb/<file>; auto-created.
+
+nvtx_profiler: false           # If true: add lightweight NVTX record_function ranges (disables compile for clarity).
 
 # ---------------------------------------------------------------------------
 # Multi-gamma auxiliary value supervision (RESEARCH FEATURE)

@@ -15,6 +15,7 @@ from common.seed import set_seed
 from common.buffer import Buffer
 from envs import make_env
 from tdmpc2 import TDMPC2
+from torch.autograd.profiler import emit_nvtx
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
@@ -50,13 +51,23 @@ def train(cfg: dict):
 	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
 
 	trainer_cls = OfflineTrainer if cfg.multitask else OnlineTrainer
-	trainer = trainer_cls(
-		cfg=cfg,
-		env=make_env(cfg),
-		agent=TDMPC2(cfg),
-		buffer=Buffer(cfg),
-		logger=Logger(cfg),
-	)
+	if getattr(cfg, 'nvtx_profiler', False):
+		with emit_nvtx():
+			trainer = trainer_cls(
+				cfg=cfg,
+				env=make_env(cfg),
+				agent=TDMPC2(cfg),
+				buffer=Buffer(cfg),
+				logger=Logger(cfg),
+			)
+	else:
+		trainer = trainer_cls(
+			cfg=cfg,
+			env=make_env(cfg),
+			agent=TDMPC2(cfg),
+			buffer=Buffer(cfg),
+			logger=Logger(cfg),
+		)
 	trainer.train()
 	print('\nTraining completed successfully')
 
