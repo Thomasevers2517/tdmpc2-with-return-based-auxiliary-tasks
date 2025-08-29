@@ -60,6 +60,8 @@ def train(cfg: dict):
 				buffer=Buffer(cfg),
 				logger=Logger(cfg),
 			)
+			trainer.train()
+			print('\nTraining completed successfully')
 	else:
 		trainer = trainer_cls(
 			cfg=cfg,
@@ -68,8 +70,9 @@ def train(cfg: dict):
 			buffer=Buffer(cfg),
 			logger=Logger(cfg),
 		)
-	trainer.train()
-	print('\nTraining completed successfully')
+		trainer.train()
+		print('\nTraining completed successfully')
+		
 
 
 if __name__ == '__main__':
