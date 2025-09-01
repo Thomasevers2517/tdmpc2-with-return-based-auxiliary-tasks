@@ -41,7 +41,7 @@ parameters:
       - [0.90, 0.95]
       
   multi_gamma_loss_weight:
-    values: [0.1, 0.5]
+    values: [0.1, 0.5, 2]
 
   # Task sweep: compare two harder dynamics tasks under pixel (rgb) observations
   task:
