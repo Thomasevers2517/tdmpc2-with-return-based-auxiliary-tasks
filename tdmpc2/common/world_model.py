@@ -68,10 +68,24 @@ class WorldModel(nn.Module):
 		self._detach_Qs_params = TensorDictParams(self._Qs.params.data, no_convert=True)
 		self._target_Qs_params = TensorDictParams(self._Qs.params.data.clone(), no_convert=True)
 
-		# Create modules
+		self._detach_aux_joint_Qs_params = TensorDictParams(self._aux_joint_Qs.params.data, no_convert=True) 
+		self._target_aux_joint_Qs_params = TensorDictParams(self._aux_joint_Qs.params.data.clone(), no_convert=True)
+
+		self._detach_aux_separate_Qs_params = TensorDictParams(self._aux_separate_Qs.params.data, no_convert=True)
+		self._target_aux_separate_Qs_params = TensorDictParams(self._aux_separate_Qs.params.data.clone(), no_convert=True)
+
+  
 		with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
 			self._detach_Qs = deepcopy(self._Qs)
 			self._target_Qs = deepcopy(self._Qs)
+
+		with self._detach_aux_joint_Qs_params.data.to("meta").to_module(self._aux_joint_Qs.module):
+			self._detach_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
+			self._target_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
+   
+		with self._detach_aux_separate_Qs_params.data.to("meta").to_module(self._aux_separate_Qs.module):
+			self._detach_aux_separate_Qs = deepcopy(self._aux_separate_Qs)
+			self._target_aux_separate_Qs = deepcopy(self._aux_separate_Qs)	
 
 		# Assign params to modules
 		# We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
@@ -79,6 +93,16 @@ class WorldModel(nn.Module):
 		self._detach_Qs.__dict__["params"] = self._detach_Qs_params
 		delattr(self._target_Qs, "params")
 		self._target_Qs.__dict__["params"] = self._target_Qs_params
+  
+		delattr(self._detach_aux_joint_Qs, "params")
+		self._detach_aux_joint_Qs.__dict__["params"] = self._detach_aux_joint
+		delattr(self._target_aux_joint_Qs, "params")
+		self._target_aux_joint_Qs.__dict__["params"] = self._target_aux_joint_Qs_params
+  
+		delattr(self._detach_aux_separate_Qs, "params")
+		self._detach_aux_separate_Qs.__dict__["params"] = self._detach_aux_separate_Qs_params
+		delattr(self._target_aux_separate_Qs, "params")
+
 
 	def __repr__(self):
 		repr = 'TD-MPC2 World Model\n'
@@ -110,6 +134,9 @@ class WorldModel(nn.Module):
 		"""
 		super().train(mode)
 		self._target_Qs.train(False)
+  		self._target_aux_joint_Qs.train(False)
+ 		self._target_aux_separate_Qs.train(False)
+   
 		return self
 
 	def soft_update_target_Q(self):
@@ -117,6 +144,8 @@ class WorldModel(nn.Module):
 		Soft-update target Q-networks using Polyak averaging.
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
+		self._target_aux_joint_Qs_params.lerp_(self._detach_aux_joint_Qs_params, self.cfg.tau)
+		self._target_aux_separate_Qs_params.lerp_(self._detach_aux_separate_Qs_params, self.cfg.tau)
 
 	def task_emb(self, x, task):
 		"""
@@ -235,7 +264,14 @@ class WorldModel(nn.Module):
 			z = self.task_emb(z, task)
 		za = torch.cat([z, a], dim=-1)
 		if self._aux_joint_Qs is not None:
-			out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+      
+			if target:
+				out = self._target_aux_joint_Qs(za)
+			elif detach:
+				out = self._detach_aux_joint_Qs(za)
+			else:
+				out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+    
 			T, B = out.shape[0], out.shape[1]
 			out = out.view(T, B, self._num_aux_gamma, self.cfg.num_bins)
 		else:
