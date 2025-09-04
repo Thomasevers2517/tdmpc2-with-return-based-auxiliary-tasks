@@ -1,8 +1,0 @@
-- task=walker-walk
-- model_size=5
-- steps=20000
-- eval_freq=10000
-- enable_wandb=false
-- compile=false
-- data_dir=/tmp
-- exp_name=smoke-walker

@@ -1,6 +1,0 @@
-- task=cheetah-run
-- steps=20000
-- eval_freq=5000
-- save_video=false
-- enable_wandb=false
-- compile=false
