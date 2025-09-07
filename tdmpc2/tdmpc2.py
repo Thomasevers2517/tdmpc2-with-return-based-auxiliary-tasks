@@ -359,7 +359,7 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 		action, _ = self.model.pi(next_z, task)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg["auxiliary_value_ema"])  # (T,B,G_aux,1) scalar per gamma (single head)
+		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (T,B,G_aux,1) scalar per gamma (single head)
 		if bootstrap is None:
 			return None
 		aux_targets = []

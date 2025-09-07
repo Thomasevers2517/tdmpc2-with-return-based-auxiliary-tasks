@@ -42,6 +42,11 @@ class WorldModel(nn.Module):
 		self._num_aux_gamma = 0
 		self._aux_joint_Qs = None      # now a single MLP head (not an Ensemble)
 		self._aux_separate_Qs = None   # ModuleList[MLP]
+		self._target_aux_joint_Qs = None
+		self._target_aux_separate_Qs = None
+		self._detach_aux_joint_Qs = None
+		self._detach_aux_separate_Qs = None	
+  
 		if getattr(cfg, 'multi_gamma_gammas', None):
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
@@ -67,25 +72,10 @@ class WorldModel(nn.Module):
 		# Create params
 		self._detach_Qs_params = TensorDictParams(self._Qs.params.data, no_convert=True)
 		self._target_Qs_params = TensorDictParams(self._Qs.params.data.clone(), no_convert=True)
-
-		self._detach_aux_joint_Qs_params = TensorDictParams(self._aux_joint_Qs.params.data, no_convert=True) 
-		self._target_aux_joint_Qs_params = TensorDictParams(self._aux_joint_Qs.params.data.clone(), no_convert=True)
-
-		self._detach_aux_separate_Qs_params = TensorDictParams(self._aux_separate_Qs.params.data, no_convert=True)
-		self._target_aux_separate_Qs_params = TensorDictParams(self._aux_separate_Qs.params.data.clone(), no_convert=True)
-
   
 		with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
 			self._detach_Qs = deepcopy(self._Qs)
 			self._target_Qs = deepcopy(self._Qs)
-
-		with self._detach_aux_joint_Qs_params.data.to("meta").to_module(self._aux_joint_Qs.module):
-			self._detach_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
-			self._target_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
-   
-		with self._detach_aux_separate_Qs_params.data.to("meta").to_module(self._aux_separate_Qs.module):
-			self._detach_aux_separate_Qs = deepcopy(self._aux_separate_Qs)
-			self._target_aux_separate_Qs = deepcopy(self._aux_separate_Qs)	
 
 		# Assign params to modules
 		# We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
@@ -93,16 +83,22 @@ class WorldModel(nn.Module):
 		self._detach_Qs.__dict__["params"] = self._detach_Qs_params
 		delattr(self._target_Qs, "params")
 		self._target_Qs.__dict__["params"] = self._target_Qs_params
-  
-		delattr(self._detach_aux_joint_Qs, "params")
-		self._detach_aux_joint_Qs.__dict__["params"] = self._detach_aux_joint
-		delattr(self._target_aux_joint_Qs, "params")
-		self._target_aux_joint_Qs.__dict__["params"] = self._target_aux_joint_Qs_params
-  
-		delattr(self._detach_aux_separate_Qs, "params")
-		self._detach_aux_separate_Qs.__dict__["params"] = self._detach_aux_separate_Qs_params
-		delattr(self._target_aux_separate_Qs, "params")
 
+		# Auxiliary heads are plain nn.Modules. Mirror main Q behavior:
+		# - Create a frozen target copy via deepcopy
+		# - Use the online head under torch.no_grad() for detach
+		if self._aux_joint_Qs is not None:
+			self._target_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
+			for p in self._target_aux_joint_Qs.parameters():
+				p.requires_grad_(False)
+			self._detach_aux_joint_Qs = self._aux_joint_Qs  # detach path uses no_grad in forward
+		elif self._aux_separate_Qs is not None:
+			self._target_aux_separate_Qs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Qs])
+			for h in self._target_aux_separate_Qs:
+				for p in h.parameters():
+					p.requires_grad_(False)
+			self._detach_aux_separate_Qs = self._aux_separate_Qs  # detach path uses no_grad in forward
+   
 
 	def __repr__(self):
 		repr = 'TD-MPC2 World Model\n'
@@ -134,9 +130,11 @@ class WorldModel(nn.Module):
 		"""
 		super().train(mode)
 		self._target_Qs.train(False)
-  		self._target_aux_joint_Qs.train(False)
- 		self._target_aux_separate_Qs.train(False)
-   
+		if self._target_aux_joint_Qs is not None:
+			self._target_aux_joint_Qs.train(False)
+		if self._target_aux_separate_Qs is not None:
+			for h in self._target_aux_separate_Qs:
+				h.train(False)
 		return self
 
 	def soft_update_target_Q(self):
@@ -144,8 +142,16 @@ class WorldModel(nn.Module):
 		Soft-update target Q-networks using Polyak averaging.
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
-		self._target_aux_joint_Qs_params.lerp_(self._detach_aux_joint_Qs_params, self.cfg.tau)
-		self._target_aux_separate_Qs_params.lerp_(self._detach_aux_separate_Qs_params, self.cfg.tau)
+		# Polyak average auxiliary target heads (per-parameter lerp)
+		if self._target_aux_joint_Qs is not None:
+			with torch.no_grad():
+				for pt, p in zip(self._target_aux_joint_Qs.parameters(), self._aux_joint_Qs.parameters()):
+					pt.data.lerp_(p.data, self.cfg.tau)
+		if self._target_aux_separate_Qs is not None:
+			with torch.no_grad():
+				for ht, ho in zip(self._target_aux_separate_Qs, self._aux_separate_Qs):
+					for pt, p in zip(ht.parameters(), ho.parameters()):
+						pt.data.lerp_(p.data, self.cfg.tau)
 
 	def task_emb(self, x, task):
 		"""
@@ -255,7 +261,6 @@ class WorldModel(nn.Module):
 		"""
 		if self._num_aux_gamma == 0:
 			return None
-		assert not target and not detach, 'target/detach not implemented for auxiliary Q.'
 		assert return_type in {'all','min','avg'}
 		added_time = False
 		if z.ndim == 2:
@@ -264,19 +269,26 @@ class WorldModel(nn.Module):
 			z = self.task_emb(z, task)
 		za = torch.cat([z, a], dim=-1)
 		if self._aux_joint_Qs is not None:
-      
 			if target:
 				out = self._target_aux_joint_Qs(za)
 			elif detach:
-				out = self._detach_aux_joint_Qs(za)
+				with torch.no_grad():
+					out = self._aux_joint_Qs(za)
 			else:
 				out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
     
 			T, B = out.shape[0], out.shape[1]
 			out = out.view(T, B, self._num_aux_gamma, self.cfg.num_bins)
-		else:
-			outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
+		elif self._aux_separate_Qs is not None:
+			if target:
+				outs = [head(za) for head in self._target_aux_separate_Qs]
+			elif detach:
+				with torch.no_grad():
+					outs = [head(za) for head in self._aux_separate_Qs]
+			else:
+				outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
 			out = torch.stack(outs, dim=2)  # (T,B,G_aux,K)
+   
 		if return_type == 'all':
 			return out
 		vals = math.two_hot_inv(out, self.cfg)  # (T,B,G_aux,1)

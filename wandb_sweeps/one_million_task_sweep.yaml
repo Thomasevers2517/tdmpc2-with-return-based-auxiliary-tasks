@@ -28,11 +28,11 @@ parameters:
   task:
     values:
       - acrobot-swingup
-      - finger-turn-easy
-      - finger-turn-hard
-      - walker-walk
-      - walker-run
-      - reacher-hard
+      # - finger-turn-easy
+      # - finger-turn-hard
+      # - walker-walk
+      # - walker-run
+      # - reacher-hard
       - quadruped-walk
   seed:
     values: [101, 202]
