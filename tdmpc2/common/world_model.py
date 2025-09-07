@@ -182,6 +182,13 @@ class WorldModel(nn.Module):
 				# Detach mirrors online snapshot
 				self.aux_joint_detach_vec.copy_(online)
 				vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Qs.parameters())
+				
+				new = (1-self.cfg.tau) * prev + self.cfg.tau * online
+				error = (new - parameters_to_vector(self._target_aux_joint_Qs.parameters())).abs().max()
+				diff =  (new - parameters_to_vector(self._aux_joint_Qs.parameters())).abs().max()
+				print(f"[DEBUG] Aux joint Q EMA max error: {error:.3e}")
+				print(f"[DEBUG] Aux joint Q online-target max diff: {diff:.3e}")
+	
 		elif getattr(self, '_aux_separate_Qs', None) is not None:
 			with torch.no_grad():
 				vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
