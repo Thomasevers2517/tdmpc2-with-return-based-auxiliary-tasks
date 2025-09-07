@@ -55,7 +55,7 @@ parameters:
   obs:
     value: rgb
   compile:
-    value: false
+    value: true
   enable_wandb:
     value: true
   wandb_project:
@@ -63,4 +63,4 @@ parameters:
   wandb_entity:
     value: thomasevers9
   save_video:
-    value: false
+    value: true
