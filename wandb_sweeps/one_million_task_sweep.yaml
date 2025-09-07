@@ -55,7 +55,7 @@ parameters:
   obs:
     value: rgb
   compile:
-    value: true
+    value: false
   enable_wandb:
     value: true
   wandb_project:

@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from common import layers, math, init
 from tensordict import TensorDict
@@ -84,20 +85,44 @@ class WorldModel(nn.Module):
 		delattr(self._target_Qs, "params")
 		self._target_Qs.__dict__["params"] = self._target_Qs_params
 
-		# Auxiliary heads are plain nn.Modules. Mirror main Q behavior:
-		# - Create a frozen target copy via deepcopy
-		# - Use the online head under torch.no_grad() for detach
+		# Auxiliary heads (non-ensemble): vectorized param buffers + target/detach clones
 		if self._aux_joint_Qs is not None:
+			# Initialize parameter vectors as buffers once
+			if not hasattr(self, 'aux_joint_target_vec'):
+				vec = parameters_to_vector(self._aux_joint_Qs.parameters()).detach().clone()
+				self.register_buffer('aux_joint_target_vec', vec)
+				self.register_buffer('aux_joint_detach_vec', vec.clone())
+			# Create frozen clones and load vectors
 			self._target_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
+			self._detach_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
 			for p in self._target_aux_joint_Qs.parameters():
 				p.requires_grad_(False)
-			self._detach_aux_joint_Qs = self._aux_joint_Qs  # detach path uses no_grad in forward
+			for p in self._detach_aux_joint_Qs.parameters():
+				p.requires_grad_(False)
+			vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
+			vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Qs.parameters())
 		elif self._aux_separate_Qs is not None:
+			# Build concatenated vectors and size map once
+			if not hasattr(self, 'aux_separate_sizes'):
+				self.aux_separate_sizes = [sum(p.numel() for p in h.parameters()) for h in self._aux_separate_Qs]
+				vecs = [parameters_to_vector(h.parameters()).detach().clone() for h in self._aux_separate_Qs]
+				full = torch.cat(vecs, dim=0)
+				self.register_buffer('aux_separate_target_vec', full)
+				self.register_buffer('aux_separate_detach_vec', full.clone())
+			# Create frozen clones and load
 			self._target_aux_separate_Qs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Qs])
-			for h in self._target_aux_separate_Qs:
-				for p in h.parameters():
+			self._detach_aux_separate_Qs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Qs])
+			for head in list(self._target_aux_separate_Qs) + list(self._detach_aux_separate_Qs):
+				for p in head.parameters():
 					p.requires_grad_(False)
-			self._detach_aux_separate_Qs = self._aux_separate_Qs  # detach path uses no_grad in forward
+			offset = 0
+			for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):
+				vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
+				offset += sz
+			offset = 0
+			for h, sz in zip(self._detach_aux_separate_Qs, self.aux_separate_sizes):
+				vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
+				offset += sz
    
 
 	def __repr__(self):
@@ -132,8 +157,13 @@ class WorldModel(nn.Module):
 		self._target_Qs.train(False)
 		if self._target_aux_joint_Qs is not None:
 			self._target_aux_joint_Qs.train(False)
-		if self._target_aux_separate_Qs is not None:
+		if getattr(self, '_detach_aux_joint_Qs', None) is not None:
+			self._detach_aux_joint_Qs.train(False)
+		if getattr(self, '_target_aux_separate_Qs', None) is not None:
 			for h in self._target_aux_separate_Qs:
+				h.train(False)
+		if getattr(self, '_detach_aux_separate_Qs', None) is not None:
+			for h in self._detach_aux_separate_Qs:
 				h.train(False)
 		return self
 
@@ -142,17 +172,34 @@ class WorldModel(nn.Module):
 		Soft-update target Q-networks using Polyak averaging.
 		"""
 		self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
-		# Polyak average auxiliary target heads (per-parameter lerp)
-		if self._target_aux_joint_Qs is not None:
+		# Vectorized EMA for aux heads; emit debug checks if enabled
+		if getattr(self, '_aux_joint_Qs', None) is not None:
 			with torch.no_grad():
-				for pt, p in zip(self._target_aux_joint_Qs.parameters(), self._aux_joint_Qs.parameters()):
-					pt.data.lerp_(p.data, self.cfg.tau)
-		if self._target_aux_separate_Qs is not None:
+				online = parameters_to_vector(self._aux_joint_Qs.parameters()).detach()
+				prev = self.aux_joint_target_vec.detach().clone()
+				self.aux_joint_target_vec.lerp_(online, self.cfg.tau)
+				vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
+				# Detach mirrors online snapshot
+				self.aux_joint_detach_vec.copy_(online)
+				vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Qs.parameters())
+		elif getattr(self, '_aux_separate_Qs', None) is not None:
 			with torch.no_grad():
-				for ht, ho in zip(self._target_aux_separate_Qs, self._aux_separate_Qs):
-					for pt, p in zip(ht.parameters(), ho.parameters()):
-						pt.data.lerp_(p.data, self.cfg.tau)
-
+				vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
+				online = torch.cat(vecs, dim=0)
+				prev = self.aux_separate_target_vec.detach().clone()
+				self.aux_separate_target_vec.lerp_(online, self.cfg.tau)
+				# Assign to target heads
+				offset = 0
+				for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):
+					vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
+					offset += sz
+				# Detach mirrors online
+				self.aux_separate_detach_vec.copy_(online)
+				offset = 0
+				for h, sz in zip(self._detach_aux_separate_Qs, self.aux_separate_sizes):
+					vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
+					offset += sz
+				
 	def task_emb(self, x, task):
 		"""
 		Continuous task embedding for multi-task experiments.
@@ -272,8 +319,7 @@ class WorldModel(nn.Module):
 			if target:
 				out = self._target_aux_joint_Qs(za)
 			elif detach:
-				with torch.no_grad():
-					out = self._aux_joint_Qs(za)
+				out = self._detach_aux_joint_Qs(za)
 			else:
 				out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
     
@@ -283,8 +329,7 @@ class WorldModel(nn.Module):
 			if target:
 				outs = [head(za) for head in self._target_aux_separate_Qs]
 			elif detach:
-				with torch.no_grad():
-					outs = [head(za) for head in self._aux_separate_Qs]
+				outs = [head(za) for head in self._detach_aux_separate_Qs]
 			else:
 				outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
 			out = torch.stack(outs, dim=2)  # (T,B,G_aux,K)
