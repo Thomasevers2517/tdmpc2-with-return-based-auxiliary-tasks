@@ -1,41 +1,24 @@
-import contextlib
-import os
-from typing import Optional
+# tdmpc2/common/nvtx_utils.py
+import contextlib, torch
+from contextlib import nullcontext
+from torch.autograd.profiler import record_function
 
-import torch
 
-
-def _nvtx_enabled(cfg=None) -> bool:
-    """Return True if NVTX profiling should emit ranges.
-
-    Priority order:
-      1. Explicit cfg.nvtx_profiler flag (if cfg provided)
-      2. Environment variable NVTX_PROFILER=1
-    """
-    if cfg is not None and getattr(cfg, 'nvtx_profiler', False):
-        return True
-    if os.getenv('NVTX_PROFILER', '0') in {'1', 'true', 'True'}:
-        return True
-    return False
-
+def _in_dynamo():
+    # works across 2.x
+    return getattr(torch, "compiler", None) and torch.compiler.is_compiling() \
+        or getattr(torch._dynamo, "is_compiling", lambda: False)()
 
 @contextlib.contextmanager
-def nvtx_range(msg: str, cfg=None, color: Optional[int] = None):  # color is hint only
-    """Context manager emitting an NVTX range if enabled.
-
-    Safe to use under torch.compile; NVTX ranges will be emitted at runtime
-    (graph capture will include markers if placed outside captured region).
-    """
-    if _nvtx_enabled(cfg):
-        torch.cuda.nvtx.range_push(msg)
-        try:
-            yield
-        finally:
-            torch.cuda.nvtx.range_pop()
-    else:
-        yield
-
+def _nvtx_range(msg: str):
+    torch.cuda.nvtx.range_push(msg)
+    try:    yield
+    finally: torch.cuda.nvtx.range_pop()
 
 def maybe_range(msg: str, cfg=None):
-    """Shorthand returning a context manager (so: with maybe_range(...): )."""
-    return nvtx_range(msg, cfg=cfg)
+    # disable ranges if NVTX off or we’re under Dynamo/Inductor
+    if (cfg is not None and not getattr(cfg, "nvtx_profiler", True)) or _in_dynamo():
+        return nullcontext()
+    if torch.cuda.is_available():
+        return _nvtx_range(msg)
+    return record_function(msg)

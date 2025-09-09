@@ -42,8 +42,8 @@ class Buffer():
 		return ReplayBuffer(
 			storage=storage,
 			sampler=self._sampler,
-			pin_memory=False,
-			prefetch=0,
+			pin_memory=self.cfg.pin_memory,
+			prefetch=self.cfg.prefetch,
 			batch_size=self._batch_size,
 		)
 
