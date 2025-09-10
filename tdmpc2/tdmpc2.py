@@ -383,6 +383,8 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
+     # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
+      
 		with torch.no_grad():
 				# Encode next observations (time steps 1..T) → latent sequence next_z
 				next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
