@@ -98,8 +98,8 @@ class TDMPC2(torch.nn.Module):
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
-			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device='cuda:0'
-		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
+			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
+		) if self.cfg.multitask else torch.tensor(self._get_discount(cfg.episode_length), device=self.device)
 		# Compose full gamma list internally: primary discount first + auxiliary gammas from config.
 		# New semantics: cfg.multi_gamma_gammas contains ONLY auxiliary discounts.
 		if getattr(self.cfg, 'multi_gamma_gammas', None):
@@ -202,14 +202,14 @@ class TDMPC2(torch.nn.Module):
 				a, std, mean = self.plan(obs, task=task)
 				self.update_planner_mean(mean)
 				if eval_mode:
-					return a.cpu()
+					return a
 				else:
-					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1).cpu()
+					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
 			z = self.model.encode(obs, task)
 			action, info = self.model.pi(z, task)
 			if eval_mode:
 				action = info["mean"]
-			return action[0].cpu()
+			return action[0]
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
@@ -342,7 +342,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_entropy": info["entropy"],
 			"pi_scaled_entropy": info["scaled_entropy"],
 			"pi_scale": self.scale.value,
-		})
+		}, device=self.device)
 		return info
 
 	@torch.no_grad()

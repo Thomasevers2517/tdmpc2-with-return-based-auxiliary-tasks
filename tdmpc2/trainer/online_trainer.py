@@ -34,7 +34,7 @@ class OnlineTrainer(Trainer):
 				self.logger.video.init(self.env, enabled=(i==0))
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
-				action = self.agent.act(obs, eval_mode=True)
+				action = self.agent.act(obs, eval_mode=True).cpu()
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
 				t += 1
@@ -53,10 +53,11 @@ class OnlineTrainer(Trainer):
 
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode."""
+     
 		if isinstance(obs, dict):
-			obs = TensorDict(obs, batch_size=(), device='cpu')
+			obs = TensorDict(obs, batch_size=())
 		else:
-			obs = obs.unsqueeze(0).cpu()
+			obs = obs.unsqueeze(0)
 		if action is None:
 			action = torch.full_like(self.env.rand_act(), float('nan'))
 		if reward is None:
@@ -106,7 +107,7 @@ class OnlineTrainer(Trainer):
 
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
-				action = self.agent.act(obs)
+				action = self.agent.act(obs).cpu()
 			else:
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
