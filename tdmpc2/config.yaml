@@ -12,6 +12,8 @@ eval_episodes: 10
 eval_freq: 50000
 
 # training
+utd_ratio: 1
+
 steps: 10_000_000
 batch_size: 256
 reward_coef: 0.1
@@ -27,6 +29,10 @@ discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
+
+pin_memory: true
+prefetch: 2
+
 exp_name: default
 data_dir: ???
 
@@ -64,14 +70,14 @@ dropout: 0.01
 simnorm_dim: 8
 
 # logging
-wandb_project: ???
-wandb_entity: ???
+wandb_project: test_auxiliary
+wandb_entity: thomasevers9
 wandb_silent: false
 enable_wandb: true
 save_csv: true
 
 # misc
-compile: true
+compile: false
 save_video: true
 save_agent: true
 seed: 1
@@ -90,7 +96,7 @@ nvtx_profiler: false           # If true: add lightweight NVTX record_function r
 #   * Auxiliary heads are training-only. Gradients flow into shared trunk.
 #   * When disabled or only 1 gamma is given, behavior matches baseline.
 # ---------------------------------------------------------------------------
-multi_gamma_gammas: []              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
+multi_gamma_gammas: [0.9, 0.95]              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
                                      # Non-empty length ≤ 6. Primary discount auto-prepended internally.
 multi_gamma_head: joint             # Head architecture: 'joint' (single Linear -> G_aux*K) or 'separate' (one Linear per aux γ).
 multi_gamma_loss_weight: 0.5        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).

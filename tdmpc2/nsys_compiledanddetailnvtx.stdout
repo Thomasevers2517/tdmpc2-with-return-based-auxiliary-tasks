@@ -1,0 +1,23 @@
+[Tue Sep  9 04:52:37 PM CEST 2025] Starting delayed Nsight Systems capture (delay=600s, duration=10s, compile=false) -> nsys_compiledanddetailnvtx
+Spawned PID 3920274. Follow with: tail -f nsys_compiledanddetailnvtx.stdout
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+V0909 16:53:22.338994 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/1] [__recompiles] Recompiling function inner in /space/thomasevers/conda-envs/tdmpc2/lib/python3.9/site-packages/torch/_dynamo/external_utils.py:29
+V0909 16:53:22.338994 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/1] [__recompiles]     triggered by the following guard failure(s):
+V0909 16:53:22.338994 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/1] [__recompiles]     - 0/0: ___check_obj_id(L['kwargs']['t0'], 106187525999648)         
+V0909 16:55:27.173487 3921012 site-packages/torch/_dynamo/guards.py:2651] [1/1] [__recompiles] Recompiling function calc_wm_losses in /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/tdmpc2.py:382
+V0909 16:55:27.173487 3921012 site-packages/torch/_dynamo/guards.py:2651] [1/1] [__recompiles]     triggered by the following guard failure(s):
+V0909 16:55:27.173487 3921012 site-packages/torch/_dynamo/guards.py:2651] [1/1] [__recompiles]     - 1/0: len(G['__import_tensordict_dot_utils']._TENSORCLASS_MEMO) != 9
+V0909 16:56:49.533670 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/2] [__recompiles] Recompiling function inner in /space/thomasevers/conda-envs/tdmpc2/lib/python3.9/site-packages/torch/_dynamo/external_utils.py:29
+V0909 16:56:49.533670 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/2] [__recompiles]     triggered by the following guard failure(s):
+V0909 16:56:49.533670 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/2] [__recompiles]     - 0/1: ___check_obj_id(L['kwargs']['eval_mode'], 106187525999648)  
+V0909 16:56:49.533670 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/2] [__recompiles]     - 0/0: ___check_obj_id(L['kwargs']['t0'], 106187525999648)         
+V0909 16:57:45.688123 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/3] [__recompiles] Recompiling function inner in /space/thomasevers/conda-envs/tdmpc2/lib/python3.9/site-packages/torch/_dynamo/external_utils.py:29
+V0909 16:57:45.688123 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/3] [__recompiles]     triggered by the following guard failure(s):
+V0909 16:57:45.688123 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/3] [__recompiles]     - 0/2: ___check_obj_id(L['kwargs']['t0'], 106187525999616)         
+V0909 16:57:45.688123 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/3] [__recompiles]     - 0/1: ___check_obj_id(L['kwargs']['t0'], 106187525999616)         
+V0909 16:57:45.688123 3921012 site-packages/torch/_dynamo/guards.py:2651] [0/3] [__recompiles]     - 0/0: ___check_obj_id(L['kwargs']['eval_mode'], 106187525999648)  
