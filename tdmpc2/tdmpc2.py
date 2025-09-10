@@ -126,7 +126,7 @@ class TDMPC2(torch.nn.Module):
 			return _plan_val
 		if self.cfg.compile:
 			# plan = torch.compile(self._plan, mode="reduce-overhead")
-			plan = torch.compile(self._plan, mode="default")
+			plan = torch.compile(self._plan, mode="reduce-overhead", fullgraph=True)
 		else:
 			plan = self._plan
 		self._plan_val = plan
@@ -191,7 +191,13 @@ class TDMPC2(torch.nn.Module):
 			if task is not None:
 				task = torch.tensor([task], device=self.device)
 			if self.cfg.mpc:
-				return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+				# if not eval_mode:
+				# a = (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
+				a, std = self.plan(obs, t0=t0, task=task)
+				if eval_mode:
+					return a.cpu()
+				else:
+					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1).cpu()
 			z = self.model.encode(obs, task)
 			action, info = self.model.pi(z, task)
 			if eval_mode:
@@ -224,7 +230,7 @@ class TDMPC2(torch.nn.Module):
 			return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
 
 	@torch.no_grad()
-	def _plan(self, obs, t0=False, eval_mode=False, task=None):
+	def _plan(self, obs, t0=False, task=None):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -288,10 +294,8 @@ class TDMPC2(torch.nn.Module):
 			rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
 			actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
 			a, std = actions[0], std[0]
-			if not eval_mode:
-				a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
 			self._prev_mean.copy_(mean)
-			return a.clamp(-1, 1)
+			return a, std
 	def calc_pi_losses(self, zs, task):
 		with maybe_range('Agent/update_pi', self.cfg):
 			action, info = self.model.pi(zs, task)
