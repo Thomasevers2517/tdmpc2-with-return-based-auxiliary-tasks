@@ -109,7 +109,11 @@ class TDMPC2(torch.nn.Module):
 		print('Episode length:', cfg.episode_length)
 		print('Discount factor:', self.discount)
 		# Buffer for MPPI warm-start action mean; shape (T, A)
-		self._prev_mean = torch.nn.Buffer(torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device))
+		self.register_buffer(
+					"_prev_mean",
+					torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device),
+					persistent=False,   # don’t save to checkpoints unless you want to
+				)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
 			# self._update = torch.compile(self._update, mode="reduce-overhead")
@@ -118,7 +122,9 @@ class TDMPC2(torch.nn.Module):
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode="reduce-overhead", fullgraph=True)
    
 
-
+	def reset_planner_state(self):
+		self._prev_mean.zero_() 
+	
 	@property
 	def plan(self):
 		_plan_val = getattr(self, "_plan_val", None)
@@ -173,7 +179,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, t0=False, eval_mode=False, task=None):
+	def act(self, obs, eval_mode=False, task=None):
 		"""
 		Select an action by planning in latent space (MPPI) or by single policy prior.
 
@@ -193,7 +199,8 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.mpc:
 				# if not eval_mode:
 				# a = (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
-				a, std = self.plan(obs, t0=t0, task=task)
+				a, std, mean = self.plan(obs, task=task)
+				self.update_planner_mean(mean)
 				if eval_mode:
 					return a.cpu()
 				else:
@@ -230,7 +237,7 @@ class TDMPC2(torch.nn.Module):
 			return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
 
 	@torch.no_grad()
-	def _plan(self, obs, t0=False, task=None):
+	def _plan(self, obs, task=None):
 		"""
 		Plan a sequence of actions using the learned world model.
 
@@ -258,8 +265,7 @@ class TDMPC2(torch.nn.Module):
 			z = z.repeat(self.cfg.num_samples, 1)
 			mean = torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device)
 			std = torch.full((self.cfg.horizon, self.cfg.action_dim), self.cfg.max_std, dtype=torch.float, device=self.device)
-			if not t0:
-				mean[:-1] = self._prev_mean[1:]
+			mean[:-1] = self._prev_mean[1:]
 			actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 			if self.cfg.num_pi_trajs > 0:
 				actions[:, :self.cfg.num_pi_trajs] = pi_actions
@@ -295,7 +301,12 @@ class TDMPC2(torch.nn.Module):
 			actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
 			a, std = actions[0], std[0]
 			self._prev_mean.copy_(mean)
-			return a, std
+			return a, std, mean
+
+	def update_planner_mean(self, mean):
+		self._prev_mean.copy_(mean)
+		return 
+
 	def calc_pi_losses(self, zs, task):
 		with maybe_range('Agent/update_pi', self.cfg):
 			action, info = self.model.pi(zs, task)
@@ -479,7 +490,8 @@ class TDMPC2(torch.nn.Module):
 			"aux_value_loss_mean": aux_value_loss_mean,
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
-		})
+		}, device=self.device)
+  
 		if aux_value_losses is not None:
 			for g, loss_g in enumerate(aux_value_losses):
 				gamma_val = self._all_gammas[g+1]
