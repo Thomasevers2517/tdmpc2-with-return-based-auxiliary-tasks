@@ -314,7 +314,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		pi_loss = self.calc_pi_losses(zs, task)
+		pi_loss, info = self.calc_pi_losses(zs, task)
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 		self.pi_optim.step()
