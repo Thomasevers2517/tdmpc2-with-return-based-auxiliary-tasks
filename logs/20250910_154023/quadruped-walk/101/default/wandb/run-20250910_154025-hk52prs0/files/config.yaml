@@ -1,0 +1,277 @@
+wandb_version: 1
+
+task:
+  desc: null
+  value: quadruped-walk
+obs:
+  desc: null
+  value: rgb
+episodic:
+  desc: null
+  value: false
+checkpoint:
+  desc: null
+  value: ???
+eval_episodes:
+  desc: null
+  value: 10
+eval_freq:
+  desc: null
+  value: 25000
+utd_ratio:
+  desc: null
+  value: 1
+steps:
+  desc: null
+  value: 2000000
+batch_size:
+  desc: null
+  value: 256
+reward_coef:
+  desc: null
+  value: 0.1
+value_coef:
+  desc: null
+  value: 0.1
+termination_coef:
+  desc: null
+  value: 1
+consistency_coef:
+  desc: null
+  value: 20
+rho:
+  desc: null
+  value: 0.5
+lr:
+  desc: null
+  value: 0.0003
+enc_lr_scale:
+  desc: null
+  value: 0.3
+grad_clip_norm:
+  desc: null
+  value: 20
+tau:
+  desc: null
+  value: 0.01
+discount_denom:
+  desc: null
+  value: 5
+discount_min:
+  desc: null
+  value: 0.95
+discount_max:
+  desc: null
+  value: 0.995
+buffer_size:
+  desc: null
+  value: 1000000
+pin_memory:
+  desc: null
+  value: false
+prefetch:
+  desc: null
+  value: 0
+exp_name:
+  desc: null
+  value: default
+data_dir:
+  desc: null
+  value: ???
+mpc:
+  desc: null
+  value: true
+iterations:
+  desc: null
+  value: 6
+num_samples:
+  desc: null
+  value: 512
+num_elites:
+  desc: null
+  value: 64
+num_pi_trajs:
+  desc: null
+  value: 24
+horizon:
+  desc: null
+  value: 3
+min_std:
+  desc: null
+  value: 0.05
+max_std:
+  desc: null
+  value: 2
+temperature:
+  desc: null
+  value: 0.5
+log_std_min:
+  desc: null
+  value: -10
+log_std_max:
+  desc: null
+  value: 2
+entropy_coef:
+  desc: null
+  value: 0.0001
+num_bins:
+  desc: null
+  value: 101
+vmin:
+  desc: null
+  value: -10
+vmax:
+  desc: null
+  value: 10
+model_size:
+  desc: null
+  value: 5
+num_enc_layers:
+  desc: null
+  value: 2
+enc_dim:
+  desc: null
+  value: 256
+num_channels:
+  desc: null
+  value: 32
+mlp_dim:
+  desc: null
+  value: 512
+latent_dim:
+  desc: null
+  value: 512
+task_dim:
+  desc: null
+  value: 0
+num_q:
+  desc: null
+  value: 5
+dropout:
+  desc: null
+  value: 0.01
+simnorm_dim:
+  desc: null
+  value: 8
+wandb_project:
+  desc: null
+  value: tdmpc2-tdmpc2
+wandb_entity:
+  desc: null
+  value: thomasevers9
+wandb_silent:
+  desc: null
+  value: false
+enable_wandb:
+  desc: null
+  value: true
+save_csv:
+  desc: null
+  value: true
+compile:
+  desc: null
+  value: true
+save_video:
+  desc: null
+  value: false
+save_agent:
+  desc: null
+  value: false
+seed:
+  desc: null
+  value: 101
+nvtx_profiler:
+  desc: null
+  value: false
+multi_gamma_gammas:
+  desc: null
+  value:
+  - 0.9
+  - 0.95
+multi_gamma_head:
+  desc: null
+  value: joint
+multi_gamma_loss_weight:
+  desc: null
+  value: 0.1
+multi_gamma_debug_logging:
+  desc: null
+  value: true
+multi_gamma_log_num_examples:
+  desc: null
+  value: 4
+auxiliary_value_ema:
+  desc: null
+  value: true
+work_dir:
+  desc: null
+  value: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/logs/20250910_154023/quadruped-walk/101/default
+task_title:
+  desc: null
+  value: Quadruped Walk
+multitask:
+  desc: null
+  value: false
+tasks:
+  desc: null
+  value:
+  - quadruped-walk
+obs_shape:
+  desc: null
+  value:
+    rgb:
+    - 9
+    - 64
+    - 64
+action_dim:
+  desc: null
+  value: 12
+episode_length:
+  desc: null
+  value: 500
+obs_shapes:
+  desc: null
+  value: ???
+action_dims:
+  desc: null
+  value: ???
+episode_lengths:
+  desc: null
+  value: ???
+seed_steps:
+  desc: null
+  value: 2500
+bin_size:
+  desc: null
+  value: 0.2
+_wandb:
+  desc: null
+  value:
+    python_version: 3.9.19
+    cli_version: 0.17.4
+    framework: torch
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1757511625
+    t:
+      1:
+      - 1
+      - 50
+      - 55
+      - 105
+      2:
+      - 1
+      - 50
+      - 55
+      - 105
+      3:
+      - 15
+      - 16
+      - 23
+      - 37
+      - 61
+      4: 3.9.19
+      5: 0.17.4
+      8:
+      - 5
+      13: linux-x86_64

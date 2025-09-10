@@ -30,8 +30,8 @@ discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
 
-pin_memory: true
-prefetch: 2
+pin_memory: false
+prefetch: 0
 
 exp_name: default
 data_dir: ???
@@ -78,8 +78,8 @@ save_csv: true
 
 # misc
 compile: false
-save_video: true
-save_agent: true
+save_video: false
+save_agent: false
 seed: 1
 
 

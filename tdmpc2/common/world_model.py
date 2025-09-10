@@ -339,11 +339,11 @@ class WorldModel(nn.Module):
 					outs = [head(za) for head in self._detach_aux_separate_Qs]
 				else:
 					outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
-				out = torch.stack(outs, dim=2)  # (T,B,G_aux,K)
+				out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
 	
 			if return_type == 'all':
 				return out
-			vals = math.two_hot_inv(out, self.cfg)  # (T,B,G_aux,1)
+			vals = math.two_hot_inv(out, self.cfg)  # (G_aux,T,B,1) 
 			return vals  # 'min'/'avg' identical with single head
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):

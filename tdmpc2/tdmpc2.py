@@ -114,7 +114,8 @@ class TDMPC2(torch.nn.Module):
 			print('Compiling update function with torch.compile...')
 			# self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
-			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="default", fullgraph=True)
+			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="reduce-overhead", fullgraph=True)
+			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode="reduce-overhead", fullgraph=True)
    
 
 
@@ -371,15 +372,15 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 		action, _ = self.model.pi(next_z, task)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (T,B,G_aux,1) scalar per gamma (single head)
+		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K) scalar per gamma (single head)
 		if bootstrap is None:
 			return None
 		aux_targets = []
 		for g in range(G_aux):
 			gamma = self._all_gammas[g+1]
-			boot_g = bootstrap[..., g, :]  # (T,B,1)
+			boot_g = bootstrap[g, ...]  # (T,B,1)
 			aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
-		return torch.stack(aux_targets, dim=0)
+		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
@@ -416,7 +417,7 @@ class TDMPC2(torch.nn.Module):
 		# Auxiliary logits (if enabled)
 		q_aux_logits = None
 		if aux_td_targets is not None:
-			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (T,B,G_aux,K)
+			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (G_aux,T,B,K)
 
 		# ------------------------------ Loss computation ------------------------------
 		reward_loss = 0.; value_loss = 0.
@@ -437,10 +438,10 @@ class TDMPC2(torch.nn.Module):
 				value_loss = value_loss + math.soft_ce(q_head_logits, td_target_t, self.cfg).mean() * (self.cfg.rho**t)
 			# Auxiliary (per gamma) losses (scalar targets) if present
 			if q_aux_logits is not None:
-				q_aux_t = q_aux_logits[t]                # (B,G_aux,K)
+				q_aux_t = q_aux_logits[:,t,:,:]                # (G_aux,B,K)
 				aux_targets_t = aux_td_targets[:, t]      # (G_aux,B,1)
 				for g in range(G_aux):
-					q_aux_tg = q_aux_t[:, g, :]            # (B,K)
+					q_aux_tg = q_aux_t[g,:,:]            # (B,K)
 					aux_target_g = aux_targets_t[g]        # (B,1)
 					loss_g = math.soft_ce(q_aux_tg, aux_target_g, self.cfg).mean()
 					aux_value_losses[g] = aux_value_losses[g] + loss_g * (self.cfg.rho**t)
