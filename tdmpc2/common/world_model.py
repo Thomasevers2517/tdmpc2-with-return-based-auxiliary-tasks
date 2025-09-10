@@ -276,7 +276,7 @@ class WorldModel(nn.Module):
 			# Gaussian policy prior
 			mean, log_std = self._pi(z).chunk(2, dim=-1)
 			log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
-			eps = torch.randn_like(mean)
+			eps = torch.randn_like(mean, device=mean.device)
 
 			if self.cfg.multitask: # Mask out unused action dimensions
 				mean = mean * self._action_masks[task]
@@ -303,7 +303,7 @@ class WorldModel(nn.Module):
 				"action_prob": 1.,
 				"entropy": -log_prob,
 				"scaled_entropy": -log_prob * entropy_scale,
-			})
+			}, device=z.device)
 			return action, info
 
 	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
