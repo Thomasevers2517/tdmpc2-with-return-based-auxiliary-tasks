@@ -7,7 +7,8 @@ class Trainer:
 		self.agent = agent
 		self.buffer = buffer
 		self.logger = logger
-		print('Architecture:', self.agent.model)
+		from common.logging_utils import get_logger
+		get_logger(__name__).info('Architecture: %s', self.agent.model)
 
 	def eval(self):
 		"""Evaluate a TD-MPC2 agent."""

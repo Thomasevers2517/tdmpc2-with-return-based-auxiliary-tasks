@@ -7,6 +7,9 @@ from common.scale import RunningScale
 from common.world_model import WorldModel
 from common.layers import api_model_conversion
 from tensordict import TensorDict
+from common.logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # -----------------------------------------------------------------------------
 # File: tdmpc2.py
@@ -106,16 +109,16 @@ class TDMPC2(torch.nn.Module):
 			self._all_gammas = [float(self.discount)] + list(self.cfg.multi_gamma_gammas)
 		else:
 			self._all_gammas = [float(self.discount)]
-		print('Episode length:', cfg.episode_length)
-		print('Discount factor:', self.discount)
+		log.info('Episode length: %s', cfg.episode_length)
+		log.info('Discount factor: %s', str(self.discount))
 		# Buffer for MPPI warm-start action mean; shape (T, A)
 		self.register_buffer(
-					"_prev_mean",
-					torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device),
-					persistent=False,   # don’t save to checkpoints unless you want to
-				)
+			"_prev_mean",
+			torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device),
+			persistent=False,   # don’t save to checkpoints unless you want to
+		)
 		if cfg.compile:
-			print('Compiling update function with torch.compile...')
+			log.info('Compiling update function with torch.compile...')
 			self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="reduce-overhead", fullgraph=True)
@@ -132,7 +135,7 @@ class TDMPC2(torch.nn.Module):
 			return _plan_val
 		if self.cfg.compile:
 			# plan = torch.compile(self._plan, mode="reduce-overhead")
-			print('Compiling planning function with torch.compile...')
+			log.info('Compiling planning function with torch.compile...')
 			plan = torch.compile(self._plan, mode="reduce-overhead", fullgraph=True)
 		else:
 			plan = self._plan

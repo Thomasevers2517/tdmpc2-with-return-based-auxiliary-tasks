@@ -5,6 +5,7 @@ os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
 os.environ['TORCH_LOGS'] = "+recompiles"
 import warnings
 warnings.filterwarnings('ignore')
+import logging
 import torch
 
 import hydra
@@ -19,6 +20,7 @@ from torch.autograd.profiler import emit_nvtx
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
+from common.logging_utils import configure_logging, get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
@@ -47,8 +49,11 @@ def train(cfg: dict):
 	assert torch.cuda.is_available()
 	assert cfg.steps > 0, 'Must train for at least 1 step.'
 	cfg = parse_cfg(cfg)
+	# Configure logging as early as possible
+	configure_logging()
+	log = get_logger(__name__)
 	set_seed(cfg.seed)
-	print(colored('Work dir:', 'yellow', attrs=['bold']), cfg.work_dir)
+	log.info('Work dir: %s', cfg.work_dir)
 
 	trainer_cls = OfflineTrainer if cfg.multitask else OnlineTrainer
 	if getattr(cfg, 'nvtx_profiler', False):
@@ -61,7 +66,7 @@ def train(cfg: dict):
 				logger=Logger(cfg),
 			)
 			trainer.train()
-			print('\nTraining completed successfully')
+			log.info('Training completed successfully')
 	else:
 		trainer = trainer_cls(
 			cfg=cfg,
@@ -70,8 +75,8 @@ def train(cfg: dict):
 			buffer=Buffer(cfg),
 			logger=Logger(cfg),
 		)
-		trainer.train()
-		print('\nTraining completed successfully')
+	trainer.train()
+	log.info('Training completed successfully')
 		
 
 

@@ -261,8 +261,11 @@ class CustomCheetah(cheetah.Cheetah):
 
 
 if __name__ == '__main__':
+    from common.logging_utils import configure_logging, get_logger
+    configure_logging()
+    log = get_logger(__name__)
     env = jump()
     obs = env.reset()
     import numpy as np
     next_obs, reward, done, info = env.step(np.zeros(6))
-    print(reward)
+    log.info('Reward: %s', reward)

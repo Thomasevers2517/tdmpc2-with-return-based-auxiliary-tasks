@@ -2,17 +2,18 @@ import os
 os.environ['MUJOCO_GL'] = os.getenv("MUJOCO_GL", 'egl')
 import warnings
 warnings.filterwarnings('ignore')
+import logging
 
 import hydra
 import imageio
 import numpy as np
 import torch
-from termcolor import colored
 
 from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
 from tdmpc2 import TDMPC2
+from common.logging_utils import configure_logging, get_logger
 
 torch.backends.cudnn.benchmark = True
 
@@ -42,13 +43,15 @@ def evaluate(cfg: dict):
 	assert torch.cuda.is_available()
 	assert cfg.eval_episodes > 0, 'Must evaluate at least 1 episode.'
 	cfg = parse_cfg(cfg)
+	configure_logging()
+	log = get_logger(__name__)
 	set_seed(cfg.seed)
-	print(colored(f'Task: {cfg.task}', 'blue', attrs=['bold']))
-	print(colored(f'Model size: {cfg.get("model_size", "default")}', 'blue', attrs=['bold']))
-	print(colored(f'Checkpoint: {cfg.checkpoint}', 'blue', attrs=['bold']))
+	log.info('Task: %s', cfg.task)
+	log.info('Model size: %s', cfg.get("model_size", "default"))
+	log.info('Checkpoint: %s', cfg.checkpoint)
 	if not cfg.multitask and ('mt80' in cfg.checkpoint or 'mt30' in cfg.checkpoint):
-		print(colored('Warning: single-task evaluation of multi-task models is not currently supported.', 'red', attrs=['bold']))
-		print(colored('To evaluate a multi-task model, use task=mt80 or task=mt30.', 'red', attrs=['bold']))
+		log.warning('Single-task evaluation of multi-task models is not currently supported.')
+		log.warning('To evaluate a multi-task model, use task=mt80 or task=mt30.')
 
 	# Make environment
 	env = make_env(cfg)
@@ -60,9 +63,9 @@ def evaluate(cfg: dict):
 	
 	# Evaluate
 	if cfg.multitask:
-		print(colored(f'Evaluating agent on {len(cfg.tasks)} tasks:', 'yellow', attrs=['bold']))
+		log.info('Evaluating agent on %d tasks', len(cfg.tasks))
 	else:
-		print(colored(f'Evaluating agent on {cfg.task}:', 'yellow', attrs=['bold']))
+		log.info('Evaluating agent on %s', cfg.task)
 	if cfg.save_video:
 		video_dir = os.path.join(cfg.work_dir, 'videos')
 		os.makedirs(video_dir, exist_ok=True)
@@ -92,11 +95,9 @@ def evaluate(cfg: dict):
 		ep_successes = np.mean(ep_successes)
 		if cfg.multitask:
 			scores.append(ep_successes*100 if task.startswith('mw-') else ep_rewards/10)
-		print(colored(f'  {task:<22}' \
-			f'\tR: {ep_rewards:.01f}  ' \
-			f'\tS: {ep_successes:.02f}', 'yellow'))
+		log.info('  %-22s\tR: %.01f\tS: %.02f', task, ep_rewards, ep_successes)
 	if cfg.multitask:
-		print(colored(f'Normalized score: {np.mean(scores):.02f}', 'yellow', attrs=['bold']))
+		log.info('Normalized score: %.02f', float(np.mean(scores)))
 
 
 if __name__ == '__main__':

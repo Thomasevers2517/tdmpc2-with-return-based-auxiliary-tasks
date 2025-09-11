@@ -5,6 +5,9 @@ import gymnasium as gym
 
 from envs.wrappers.multitask import MultitaskWrapper
 from envs.wrappers.tensor import TensorWrapper
+from common.logging_utils import get_logger
+
+log = get_logger(__name__)
 
 def missing_dependencies(task):
 	raise ValueError(f'Missing dependencies for task {task}; install dependencies to use this environment.')
@@ -38,7 +41,7 @@ def make_multitask_env(cfg):
 	"""
 	Make a multi-task environment for TD-MPC2 experiments.
 	"""
-	print('Creating multi-task environment with tasks:', cfg.tasks)
+	log.info('Creating multi-task environment with tasks: %s', cfg.tasks)
 	envs = []
 	for task in cfg.tasks:
 		_cfg = deepcopy(cfg)

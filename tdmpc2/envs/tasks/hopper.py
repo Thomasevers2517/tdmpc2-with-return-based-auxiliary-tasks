@@ -107,8 +107,11 @@ class CustomHopper(hopper.Hopper):
 
 
 if __name__ == '__main__':
+	from common.logging_utils import configure_logging, get_logger
+	configure_logging()
+	log = get_logger(__name__)
 	env = hop_backwards()
 	obs = env.reset()
 	import numpy as np
 	next_obs, reward, done, info = env.step(np.zeros(2))
-	print(reward)
+	log.info('Reward: %s', reward)
