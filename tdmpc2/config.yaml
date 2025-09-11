@@ -31,8 +31,8 @@ discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1_000_000
 
-pin_memory: true
-prefetch: 4
+pin_memory: false
+prefetch: 0
 
 exp_name: default
 data_dir: ???
@@ -117,3 +117,32 @@ action_dims: ???
 episode_lengths: ???
 seed_steps: ???
 bin_size: ???
+
+# ----------------------------------------------------------------------------
+# Hydra logging and run directory configuration
+# Routes Python logging to both console and a train.log file in the Hydra run dir
+# ----------------------------------------------------------------------------
+hydra:
+    job:
+        chdir: true
+        env_set:
+            PYTHONUNBUFFERED: "1"
+    run:
+        dir: logs/${now:%Y%m%d_%H%M%S}
+    job_logging:
+        formatters:
+            simple:
+                format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+                datefmt: "%H:%M:%S"
+        handlers:
+            file:
+                class: logging.FileHandler
+                formatter: simple
+                filename: train.log
+                mode: a
+            console:
+                class: logging.StreamHandler
+                formatter: simple
+        root:
+            level: INFO
+            handlers: [file, console]

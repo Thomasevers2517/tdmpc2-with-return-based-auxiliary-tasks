@@ -1,0 +1,62 @@
+15:08:50 | INFO | __main__ | Work dir: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/logs/20250911_150850/acrobot-swingup/1/default
+15:08:52 | INFO | tdmpc2 | Episode length: 500
+15:08:52 | INFO | tdmpc2 | Discount factor: tensor(0.9900, device='cuda:0')
+15:08:52 | INFO | common.logger | ----------------------------------------
+15:08:52 | INFO | common.logger |   Task:           Acrobot Swingup
+15:08:52 | INFO | common.logger |   Steps:          10,000,000
+15:08:52 | INFO | common.logger |   Observations:   (9, 64, 64)
+15:08:52 | INFO | common.logger |   Actions:        1
+15:08:52 | INFO | common.logger |   Experiment:     default
+15:08:52 | INFO | common.logger | ----------------------------------------
+wandb: Currently logged in as: thomasevers9. Use `wandb login --relogin` to force relogin
+wandb: wandb version 0.21.3 is available!  To upgrade, please run:
+wandb:  $ pip install wandb --upgrade
+wandb: Tracking run with wandb version 0.17.4
+wandb: Run data is saved locally in /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/logs/20250911_150850/acrobot-swingup/1/default/wandb/run-20250911_150855-kjf3qvak
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run worldly-snowflake-28
+wandb: ⭐️ View project at https://wandb.ai/thomasevers9/test_auxiliary
+wandb: 🚀 View run at https://wandb.ai/thomasevers9/test_auxiliary/runs/kjf3qvak
+15:09:00 | INFO | common.logger | Logs will be synced with wandb.
+15:09:00 | INFO | trainer.base | Architecture: TD-MPC2 World Model
+Encoder: ModuleDict(
+  (rgb): Sequential(
+    (0): ShiftAug()
+    (1): PixelPreprocess()
+    (2): Conv2d(9, 32, kernel_size=(7, 7), stride=(2, 2))
+    (3): ReLU()
+    (4): Conv2d(32, 32, kernel_size=(5, 5), stride=(2, 2))
+    (5): ReLU()
+    (6): Conv2d(32, 32, kernel_size=(3, 3), stride=(2, 2))
+    (7): ReLU()
+    (8): Conv2d(32, 32, kernel_size=(3, 3), stride=(1, 1))
+    (9): Flatten(start_dim=1, end_dim=-1)
+    (10): SimNorm(dim=8)
+  )
+)
+Dynamics: Sequential(
+  (0): NormedLinear(in_features=513, out_features=512, bias=True, act=Mish)
+  (1): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (2): NormedLinear(in_features=512, out_features=512, bias=True, act=SimNorm)
+)
+Reward: Sequential(
+  (0): NormedLinear(in_features=513, out_features=512, bias=True, act=Mish)
+  (1): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (2): Linear(in_features=512, out_features=101, bias=True)
+)
+Policy prior: Sequential(
+  (0): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (1): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (2): Linear(in_features=512, out_features=2, bias=True)
+)
+Q-functions: Vectorized 5x Sequential(
+  (0): NormedLinear(in_features=513, out_features=512, bias=True, dropout=0.01, act=Mish)
+  (1): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (2): Linear(in_features=512, out_features=101, bias=True)
+)
+Aux Q-functions: Sequential(
+  (0): NormedLinear(in_features=513, out_features=512, bias=True, dropout=0.01, act=Mish)
+  (1): NormedLinear(in_features=512, out_features=512, bias=True, act=Mish)
+  (2): Linear(in_features=512, out_features=202, bias=True)
+)
+Learnable parameters: 5,487,818

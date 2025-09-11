@@ -30,6 +30,5 @@ def configure_logging(level: Optional[Union[str, int]] = None) -> logging.Logger
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a logger, ensuring logging is configured."""
-    configure_logging()
+    """Return a logger. Assumes logging is configured by Hydra or entry points."""
     return logging.getLogger(name if name else __name__)

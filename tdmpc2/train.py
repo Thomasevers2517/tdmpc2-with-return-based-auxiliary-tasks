@@ -20,7 +20,7 @@ from torch.autograd.profiler import emit_nvtx
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
-from common.logging_utils import configure_logging, get_logger
+from common.logging_utils import get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
@@ -49,8 +49,6 @@ def train(cfg: dict):
 	assert torch.cuda.is_available()
 	assert cfg.steps > 0, 'Must train for at least 1 step.'
 	cfg = parse_cfg(cfg)
-	# Configure logging as early as possible
-	configure_logging()
 	log = get_logger(__name__)
 	set_seed(cfg.seed)
 	log.info('Work dir: %s', cfg.work_dir)

@@ -13,7 +13,7 @@ from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
 from tdmpc2 import TDMPC2
-from common.logging_utils import configure_logging, get_logger
+from common.logging_utils import get_logger
 
 torch.backends.cudnn.benchmark = True
 
@@ -43,7 +43,6 @@ def evaluate(cfg: dict):
 	assert torch.cuda.is_available()
 	assert cfg.eval_episodes > 0, 'Must evaluate at least 1 episode.'
 	cfg = parse_cfg(cfg)
-	configure_logging()
 	log = get_logger(__name__)
 	set_seed(cfg.seed)
 	log.info('Task: %s', cfg.task)

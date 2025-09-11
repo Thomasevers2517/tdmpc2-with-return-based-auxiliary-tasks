@@ -107,8 +107,7 @@ class CustomHopper(hopper.Hopper):
 
 
 if __name__ == '__main__':
-	from common.logging_utils import configure_logging, get_logger
-	configure_logging()
+	from common.logging_utils import get_logger
 	log = get_logger(__name__)
 	env = hop_backwards()
 	obs = env.reset()
