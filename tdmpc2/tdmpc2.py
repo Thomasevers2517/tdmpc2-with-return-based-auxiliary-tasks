@@ -116,7 +116,7 @@ class TDMPC2(torch.nn.Module):
 				)
 		if cfg.compile:
 			print('Compiling update function with torch.compile...')
-			# self._update = torch.compile(self._update, mode="reduce-overhead")
+			self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="reduce-overhead", fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode="reduce-overhead", fullgraph=True)
@@ -132,6 +132,7 @@ class TDMPC2(torch.nn.Module):
 			return _plan_val
 		if self.cfg.compile:
 			# plan = torch.compile(self._plan, mode="reduce-overhead")
+			print('Compiling planning function with torch.compile...')
 			plan = torch.compile(self._plan, mode="reduce-overhead", fullgraph=True)
 		else:
 			plan = self._plan
