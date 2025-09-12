@@ -33,7 +33,7 @@ parameters:
       # - walker-walk
       # - walker-run
       # - reacher-hard
-      - quadruped-walk
+      # - quadruped-walk
   seed:
     values: [101, 202]
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)

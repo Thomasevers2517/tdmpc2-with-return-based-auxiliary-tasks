@@ -31,7 +31,7 @@ fi
 # Get sweep name (basename without extension)
 SWEEP_NAME=$(basename "$SWEEP_YAML" .yaml)
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_DIR="$REPO_ROOT/outputs/${SWEEP_NAME}/${TIMESTAMP}"
+LOG_DIR="$REPO_ROOT/sweeps/${SWEEP_NAME}/${TIMESTAMP}"
 mkdir -p "$LOG_DIR"
 
 # Activate conda env (disable nounset during activation to avoid env script errors)
@@ -65,12 +65,19 @@ echo "$SWEEP_ID" > "$LOG_DIR/sweep_id.txt"
 # Launch agents for each GPU (nohup, ensure env sourced in subshell)
 IFS=',' read -ra GPUS <<< "$GPU_LIST"
 for GPU in "${GPUS[@]}"; do
-  LOG_FILE="$LOG_DIR/output_gpu${GPU}.log"
-  PID_FILE="$LOG_DIR/agent_gpu${GPU}.pid"
-  echo "Launching agent on GPU $GPU, logging to $LOG_FILE" | tee -a "$LOG_DIR/sweep_create.log"
-  nohup bash -lc "set +u; source \"$(conda info --base)\"/etc/profile.d/conda.sh; conda activate tdmpc2; set -u; cd \"$REPO_ROOT\"; export CUDA_VISIBLE_DEVICES=$GPU WANDB_ENTITY=\"$WANDB_ENTITY\" WANDB_PROJECT=\"$WANDB_PROJECT\"; python -m wandb agent $WANDB_ENTITY/$WANDB_PROJECT/$SWEEP_ID" > "$LOG_FILE" 2>&1 &
-  echo $! > "$PID_FILE"
-  echo "PID $(cat \"$PID_FILE\")" | tee -a "$LOG_DIR/sweep_create.log"
-done
 
-echo "All agents launched. Logs in $LOG_DIR."
+  echo "Launching agent on GPU $GPU"
+  LOG_FILE="$LOG_DIR/agent_gpu${GPU}.log"
+  # Launch in background with nohup, capture PID, and redirect logs
+  nohup bash -lc "set +u; source \"$(conda info --base)\"/etc/profile.d/conda.sh; conda activate tdmpc2; set -u; \
+                   cd \"$REPO_ROOT\"; \
+                   export CUDA_VISIBLE_DEVICES=$GPU WANDB_ENTITY=\"$WANDB_ENTITY\" WANDB_PROJECT=\"$WANDB_PROJECT\" PYTHONUNBUFFERED=1; \
+                   python -m wandb agent $WANDB_ENTITY/$WANDB_PROJECT/$SWEEP_ID" \
+        > "$LOG_FILE" 2>&1 &
+  PID=$!
+  echo "$PID" > "$LOG_DIR/agent_gpu${GPU}.pid"
+  echo "Agent for GPU $GPU launched in background. PID: $PID | Logs: $LOG_FILE"
+  sleep 4  # Stagger startups slightly
+done
+echo "Launched ${#GPUS[@]} agents for sweep $SWEEP_ID. Logs: $LOG_DIR"
+

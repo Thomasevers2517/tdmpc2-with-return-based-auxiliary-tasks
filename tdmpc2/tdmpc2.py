@@ -119,7 +119,7 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
-			self._update = torch.compile(self._update, mode="reduce-overhead")
+			# self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="reduce-overhead", fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode="reduce-overhead", fullgraph=True)
@@ -546,7 +546,8 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			dict: Dictionary of training statistics.
 		"""
-		obs, action, reward, terminated, task = buffer.sample()
+		with maybe_range('update/sample_buffer', self.cfg):
+			obs, action, reward, terminated, task = buffer.sample()
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
