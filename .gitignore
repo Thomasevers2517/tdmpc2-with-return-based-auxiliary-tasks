@@ -1,3 +1,6 @@
+.nfs*
+nohup*
+
 # Logging
 tdmpc2/logs/
 tdmpc2/outputs/
@@ -129,5 +132,3 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-
-nohup.out
