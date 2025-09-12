@@ -74,9 +74,9 @@ def make_env(cfg):
 		env = None
 		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
 			try:
-				log.info('Trying to make environment with %s', fn.__module__)
 				env = fn(cfg)
-			except ValueError as e:
+				log.info('Making environment with %s', fn.__module__)
+			except ValueError:
 				pass
 		if env is None:
 			raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')

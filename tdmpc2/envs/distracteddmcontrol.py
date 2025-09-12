@@ -120,10 +120,16 @@ def make_env(cfg):
 	if (domain, task) not in distracted_suite.suite.ALL_TASKS:
 		raise ValueError('Unknown task:', task)
 	assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
+
 	env = distracted_suite.load(domain,
 					 task,
 					 task_kwargs={'random': cfg.seed},
-					 visualize_reward=False)
+					 # Use absolute path to vendored DAVIS frames so background wrapper finds videos.
+					 background_dataset_path=cfg.davis_dataset_path,
+					 visualize_reward=False,
+					dynamic=cfg.distracted_dynamic,
+					difficulty=cfg.distracted_difficulty)
+ 
 	env = action_scale.Wrapper(env, minimum=-1., maximum=1.)
 	env = DMControlWrapper(env, domain)
 	if cfg.obs == 'rgb':
