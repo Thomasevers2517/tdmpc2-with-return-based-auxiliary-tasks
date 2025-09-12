@@ -32,7 +32,11 @@ try:
 	from envs.mujoco import make_env as make_mujoco_env
 except:
 	make_mujoco_env = missing_dependencies
-
+try:
+    from envs.distracteddmcontrol import make_env as make_distracting_control_env
+except Exception as e:
+    print(e, flush=True)
+    make_distracting_control_env = missing_dependencies
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -68,16 +72,18 @@ def make_env(cfg):
 
 	else:
 		env = None
-		for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
 			try:
+				log.info('Trying to make environment with %s', fn.__module__)
 				env = fn(cfg)
-			except ValueError:
+			except ValueError as e:
 				pass
 		if env is None:
 			raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')
 		env = TensorWrapper(env)
 	try: # Dict
 		cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
+		log.info('Observation spaces: %s', cfg.obs_shape)
 	except: # Box
 		cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
 	cfg.action_dim = env.action_space.shape[0]
