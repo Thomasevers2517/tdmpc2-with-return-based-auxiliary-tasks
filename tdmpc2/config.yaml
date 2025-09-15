@@ -100,7 +100,7 @@ nvtx_profiler: false           # If true: add lightweight NVTX record_function r
 multi_gamma_gammas: [0.9, 0.95]              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
                                      # Non-empty length ≤ 6. Primary discount auto-prepended internally.
 multi_gamma_head: joint             # Head architecture: 'joint' (single Linear -> G_aux*K) or 'separate' (one Linear per aux γ).
-multi_gamma_loss_weight: 0.5        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
+multi_gamma_loss_weight: 0.1        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
 multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics (heavier overhead).
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true
