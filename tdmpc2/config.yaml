@@ -3,8 +3,8 @@ defaults:
     - override hydra/launcher: basic
 
 # environment
-task: dog-run
-obs: state
+task: reacher-easy
+obs: rgb
 episodic: false
 
 # evaluation
@@ -79,6 +79,7 @@ save_csv: true
 
 # misc
 compile: false
+compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
 save_video: false
 save_agent: false
 seed: 1

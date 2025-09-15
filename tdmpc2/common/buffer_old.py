@@ -1,6 +1,6 @@
 import torch
 from tensordict.tensordict import TensorDict
-from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage, TensorDictReplayBuffer
+from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage
 from torchrl.data.replay_buffers.samplers import SliceSampler
 from common.logging_utils import get_logger
 
@@ -27,11 +27,6 @@ class Buffer():
 		)
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
-  
-          # --- GPU prefetch machinery ---
-		self._copy_stream = torch.cuda.Stream()
-		self._prefetched_td_gpu = None
-		self._primed = False
 
 	@property
 	def capacity(self):
@@ -43,7 +38,7 @@ class Buffer():
 		"""Return the number of episodes in the buffer."""
 		return self._num_eps
 
-	def _reserve_buffer(self, storage, t = None):
+	def _reserve_buffer(self, storage):
 		"""
 		Reserve a buffer with the given storage.
 		"""
@@ -53,7 +48,6 @@ class Buffer():
 			pin_memory=self.cfg.pin_memory,
 			prefetch=self.cfg.prefetch,
 			batch_size=self._batch_size,
-   			transform= self.transform_sample
 		)
 
 	def _init(self, tds):
@@ -72,14 +66,9 @@ class Buffer():
 		log.info('Using %s memory for storage.', storage_device.upper())
 		self._storage_device = torch.device(storage_device)
 		return self._reserve_buffer(
-			LazyTensorStorage(self._capacity, device=self._storage_device), 
+			LazyTensorStorage(self._capacity, device=self._storage_device)
 		)
 
-	def transform_sample(self, td):
-		td = td.view(-1, self.cfg.horizon+1).permute(1, 0)
-		td = td.select("obs", "action", "reward", "terminated", "task", strict=False).pin_memory(0, inplace=False)
-		return td
-     
 	def load(self, td):
 		"""
 		Load a batch of episodes into the buffer. This is useful for loading data from disk,
@@ -93,8 +82,6 @@ class Buffer():
 		td = td.reshape(td.shape[0]*td.shape[1])
 		self._buffer.extend(td)
 		self._num_eps += num_new_eps
-		self._primed = False; self._prefetched_td_gpu = None
-
 		return self._num_eps
 
 	def add(self, td):
@@ -104,21 +91,14 @@ class Buffer():
 			self._buffer = self._init(td)
 		self._buffer.extend(td)
 		self._num_eps += 1
-		self._primed = False; self._prefetched_td_gpu = None
 		return self._num_eps
 
-
-
-	def sample(self):
-		"""Sample a batch of subsequences from the buffer."""
-		if not self._primed:
-			self._preload_gpu()
-			torch.cuda.current_stream().wait_stream(self._copy_stream)  # first batch only
-			self._primed = True
-		torch.cuda.current_stream().wait_stream(self._copy_stream)
-		td = self._prefetched_td_gpu
-		self._preload_gpu()  # overlap next copy with your compute on 'ready'
-
+	def _prepare_batch(self, td):
+		"""
+		Prepare a sampled batch for training (post-processing).
+		Expects `td` to be a TensorDict with batch size TxB.
+		"""
+		td = td.select("obs", "action", "reward", "terminated", "task", strict=False).to(self._device, non_blocking=True)
 		obs = td.get('obs').contiguous()
 		action = td.get('action')[1:].contiguous()
 		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
@@ -126,15 +106,13 @@ class Buffer():
 		if terminated is not None:
 			terminated = td.get('terminated')[1:].unsqueeze(-1).contiguous()
 		else:
-			terminated = torch.zeros_like(reward).contiguous()
+			terminated = torch.zeros_like(reward)
 		task = td.get('task', None)
 		if task is not None:
 			task = task[0].contiguous()
 		return obs, action, reward, terminated, task
 
-
-	def _preload_gpu(self):
-		td_cpu = self._buffer.sample()  # CPU, pinned, already sliced/reshaped
-		with torch.cuda.stream(self._copy_stream):
-			# one async H2D per tensor; pinned + non_blocking allows overlap
-			self._prefetched_td_gpu = td_cpu.to(self._device, non_blocking=True)
+	def sample(self):
+		"""Sample a batch of subsequences from the buffer."""
+		td = self._buffer.sample().view(-1, self.cfg.horizon+1).permute(1, 0)
+		return self._prepare_batch(td)

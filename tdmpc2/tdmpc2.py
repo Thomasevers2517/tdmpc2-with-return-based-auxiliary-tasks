@@ -119,10 +119,10 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
-			# self._update = torch.compile(self._update, mode="reduce-overhead")
+			self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
-			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode="reduce-overhead", fullgraph=True)
-			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode="reduce-overhead", fullgraph=True)
+			# self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
+			# self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
    
 
 	def reset_planner_state(self):
@@ -136,7 +136,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.compile:
 			# plan = torch.compile(self._plan, mode="reduce-overhead")
 			log.info('Compiling planning function with torch.compile...')
-			plan = torch.compile(self._plan, mode="reduce-overhead", fullgraph=True)
+			plan = torch.compile(self._plan, mode=self.cfg.compile_type, fullgraph=True)
 		else:
 			plan = self._plan
 		self._plan_val = plan
@@ -404,26 +404,27 @@ class TDMPC2(torch.nn.Module):
 
 	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
      # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
-      
-		with torch.no_grad():
-				# Encode next observations (time steps 1..T) → latent sequence next_z
-				next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
-				# Distributional TD targets (primary gamma) vs Q logits
-				td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
-				# Auxiliary scalar TD targets per gamma (optional)
-				aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
+		with maybe_range('Agent/calc_td_target', self.cfg):
+			with torch.no_grad():
+					# Encode next observations (time steps 1..T) → latent sequence next_z
+					next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
+					# Distributional TD targets (primary gamma) vs Q logits
+					td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
+					# Auxiliary scalar TD targets per gamma (optional)
+					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
 
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
-		z = self.model.encode(obs[0], task)  # initial latent (B,L)
-		zs[0] = z
-		consistency_loss = 0.
-		for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
-			z = self.model.next(z, _a, task)            # model prediction z_{t+1}
-			# Consistency MSE between predicted & encoded next latent
-			consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
-			zs[t+1] = z
+		with maybe_range('Agent/latent_rollout', self.cfg):
+			z = self.model.encode(obs[0], task)  # initial latent (B,L)
+			zs[0] = z
+			consistency_loss = 0.
+			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
+				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
+				# Consistency MSE between predicted & encoded next latent
+				consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
+				zs[t+1] = z
 
 		# ------------------------------ Model predictions for losses ------------------------------
 		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
@@ -548,6 +549,12 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('update/sample_buffer', self.cfg):
 			obs, action, reward, terminated, task = buffer.sample()
+			# if obs.is_pinned():
+			# 	log.info("obs is pinned")
+			# else:
+			# 	log.info("obs is not pinned")
+
+    
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
