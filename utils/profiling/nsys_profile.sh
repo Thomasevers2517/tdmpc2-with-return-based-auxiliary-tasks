@@ -21,7 +21,7 @@ mkdir -p "$OUT_DIR"
 # --gpu-metrics-devices=all 
 
 # Run Nsight Systems profiling; outputs go into $OUT_DIR
-CUDA_VISIBLE_DEVICES=2 nohup nsys profile \
+CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,opengl,python-gil,cudla \
 	--delay=2400 \
 	--duration=20 \

@@ -119,10 +119,10 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
-			self._update = torch.compile(self._update, mode="reduce-overhead")
+			# self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
-			# self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
-			# self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
+			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
+			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
    
 
 	def reset_planner_state(self):
