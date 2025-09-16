@@ -5,7 +5,7 @@ nohup*
 tdmpc2/logs/
 tdmpc2/outputs/
 tdmpc2/wandb/
-nsys_*
+
 
 # HPC
 nautilus/*.yaml
