@@ -19,13 +19,12 @@ mkdir -p "$OUT_DIR"
 
 # cuda, cuda-hw, cudnn cublas cublas-verbose cusparse-verbose, cudla, cudla-verbose, cusolver, opengl, cusolver-verbose, opengl-annotations openacc, openmp, osrt mpi, nvvideo, nvtx, dx11,dx11-annotations dx12,dx12-annotations tegra-accelerators, ucx, openxr, oshmem, openxr-annotations, python-gil, gds(beta) wddm, vulkan, vulkan-annotations, none
 # --gpu-metrics-devices=all 
-
+# --sample=none \
 # Run Nsight Systems profiling; outputs go into $OUT_DIR
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
-	--trace=cuda,nvtx,cudnn,cublas,opengl,python-gil,cudla \
-	--delay=2400 \
+	--trace=cuda,nvtx,cudnn,cublas,opengl,cudla \
+	--delay=1200 \
 	--duration=20 \
-	--sample=none \
 	--force-overwrite=true	-o "$OUT_DIR/profile" \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \

@@ -303,7 +303,7 @@ class WorldModel(nn.Module):
 				"action_prob": 1.,
 				"entropy": -log_prob,
 				"scaled_entropy": -log_prob * entropy_scale,
-			}, device=z.device)
+			}, device=z.device, non_blocking=True)
 			return action, info
 
 	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
