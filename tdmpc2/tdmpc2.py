@@ -1,5 +1,7 @@
 import torch
 import torch.nn.functional as F
+from torch import autocast
+
 
 from common import math
 from common.nvtx_utils import maybe_range
@@ -334,7 +336,9 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		pi_loss, info = self.calc_pi_losses(zs, task)
+		with autocast(device_type=self.device.type ,dtype=torch.bfloat16):
+			pi_loss, info = self.calc_pi_losses(zs, task)
+
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 		self.pi_optim.step()
@@ -531,7 +535,8 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
+			with autocast(device_type=self.device.type, dtype=torch.bfloat16):
+				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
 
 			# ------------------------------ Backprop & updates ------------------------------
 			

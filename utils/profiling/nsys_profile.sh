@@ -7,13 +7,15 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
+RUN_NAME="tdmpc2_reacher_easy_compiled_default_autocastbf16"
+
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Timestamped output directory under nsys_reports/
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="$ROOT_DIR/nsys_reports/$TIMESTAMP"
+OUT_DIR="$ROOT_DIR/nsys_reports/$TIMESTAMP-$RUN_NAME"
 mkdir -p "$OUT_DIR"
 
 
@@ -33,6 +35,6 @@ CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 		nvtx_profiler=true \
 		enable_wandb=false \
 		steps=2000000 \
-	> "$OUT_DIR/profile.log" 2>&1 &
+	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
 
 echo "Nsight profiling started. Reports: $OUT_DIR"

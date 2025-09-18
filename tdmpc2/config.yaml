@@ -79,7 +79,7 @@ save_csv: true
 
 # misc
 compile: false
-compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
+compile_type: default  # 'default', 'reduce-overhead', 'max-autotune'
 save_video: false
 save_agent: false
 seed: 1
