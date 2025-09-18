@@ -75,8 +75,5 @@ def train(cfg: dict):
 		)
 	trainer.train()
 	log.info('Training completed successfully')
-		
-
-
 if __name__ == '__main__':
 	train()

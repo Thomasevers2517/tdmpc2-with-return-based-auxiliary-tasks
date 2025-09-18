@@ -125,6 +125,20 @@ class TDMPC2(torch.nn.Module):
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
+			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			def optim_step():
+				self.optim.step()
+				return
+			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			def pi_optim_step():
+				self.pi_optim.step()
+				return
+			self.optim_step = optim_step
+			self.pi_optim_step = pi_optim_step
+		else:
+			self.optim_step = self.optim.step
+			self.pi_optim_step = self.pi_optim.step
+
    
 
 	def reset_planner_state(self):
@@ -341,7 +355,7 @@ class TDMPC2(torch.nn.Module):
 
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
-		self.pi_optim.step()
+		self.pi_optim_step()
 		self.pi_optim.zero_grad(set_to_none=True)
 
 		info = TensorDict({
@@ -542,7 +556,8 @@ class TDMPC2(torch.nn.Module):
 			
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
-			self.optim.step(); self.optim.zero_grad(set_to_none=True)
+			self.optim_step() #This may be compiled as well
+			self.optim.zero_grad(set_to_none=True)
 			info.update({
 				"grad_norm": grad_norm,
 			}, non_blocking=True)

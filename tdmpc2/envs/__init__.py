@@ -14,7 +14,8 @@ def missing_dependencies(task):
 
 try:
 	from envs.dmcontrol import make_env as make_dm_control_env
-except:
+except Exception as e:
+	print(e, flush=True)
 	make_dm_control_env = missing_dependencies
 try:
 	from envs.maniskill import make_env as make_maniskill_env
@@ -74,6 +75,7 @@ def make_env(cfg):
 		env = None
 		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
 			try:
+				log.info('Trying to make environment with %s', fn.__module__)
 				env = fn(cfg)
 				log.info('Making environment with %s', fn.__module__)
 			except ValueError:
