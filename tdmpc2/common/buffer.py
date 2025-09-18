@@ -77,7 +77,9 @@ class Buffer():
 
 	def transform_sample(self, td):
 		td = td.view(-1, self.cfg.horizon+1).permute(1, 0)
-		td = td.select("obs", "action", "reward", "terminated", "task", strict=False).pin_memory()
+		td = td.select("obs", "action", "reward", "terminated", "task", strict=False)
+		if self._storage_device.type == 'cpu':
+			td = td.pin_memory()
 		return td
      
 	def load(self, td):

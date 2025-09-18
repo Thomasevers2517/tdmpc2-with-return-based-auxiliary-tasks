@@ -27,17 +27,21 @@ metric:
 parameters:
   task:
     values:
-      - acrobot-swingup
-      - finger-turn-easy
-      - finger-turn-hard
-      - walker-walk
+      # - acrobot-swingup
+      # - cheetah-run
+      # - finger-turn-easy
+      # - finger-turn-hard
+      # - walker-walk
       - walker-run
-      - reacher-hard
-      - quadruped-walk
-
+      # - reacher-hard
+      - reacher-easy
+      # - quadruped-walk
+  utd_ratio:
+    values: [1, 2]
   multi_gamma_head: 
     values:
-        - separate   
+        - separate  
+        - joint 
   seed:
     values: [102, 203, 304]
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
@@ -45,10 +49,13 @@ parameters:
     values:
       - [0.90, 0.95]
       - [0.5, 0.7, 0.9, 0.95]
+      - [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+  joint_aux_dim_mult:
+    values: [1, 2]
   multi_gamma_loss_weight:
     values: [0.1, 0.5]
   steps:
-    value: 1000000
+    value: 250000
   eval_freq:
     value: 25000
   batch_size:

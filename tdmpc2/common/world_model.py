@@ -54,7 +54,7 @@ class WorldModel(nn.Module):
 			self._num_aux_gamma = len(gammas)
 			in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Qs = layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+				self._aux_joint_Qs = layers.mlp(in_dim, 2*[cfg.mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
 				self._aux_separate_Qs = torch.nn.ModuleList([
 					layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)

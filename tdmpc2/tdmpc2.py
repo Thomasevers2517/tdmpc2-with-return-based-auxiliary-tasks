@@ -583,10 +583,6 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('update/sample_buffer', self.cfg):
 			obs, action, reward, terminated, task = buffer.sample()
-			# if obs.is_pinned():
-			# 	log.info("obs is pinned")
-			# else:
-			# 	log.info("obs is not pinned")
 
     
 		kwargs = {}
