@@ -77,7 +77,7 @@ for GPU in "${GPUS[@]}"; do
   PID=$!
   echo "$PID" > "$LOG_DIR/agent_gpu${GPU}.pid"
   echo "Agent for GPU $GPU launched in background. PID: $PID | Logs: $LOG_FILE"
-  sleep 4  # Stagger startups slightly
+  sleep 20  # Stagger startups slightly
 done
 echo "Launched ${#GPUS[@]} agents for sweep $SWEEP_ID. Logs: $LOG_DIR"
 
