@@ -29,7 +29,7 @@ tau: 0.01
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
-buffer_size: 100_000
+buffer_size: 10_000
 
 pin_memory: true
 prefetch: 4
@@ -111,6 +111,9 @@ distributional_bootstrap: true  # If true, use distributional (C51-style) TD tar
 distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixed distractors)
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'
 davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/envs/custom_envs/distracting_control/DAVIS/JPEGImages/480p  # Path to DAVIS dataset for Distracting Control tasks
+
+use_bfloat16: true   # If true, use bfloat16 precision with autocasting. If false, use float32.
+
 # convenience
 work_dir: ???
 task_title: ???

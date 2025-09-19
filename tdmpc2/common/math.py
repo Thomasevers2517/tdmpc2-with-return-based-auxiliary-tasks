@@ -265,7 +265,6 @@ def project_value_distribution(next_logits, reward, terminated, discount, cfg, e
 
 	# --- (10) Detach: targets are fixed for loss computation ---
 	out = target.detach()
-	_log('project_value_distribution', out)
 	return out
 
 def distribution_variance(logits, cfg):

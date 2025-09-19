@@ -74,7 +74,8 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
-		# ------------------------------------------------------------------
+		self.dtype = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
+  # ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
 		# auxiliary Q ensemble parameters (joint or separate) so they are
@@ -351,7 +352,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		with autocast(device_type=self.device.type ,dtype=torch.bfloat16):
+		with autocast(device_type=self.device.type, dtype=self.dtype):
 			pi_loss, info = self.calc_pi_losses(zs, task)
 
 		pi_loss.backward()
@@ -435,10 +436,10 @@ class TDMPC2(torch.nn.Module):
 				gamma = self._all_gammas[g+1]
 				boot_g = bootstrap[g, ...]  # (T,B,1)
 				aux_targets.append(project_value_distribution(boot_g, reward, terminated, gamma, self.cfg))  # (T,B,K)
-				aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+			aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 			return aux_targets
 
-	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
+	def calc_wm_losses(self, obs, action, reward, terminated, task=None, log_details=False):
      # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
@@ -448,7 +449,7 @@ class TDMPC2(torch.nn.Module):
 					td_targets = self._td_target(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (T,B,K)
 					# Auxiliary scalar TD targets per gamma (optional)
 					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (G_aux,T,B,1) or None
-
+						
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
@@ -555,7 +556,8 @@ class TDMPC2(torch.nn.Module):
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
 		return total_loss, zs, info
   
-	def _update(self, obs, action, reward, terminated, task=None):
+	
+	def _update(self, obs, action, reward, terminated, task=None, debug=False):
 		"""Single gradient update step.
 
 		Args:
@@ -567,8 +569,10 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			with autocast(device_type=self.device.type, dtype=torch.bfloat16):
-				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
+
+			with autocast(device_type=self.device.type, dtype=self.dtype):
+				# Compute losses and latent rollout		
+				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task, debug=debug)
 
 			# ------------------------------ Backprop & updates ------------------------------
 			
