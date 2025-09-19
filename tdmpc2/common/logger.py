@@ -242,3 +242,6 @@ class Logger:
 				self._log_dir / "eval.csv", header=keys, index=None
 			)
 		self._print(d, category)
+
+def tensor_details(tensor):
+	return f"{tensor.dtype} {tensor.device} {tensor.shape}"

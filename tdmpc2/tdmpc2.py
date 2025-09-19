@@ -500,7 +500,7 @@ class TDMPC2(torch.nn.Module):
 			val_ce = math.soft_ce(
 				qs.reshape(Qe * T * B, K),
 				# expand td_targets to (Qe,T,B,1) then flatten
-				td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe * T * B, 1),
+				td_targets.expand(Qe, -1, -1, -1).reshape(Qe * T * B, self.cfg.num_bins),
 				self.cfg,
 			)
 			val_ce = val_ce.view(Qe, T, B, 1).mean(dim=(0,2)).squeeze(-1)  # (T)
@@ -557,7 +557,7 @@ class TDMPC2(torch.nn.Module):
 		return total_loss, zs, info
   
 	
-	def _update(self, obs, action, reward, terminated, task=None, debug=False):
+	def _update(self, obs, action, reward, terminated, task=None, log_details=False):
 		"""Single gradient update step.
 
 		Args:
@@ -572,7 +572,8 @@ class TDMPC2(torch.nn.Module):
 
 			with autocast(device_type=self.device.type, dtype=self.dtype):
 				# Compute losses and latent rollout		
-				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task, debug=debug)
+				log.debug
+				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task, log_details=log_details)
 
 			# ------------------------------ Backprop & updates ------------------------------
 			
