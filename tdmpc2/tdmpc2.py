@@ -10,6 +10,7 @@ from common.world_model import WorldModel
 from common.layers import api_model_conversion
 from tensordict import TensorDict
 from common.logging_utils import get_logger
+from common.math import project_value_distribution
 
 log = get_logger(__name__)
 
@@ -368,7 +369,7 @@ class TDMPC2(torch.nn.Module):
 		return info
 
 	@torch.no_grad()
-	def _td_target(self, next_z, reward, terminated, task):
+	def _td_target(self, next_z, reward, terminated, task, distributional=False):
 		"""
 		Compute the TD-target from a reward and the observation at the following time step.
 
@@ -383,18 +384,24 @@ class TDMPC2(torch.nn.Module):
 		"""
 		action, _ = self.model.pi(next_z, task)
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		# Primary TD target distribution (still stored as distributional bins via CE loss)
-		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)  # (T,B,K)
+		if not distributional:
+			# Scalar TD target (for auxiliary targets only)
+			td = reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
+			return math.two_hot(td, self.cfg)
+		else:
+			# Distributional TD target (primary target for value loss)
+			next_q = self.model.Q(next_z, action, task, return_type='minexpected_dist', target=True)  # (T,B,K)
+			td_target = project_value_distribution(next_q, reward, terminated, discount, self.cfg)  # (T,B,K)
+			return td_target
 
 	@torch.no_grad()
-	def _td_target_aux(self, next_z, reward, terminated, task):
+	def _td_target_aux(self, next_z, reward, terminated, task, distributional=False):
 		"""Compute auxiliary TD targets per gamma using Q_aux(min) bootstrap.
 
 		Uses a conservative (min over two sampled ensemble members) per-gamma
 		bootstrap produced internally by `Q_aux(return_type='min')`.
 
-		TODO: Potential enhancement: use full distributional auxiliary logits
-		as targets (would require adapting loss to compare distributions). Also do this in normal td target comp
+
 
 		Args:
 			next_z (torch.Tensor): Latent states at t+1. Shape (T,B,L).
@@ -409,16 +416,27 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 		action, _ = self.model.pi(next_z, task)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K) scalar per gamma (single head)
-		if bootstrap is None:
-			return None
-		aux_targets = []
-		for g in range(G_aux):
-			gamma = self._all_gammas[g+1]
-			boot_g = bootstrap[g, ...]  # (T,B,1)
-			aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
-		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+		if not distributional: 
+			bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K) scalar per gamma (single head)
 
+			aux_targets = []
+			for g in range(G_aux):
+				gamma = self._all_gammas[g+1]
+				boot_g = bootstrap[g, ...]  # (T,B,1)
+				aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
+				aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+			return aux_targets
+		else:
+			# Distributional auxiliary targets (not currently used)
+			bootstrap = self.model.Q_aux(next_z, action, task, return_type='dist', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K)
+
+			aux_targets = []
+			for g in range(G_aux):
+				gamma = self._all_gammas[g+1]
+				boot_g = bootstrap[g, ...]  # (T,B,1)
+				aux_targets.append(project_value_distribution(boot_g, reward, terminated, gamma, self.cfg))  # (T,B,K)
+				aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+			return aux_targets
 
 	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
      # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
@@ -427,9 +445,9 @@ class TDMPC2(torch.nn.Module):
 					# Encode next observations (time steps 1..T) → latent sequence next_z
 					next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
 					# Distributional TD targets (primary gamma) vs Q logits
-					td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
+					td_targets = self._td_target(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (T,B,K)
 					# Auxiliary scalar TD targets per gamma (optional)
-					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
+					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (G_aux,T,B,1) or None
 
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
@@ -454,7 +472,7 @@ class TDMPC2(torch.nn.Module):
 		# Auxiliary logits (if enabled)
 		q_aux_logits = None
 		if aux_td_targets is not None:
-			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (G_aux,T,B,K)
+			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='dist')  # (G_aux,T,B,K)
 
 		with maybe_range('Agent/order_losses', self.cfg):
 

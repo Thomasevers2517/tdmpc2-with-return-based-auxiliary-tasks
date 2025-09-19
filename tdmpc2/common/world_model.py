@@ -307,17 +307,11 @@ class WorldModel(nn.Module):
 			return action, info
 
 	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
-		"""Predict auxiliary state-action value distributions (no ensemble).
 
-		Args:
-			z: (T,B,L) or (B,L) latent states
-			a: aligned actions
-			return_type: 'all' -> logits (T,B,G_aux,K); 'min'/'avg' -> scalar values (T,B,G_aux,1)
-		"""
 		with maybe_range('WM/Q_aux', self.cfg):
 			if self._num_aux_gamma == 0:
 				return None
-			assert return_type in {'all','min','avg'}
+			assert return_type in {'dist','min','avg' }
 
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
@@ -341,7 +335,7 @@ class WorldModel(nn.Module):
 					outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
 				out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
 	
-			if return_type == 'all':
+			if return_type == 'dist':
 				return out
 			vals = math.two_hot_inv(out, self.cfg)  # (G_aux,T,B,1) 
 			return vals  # 'min'/'avg' identical with single head
@@ -354,7 +348,7 @@ class WorldModel(nn.Module):
 			- `all`: return all Q-values.
 		`target` specifies whether to use the target Q-networks or not.
 		"""
-		assert return_type in {'min', 'avg', 'all'}
+		assert return_type in {'min', 'avg', 'all', 'minexpected_dist'}
 
 		with maybe_range('WM/Q', self.cfg):
 			if self.cfg.multitask:
@@ -372,6 +366,13 @@ class WorldModel(nn.Module):
 
 			if return_type == 'all':
 				return out
+			elif return_type == 'minexpected_dist':
+				# Take expectation over full ensemble (not subsampled)
+				E = math.expected_from_logits(out, self.cfg)  # (Qs,T,B,1)
+				min_index = E.argmin(0, keepdim=True) # (1,T,B,1)
+				# Select, for each (T,B), the ensemble head with minimal expected value and return its logits
+				idx = min_index.expand(-1, E.shape[1], E.shape[2], out.shape[-1])  # (1,T,B,K)
+				return out.gather(dim=0, index=idx).squeeze(0)  # (T,B,K)
 
 			qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
 			Q = math.two_hot_inv(out[qidx], self.cfg)
