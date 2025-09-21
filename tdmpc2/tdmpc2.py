@@ -512,7 +512,7 @@ class TDMPC2(torch.nn.Module):
 				G_aux = aux_td_targets.shape[0]
 				aux_ce = math.soft_ce(
 					q_aux_logits.reshape(G_aux * T * B, K),
-					aux_td_targets.reshape(G_aux * T * B, 1),
+					aux_td_targets.reshape(G_aux * T * B, K),
 					self.cfg,
 				)
 				aux_ce = aux_ce.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # (G_aux,T)
