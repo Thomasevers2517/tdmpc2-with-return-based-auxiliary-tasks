@@ -489,7 +489,7 @@ class TDMPC2(torch.nn.Module):
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
-				reward.reshape(T * B, 1),
+				math.two_hot(reward.reshape(T * B, 1)),
 				self.cfg,
 			)
 			rew_ce = rew_ce.view(T, B, 1).mean(dim=1).squeeze(-1)  # (T,)
