@@ -500,7 +500,7 @@ class TDMPC2(torch.nn.Module):
 			val_ce = math.soft_ce(
 				qs.reshape(Qe * T * B, K),
 				# expand td_targets to (Qe,T,B,1) then flatten
-				td_targets.expand(Qe, -1, -1, -1).reshape(Qe * T * B, self.cfg.num_bins),
+				td_targets.expand(Qe, -1, -1, -1).reshape(Qe * T * B, K),
 				self.cfg,
 			)
 			val_ce = val_ce.view(Qe, T, B, 1).mean(dim=(0,2)).squeeze(-1)  # (T)
