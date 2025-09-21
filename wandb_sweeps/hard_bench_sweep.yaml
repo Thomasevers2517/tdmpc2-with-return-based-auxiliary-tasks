@@ -33,9 +33,9 @@ parameters:
       # - walker-walk
       # - walker-run
       # - reacher-hard
-      # - quadruped-walk
+      - quadruped-walk
   seed:
-    values: [101, 202]
+    values: [101, 202, 303,403]
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
@@ -45,7 +45,7 @@ parameters:
   multi_gamma_loss_weight:
     values: [0.1] #, 0.025, 1]
   steps:
-    value: 2000000
+    value: 1000000
   eval_freq:
     value: 25000
   batch_size:

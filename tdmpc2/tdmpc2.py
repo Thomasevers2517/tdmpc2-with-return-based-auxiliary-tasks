@@ -73,7 +73,7 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
-		self.dtype = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
+		self.model_data_type = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
   		# ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
@@ -351,7 +351,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		with autocast(device_type=self.device.type ,dtype=self.dtype):
+		with autocast(device_type=self.device.type ,dtype=self.model_data_type):
 			pi_loss, info = self.calc_pi_losses(zs, task)
 
 		pi_loss.backward()
@@ -422,7 +422,7 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
-     # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
+     # TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
 					# Encode next observations (time steps 1..T) → latent sequence next_z
@@ -550,7 +550,7 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			with autocast(device_type=self.device.type, dtype=self.dtype):
+			with autocast(device_type=self.device.type, dtype=self.model_data_type):
 				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
 
 			# ------------------------------ Backprop & updates ------------------------------
