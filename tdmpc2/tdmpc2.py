@@ -73,7 +73,8 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
-		# ------------------------------------------------------------------
+		self.dtype = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
+  		# ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
 		# auxiliary Q ensemble parameters (joint or separate) so they are
@@ -350,7 +351,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		with autocast(device_type=self.device.type ,dtype=torch.bfloat16):
+		with autocast(device_type=self.device.type ,dtype=self.dtype):
 			pi_loss, info = self.calc_pi_losses(zs, task)
 
 		pi_loss.backward()
@@ -549,7 +550,7 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			with autocast(device_type=self.device.type, dtype=torch.bfloat16):
+			with autocast(device_type=self.device.type, dtype=self.dtype):
 				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
 
 			# ------------------------------ Backprop & updates ------------------------------

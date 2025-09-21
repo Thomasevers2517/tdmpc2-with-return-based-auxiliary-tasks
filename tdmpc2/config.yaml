@@ -106,6 +106,8 @@ multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics 
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true
 
+use_bfloat16: false            # If true: use bfloat16 precision with autocast where applicable (saves memory, may be faster).
+
 distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixed distractors)
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'
 davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/envs/custom_envs/distracting_control/DAVIS/JPEGImages/480p  # Path to DAVIS dataset for Distracting Control tasks
