@@ -113,7 +113,7 @@ distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixe
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'
 davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/envs/custom_envs/distracting_control/DAVIS/JPEGImages/480p  # Path to DAVIS dataset for Distracting Control tasks
 
-use_bfloat16: true   # If true, use bfloat16 precision with autocasting. If false, use float32.
+use_bfloat16: false   # If true, use bfloat16 precision with autocasting. If false, use float32.
 
 # convenience
 work_dir: ???

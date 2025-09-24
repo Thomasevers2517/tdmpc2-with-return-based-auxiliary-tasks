@@ -398,11 +398,6 @@ class TDMPC2(torch.nn.Module):
 	def _td_target_aux(self, next_z, reward, terminated, task, distributional=False):
 		"""Compute auxiliary TD targets per gamma using Q_aux(min) bootstrap.
 
-		Uses a conservative (min over two sampled ensemble members) per-gamma
-		bootstrap produced internally by `Q_aux(return_type='min')`.
-
-
-
 		Args:
 			next_z (torch.Tensor): Latent states at t+1. Shape (T,B,L).
 			reward (torch.Tensor): Immediate rewards at t. Shape (T,B,1).
@@ -488,7 +483,7 @@ class TDMPC2(torch.nn.Module):
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
-				math.two_hot(reward.reshape(T * B, 1)),
+				math.two_hot(reward.reshape(T * B, 1), self.cfg),
 				self.cfg,
 			)
 			rew_ce = rew_ce.view(T, B, 1).mean(dim=1).squeeze(-1)  # (T,)
