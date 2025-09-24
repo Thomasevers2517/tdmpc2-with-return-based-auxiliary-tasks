@@ -321,7 +321,6 @@ class TDMPC2(torch.nn.Module):
 			rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
 			actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
 			a, std = actions[0], std[0]
-			self._prev_mean.copy_(mean)
 			return a, std, mean
 
 	def update_planner_mean(self, mean):
