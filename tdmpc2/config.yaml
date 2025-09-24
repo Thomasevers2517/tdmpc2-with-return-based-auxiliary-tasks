@@ -29,7 +29,7 @@ tau: 0.01
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
-buffer_size: 100_000
+buffer_size: 1000_000
 
 pin_memory: true
 prefetch: 4
@@ -106,7 +106,8 @@ multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics 
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true
 
-distributional_bootstrap: false  # If true, use distributional (C51-style) TD targets for both primary and auxiliary Q. If false, use standard scalar TD targets.
+distributional_bootstrap: false  # If true, use distributional (C51-style) TD targets for both primary. If false, use standard scalar TD targets.
+distributional_bootstrap_aux: false  # If true, use distributional (C51-style) TD targets for auxiliary Q only. If false, use standard scalar TD targets.
 
 distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixed distractors)
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'

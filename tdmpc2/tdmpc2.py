@@ -322,7 +322,6 @@ class TDMPC2(torch.nn.Module):
 			rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
 			actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
 			a, std = actions[0], std[0]
-			self._prev_mean.copy_(mean)
 			return a, std, mean
 
 	def update_planner_mean(self, mean):
@@ -448,7 +447,7 @@ class TDMPC2(torch.nn.Module):
 					# Distributional TD targets (primary gamma) vs Q logits
 					td_targets = self._td_target(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (T,B,K)
 					# Auxiliary scalar TD targets per gamma (optional)
-					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap)  # (G_aux,T,B,1) or None
+					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task, distributional=self.cfg.distributional_bootstrap_aux)  # (G_aux,T,B,1) or None
 						
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
