@@ -37,6 +37,8 @@ prefetch: 4
 exp_name: default
 data_dir: ???
 
+verbose: false
+log_interval: 500   # Log every N steps if verbose is true
 # planning
 mpc: true
 iterations: 6

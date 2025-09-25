@@ -75,6 +75,7 @@ class TDMPC2(torch.nn.Module):
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
 		self.dtype = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
+		self._step = 0
   # ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
@@ -125,8 +126,8 @@ class TDMPC2(torch.nn.Module):
 			log.info('Compiling update function with torch.compile...')
 			# self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
-			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
-			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
+			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=not self.cfg.verbose)
+			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=not self.cfg.verbose)
 			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
 			def optim_step():
 				self.optim.step()
@@ -141,7 +142,17 @@ class TDMPC2(torch.nn.Module):
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
 
-   
+	def log_tensor(self, value, tag=''):
+		if not self.cfg.verbose:
+			return
+		if tag== 'step':
+			self._step += 1
+
+		if (self._step % self.cfg.log_interval == 0):
+			if isinstance(value, torch.Tensor):
+				value = value
+			log.info(f'Step {self._step} --- {tag} -- {value.shape}: {value}')
+		return
 
 	def reset_planner_state(self):
 		self._prev_mean.zero_() 
@@ -154,7 +165,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.compile:
 			# plan = torch.compile(self._plan, mode="reduce-overhead")
 			log.info('Compiling planning function with torch.compile...')
-			plan = torch.compile(self._plan, mode=self.cfg.compile_type, fullgraph=True)
+			plan = torch.compile(self._plan, mode=self.cfg.compile_type, fullgraph= not self.cfg.verbose)
 		else:
 			plan = self._plan
 		self._plan_val = plan
@@ -418,8 +429,9 @@ class TDMPC2(torch.nn.Module):
 			for g in range(G_aux):
 				gamma = self._all_gammas[g+1]
 				boot_g = bootstrap[g, ...]  # (T,B,1)
-				aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
-				aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+				aux_td = reward + gamma * (1 - terminated) * boot_g
+				aux_targets.append(aux_td)  # (T,B,1)
+			aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 			aux_targets = math.two_hot(aux_targets.reshape(-1, 1), self.cfg)
 			return aux_targets
 		else:
@@ -434,7 +446,8 @@ class TDMPC2(torch.nn.Module):
 			aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 			return aux_targets
 
-	def calc_wm_losses(self, obs, action, reward, terminated, task=None, log_details=False):
+	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
+		self.log_tensor(obs[0,0].detach(), tag='step')
      # TODO no looping for calcing loss  +  fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
@@ -492,24 +505,35 @@ class TDMPC2(torch.nn.Module):
 
 			# Value CE across ensemble heads (Qe,T,B) -> mean over B, sum over heads, weight by rho
 			Qe = qs.shape[0]
+			td_targets = td_targets.unsqueeze(0).expand(Qe, -1, -1)
+			qs = qs.view(Qe, T * B, K)
 			val_ce = math.soft_ce(
 				qs.reshape(Qe * T * B, K),
 				# expand td_targets to (Qe,T*B,K) then flatten
-				td_targets.unsqueeze(0).expand(Qe, -1, -1).reshape(Qe * T * B, K),
+				td_targets.reshape(Qe * T * B, K),
 				self.cfg,
 			)
+			self.log_tensor(td_targets[0,0,:], tag='td_target_sample')
+			self.log_tensor(qs[0,0,:], tag='q_sample')
+			self.log_tensor(val_ce.view(Qe, T*B)[0,0], tag='val_ce_sample')
+   
 			val_ce = val_ce.view(Qe, T, B, 1).mean(dim=(0,2)).squeeze(-1)  # (T)
 			value_loss = (val_ce * rho_pows).sum() / T
 
 			# Auxiliary per-gamma losses (optional), vectorized over (G_aux,T,B)
 			aux_value_losses = None
 			if q_aux_logits is not None:
-				G_aux = aux_td_targets.view(-1, T, B, K).shape[0]
+				aux_td_targets = aux_td_targets.view(-1, T*B, K)
+				G_aux = aux_td_targets.shape[0]
+
 				aux_ce = math.soft_ce(
 					q_aux_logits.reshape(G_aux * T * B, K),
 					aux_td_targets.reshape(G_aux * T * B, K),
 					self.cfg,
 				)
+				self.log_tensor(aux_td_targets[:,0,:], tag='aux_td_target_sample')
+				self.log_tensor(q_aux_logits[:,0,:], tag='q_aux_sample')
+				self.log_tensor(aux_ce.view(G_aux, T*B)[:,0], tag='aux_ce_sample')
 				aux_ce = aux_ce.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # (G_aux,T)
 				aux_value_losses = (aux_ce * rho_pows.unsqueeze(0)).sum(dim=1) / T  # (G_aux,)
 
@@ -568,7 +592,7 @@ class TDMPC2(torch.nn.Module):
 			with autocast(device_type=self.device.type, dtype=self.dtype):
 				# Compute losses and latent rollout		
 				log.debug
-				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task, log_details=log_details)
+				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
 
 			# ------------------------------ Backprop & updates ------------------------------
 			
