@@ -387,7 +387,7 @@ class TDMPC2(torch.nn.Module):
 		if not distributional:
 			# Scalar TD target (for auxiliary targets only)
 			td = reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)
-			return math.two_hot(td, self.cfg)
+			return math.two_hot(td.reshape(-1, 1), self.cfg)
 		else:
 			# Distributional TD target (primary target for value loss)
 			next_q = self.model.Q(next_z, action, task, return_type='minexpected_dist', target=True)  # (T,B,K)
@@ -420,6 +420,7 @@ class TDMPC2(torch.nn.Module):
 				boot_g = bootstrap[g, ...]  # (T,B,1)
 				aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
 				aux_targets = torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+			aux_targets = math.two_hot(aux_targets.reshape(-1, 1), self.cfg)
 			return aux_targets
 		else:
 			# Distributional auxiliary targets (not currently used)
@@ -493,8 +494,8 @@ class TDMPC2(torch.nn.Module):
 			Qe = qs.shape[0]
 			val_ce = math.soft_ce(
 				qs.reshape(Qe * T * B, K),
-				# expand td_targets to (Qe,T,B,1) then flatten
-				td_targets.expand(Qe, -1, -1, -1).reshape(Qe * T * B, K),
+				# expand td_targets to (Qe,T*B,K) then flatten
+				td_targets.unsqueeze(0).expand(Qe, -1, -1).reshape(Qe * T * B, K),
 				self.cfg,
 			)
 			val_ce = val_ce.view(Qe, T, B, 1).mean(dim=(0,2)).squeeze(-1)  # (T)
@@ -503,7 +504,7 @@ class TDMPC2(torch.nn.Module):
 			# Auxiliary per-gamma losses (optional), vectorized over (G_aux,T,B)
 			aux_value_losses = None
 			if q_aux_logits is not None:
-				G_aux = aux_td_targets.shape[0]
+				G_aux = aux_td_targets.view(-1, T, B, K).shape[0]
 				aux_ce = math.soft_ce(
 					q_aux_logits.reshape(G_aux * T * B, K),
 					aux_td_targets.reshape(G_aux * T * B, K),

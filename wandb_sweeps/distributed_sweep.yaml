@@ -27,15 +27,15 @@ metric:
 parameters:
   task:
     values:
-      # - acrobot-swingup
+      - acrobot-swingup
       # - cheetah-run
       # - finger-turn-easy
       # - finger-turn-hard
       # - walker-walk
-      - walker-run
-      # - reacher-hard
-      - reacher-easy
-      # - quadruped-walk
+      # - walker-run
+      - reacher-hard
+      # - reacher-easy
+      - quadruped-walk
   utd_ratio:
     values: [1]
   multi_gamma_head: 
@@ -61,11 +61,12 @@ parameters:
   multi_gamma_loss_weight:
     values: [0.1, 0.03]
   distributional_bootstrap:
-    values: [false, true]
+    values: [false]
+    # values: [false, true]
   distributional_bootstrap_aux:
     values: [true]
   steps:
-    value: 250000
+    value: 1000000
   eval_freq:
     value: 25000
   batch_size:
