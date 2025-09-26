@@ -420,7 +420,7 @@ class TDMPC2(torch.nn.Module):
 		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 
 
-	def calc_wm_losses(self, obs, action, reward, terminated, task=None):
+	def calc_wm_losses(self, obs, action, reward, terminated, actor_critic_only=False ,task=None):
      # TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
@@ -434,15 +434,24 @@ class TDMPC2(torch.nn.Module):
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
-		with maybe_range('Agent/latent_rollout', self.cfg):
-			z = self.model.encode(obs[0], task)  # initial latent (B,L)
-			zs[0] = z
-			consistency_loss = 0.
-			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
-				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
-				# Consistency MSE between predicted & encoded next latent
-				consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
-				zs[t+1] = z
+  
+		if actor_critic_only:
+			with maybe_range('Agent/latent_rollout', self.cfg):
+				with torch.no_grad():
+					zs[0] = self.model.encode(obs[0], task)  # initial latent (B,L)
+				consistency_loss = torch.tensor(0., device=self.device)
+				for t in range(self.cfg.horizon):
+					zs[t+1] = self.model.next(zs[t], action[t], task)            # model prediction z_{t+1}
+		else:
+			with maybe_range('Agent/latent_rollout', self.cfg):
+				z = self.model.encode(obs[0], task)  # initial latent (B,L)
+				zs[0] = z
+				consistency_loss = 0.
+				for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
+					z = self.model.next(z, _a, task)            # model prediction z_{t+1}
+					# Consistency MSE between predicted & encoded next latent
+					consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
+					zs[t+1] = z
 		# ------------------------------ Model predictions for losses ------------------------------
 		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
 		qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
@@ -537,7 +546,7 @@ class TDMPC2(torch.nn.Module):
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
 		return total_loss, zs, info
   
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, actor_critic_only, task=None):
 		"""Single gradient update step.
 
 		Args:
@@ -550,7 +559,7 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
 			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, task)
+				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, actor_critic_only=actor_critic_only, task=task)
 
 			# ------------------------------ Backprop & updates ------------------------------
 			
@@ -571,7 +580,7 @@ class TDMPC2(torch.nn.Module):
 			info.update(pi_info, non_blocking=True)
 			return info.detach().mean()
 
-	def update(self, buffer):
+	def update(self, buffer, actor_critic_only=False):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -589,4 +598,7 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, **kwargs)
+		return self._update(obs, action, reward, terminated, actor_critic_only=actor_critic_only, **kwargs)
+
+	def reset_params(self):
+		return 
