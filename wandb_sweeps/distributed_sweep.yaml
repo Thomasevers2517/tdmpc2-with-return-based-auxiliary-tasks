@@ -57,7 +57,7 @@ parameters:
     values: [1,2]
 
   value_coef:
-    values: [0.1, 0.03]
+    values: [0.1]
   multi_gamma_loss_weight:
     values: [0.1, 0.03]
   distributional_bootstrap:
