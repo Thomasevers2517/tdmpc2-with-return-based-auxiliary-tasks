@@ -15,7 +15,7 @@ eval_freq: 50000
 # training
 utd_ratio: 1
 ac_utd_multiplier: 1
-reset_agent_freq: 40_000_000  
+reset_agent_freq: 40_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
 
 steps: 10_000_000
 batch_size: 256

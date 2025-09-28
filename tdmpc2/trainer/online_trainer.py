@@ -129,7 +129,7 @@ class OnlineTrainer(Trainer):
 					for i in range(self.cfg.ac_utd_multiplier-1):
 						_train_metrics = self.agent.update(self.buffer, actor_critic_only=True)
 
-			if self._step % self.cfg.reset_agent_freq == 0 and self._step > 0:
+			if (self._step / (self.cfg.utd_ratio*self.cfg.ac_utd_multiplier)) % self.cfg.reset_agent_freq == 0 and self._step > 0:
 				self.reset_params(self.agent.model)
 				log.info('Reset agent at step %d', self._step)
 					

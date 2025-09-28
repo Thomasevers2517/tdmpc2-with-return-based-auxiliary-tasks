@@ -41,7 +41,7 @@ parameters:
   ac_utd_multiplier: 
     values: [2,4]
   reset_agent_freq: 
-    values: [40_000_000]
+    values: [40_000] 
   multi_gamma_head: 
     values:
         - separate  
