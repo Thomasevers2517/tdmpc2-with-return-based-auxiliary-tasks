@@ -40,7 +40,7 @@ parameters:
     values: [1]
   multi_gamma_head: 
     values:
-        # - separate  
+        - separate  
         - joint 
   seed:
     values: [102, 203, 304]
@@ -54,12 +54,12 @@ parameters:
       # - [0.7, 0.9, 0.95, 0.97]
 
   joint_aux_dim_mult:
-    values: [1,2]
+    values: [2, 8]
 
   value_coef:
     values: [0.1]
   multi_gamma_loss_weight:
-    values: [0.1, 0.03]
+    values: [0.1, 0.01]
   distributional_bootstrap:
     values: [false]
     # values: [false, true]
