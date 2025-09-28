@@ -600,5 +600,3 @@ class TDMPC2(torch.nn.Module):
 		torch.compiler.cudagraph_mark_step_begin()
 		return self._update(obs, action, reward, terminated, actor_critic_only=actor_critic_only, **kwargs)
 
-	def reset_params(self):
-		return 

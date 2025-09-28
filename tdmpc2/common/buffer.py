@@ -68,7 +68,7 @@ class Buffer():
 		total_bytes = bytes_per_step*self._capacity
 		log.info('Storage required: %.2f GB', total_bytes/1e9)
 		# Heuristic: decide whether to use CUDA or CPU memory
-		storage_device = 'cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
+		storage_device = 'cpu' #cuda:0' if 2.5*total_bytes < mem_free else 'cpu'
 		log.info('Using %s memory for storage.', storage_device.upper())
 		self._storage_device = torch.device(storage_device)
 		return self._reserve_buffer(

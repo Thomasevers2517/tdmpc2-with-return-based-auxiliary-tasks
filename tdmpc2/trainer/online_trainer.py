@@ -130,10 +130,20 @@ class OnlineTrainer(Trainer):
 						_train_metrics = self.agent.update(self.buffer, actor_critic_only=True)
 
 			if self._step % self.cfg.reset_agent_freq == 0 and self._step > 0:
-				self.agent.reset_params()
+				self.reset_params(self.agent.model)
 				log.info('Reset agent at step %d', self._step)
 					
 
 			self._step += 1
 
 		self.logger.finish(self.agent)
+	def reset_params(self, module):
+		"""Reset the parameters of a torch module"""
+		for layer in module.children():
+			if hasattr(layer, 'reset_parameters'):
+				layer.reset_parameters()
+				print(f'Reset parameters of layer {layer}')
+			else:
+				print(f'Checking children of layer {layer}')
+				self.reset_params(layer)
+		return 
