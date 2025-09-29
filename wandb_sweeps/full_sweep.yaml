@@ -56,7 +56,7 @@ parameters:
   joint_aux_dim_mult:
     values: [1, 2]
   multi_gamma_loss_weight:
-    values: [0.03, 0.1, 0.3]
+    values: [0.1]
   steps:
     value: 250000
   eval_freq:

@@ -8,6 +8,12 @@ from common.nvtx_utils import maybe_range
 from common.scale import RunningScale
 from common.world_model import WorldModel
 from common.layers import api_model_conversion
+from utils.reset import (
+	clear_optimizer_state,
+	hard_reset_module,
+	shrink_perturb_module,
+	sync_auxiliary_detach,
+)
 from tensordict import TensorDict
 from common.logging_utils import get_logger
 
@@ -145,6 +151,98 @@ class TDMPC2(torch.nn.Module):
 	def reset_planner_state(self):
 		self._prev_mean.zero_() 
 	
+	def reset_agent(self):
+		log.info('===== Agent reset start =====')
+		cfg_reset = self.cfg.reset
+		fallbacks = cfg_reset["fallbacks"]
+		default_alpha = float(fallbacks["shrink_alpha"])
+		default_noise = float(fallbacks["shrink_noise_std"])
+
+		def _resolve_type(section):
+			return str(section["type"]).lower()
+
+		def _resolve_layers(section, fallback=-1):
+			value = section["layers"]
+			if value is None:
+				return fallback
+			try:
+				return int(value)
+			except (TypeError, ValueError):
+				log.warning('Invalid layers value %s; defaulting to %s', value, fallback)
+				return fallback
+
+		def _resolve_alpha(section):
+			value = section["alpha"]
+			return default_alpha if value is None else float(value)
+
+		def _resolve_noise(section):
+			value = section["noise_std"]
+			return default_noise if value is None else float(value)
+
+		actor_cfg = cfg_reset["actor_critic"]
+		encoder_cfg = cfg_reset["encoder_dynamics"]
+		actor_type = _resolve_type(actor_cfg)
+		encoder_type = _resolve_type(encoder_cfg)
+		if actor_type == 'none' and encoder_type == 'none':
+			log.info('No reset actions configured (actor_critic=none, encoder_dynamics=none); skipping.')
+			return
+
+		actor_layers = _resolve_layers(actor_cfg)
+		encoder_layers = _resolve_layers(encoder_cfg)
+		actor_alpha = _resolve_alpha(actor_cfg)
+		actor_noise = _resolve_noise(actor_cfg)
+		encoder_alpha = _resolve_alpha(encoder_cfg)
+		encoder_noise = _resolve_noise(encoder_cfg)
+
+		log.info('Actor-critic reset config: type=%s, layers=%s, alpha=%s, noise_std=%s', actor_type, actor_layers, actor_alpha, actor_noise)
+		log.info('Encoder-dynamics reset config: type=%s, layers=%s, alpha=%s, noise_std=%s', encoder_type, encoder_layers, encoder_alpha, encoder_noise)
+
+		policy_params = []
+		critic_params = []
+		encoder_params = []
+
+		if actor_type == 'full':
+			policy_params.extend(hard_reset_module(self.model._pi, actor_layers, module_name='model._pi', logger=log))
+			critic_params.extend(hard_reset_module(self.model._Qs, actor_layers, module_name='model._Qs', logger=log))
+			if self.model._aux_joint_Qs is not None:
+				critic_params.extend(hard_reset_module(self.model._aux_joint_Qs, actor_layers, module_name='model._aux_joint_Qs', logger=log))
+			elif self.model._aux_separate_Qs is not None:
+				for idx, head in enumerate(self.model._aux_separate_Qs):
+					critic_params.extend(hard_reset_module(head, actor_layers, module_name=f'model._aux_separate_Qs[{idx}]', logger=log))
+		elif actor_type == 'shrink_perturb':
+			policy_params.extend(shrink_perturb_module(self.model._pi, actor_layers, actor_alpha, actor_noise, module_name='model._pi', logger=log))
+			critic_params.extend(shrink_perturb_module(self.model._Qs, actor_layers, actor_alpha, actor_noise, module_name='model._Qs', logger=log))
+			if self.model._aux_joint_Qs is not None:
+				critic_params.extend(shrink_perturb_module(self.model._aux_joint_Qs, actor_layers, actor_alpha, actor_noise, module_name='model._aux_joint_Qs', logger=log))
+			elif self.model._aux_separate_Qs is not None:
+				for idx, head in enumerate(self.model._aux_separate_Qs):
+					critic_params.extend(shrink_perturb_module(head, actor_layers, actor_alpha, actor_noise, module_name=f'model._aux_separate_Qs[{idx}]', logger=log))
+		else:
+			log.info('Actor-critic reset skipped (type=%s)', actor_type)
+
+		if encoder_type == 'full':
+			for key, encoder in self.model._encoder.items():
+				encoder_params.extend(hard_reset_module(encoder, encoder_layers, module_name=f'model._encoder[{key}]', logger=log))
+			encoder_params.extend(hard_reset_module(self.model._dynamics, encoder_layers, module_name='model._dynamics', logger=log))
+		elif encoder_type == 'shrink_perturb':
+			for key, encoder in self.model._encoder.items():
+				encoder_params.extend(shrink_perturb_module(encoder, encoder_layers, encoder_alpha, encoder_noise, module_name=f'model._encoder[{key}]', logger=log))
+			encoder_params.extend(shrink_perturb_module(self.model._dynamics, encoder_layers, encoder_alpha, encoder_noise, module_name='model._dynamics', logger=log))
+		else:
+			log.info('Encoder-dynamics reset skipped (type=%s)', encoder_type)
+
+		touched_policy = len(policy_params)
+		touched_model = len(critic_params) + len(encoder_params)
+		log.info('Touched %d policy parameters and %d model parameters during reset', touched_policy, touched_model)
+
+		clear_optimizer_state(self.pi_optim, policy_params, 'policy', logger=log)
+		clear_optimizer_state(self.optim, list({p for p in critic_params + encoder_params}), 'world_model', logger=log)
+
+		sync_auxiliary_detach(self.model, logger=log)
+		self.scale.reset()
+		log.info('RunningScale reset invoked post-parameter reset')
+		log.info('===== Agent reset complete =====')
+
 	@property
 	def plan(self):
 		_plan_val = getattr(self, "_plan_val", None)
