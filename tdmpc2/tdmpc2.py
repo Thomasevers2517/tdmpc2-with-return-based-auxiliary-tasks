@@ -220,7 +220,16 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.mpc:
 				# if not eval_mode:
 				# a = (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
-				a, std, mean = self.plan(obs, task=task)
+				score, elite_actions, mean, std = self.plan(obs, task=task)
+							# Select first action from sampled distribution; add exploration noise if training
+				if self.cfg.best_eval and eval_mode:
+					# Take best action sequence
+					idx = torch.argmax(score)
+				else:
+					idx = math.gumbel_softmax_sample(score.squeeze(1))
+				actions = torch.index_select(elite_actions, 1, idx).squeeze(1)
+				a, std = actions[0], std[0]
+				
 				self.update_planner_mean(mean)
 				if eval_mode:
 					return a
@@ -317,11 +326,8 @@ class TDMPC2(torch.nn.Module):
 					mean = mean * self.model._action_masks[task]
 					std = std * self.model._action_masks[task]
 
-			# Select first action from sampled distribution; add exploration noise if training
-			rand_idx = math.gumbel_softmax_sample(score.squeeze(1))
-			actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
-			a, std = actions[0], std[0]
-			return a, std, mean
+			return score, elite_actions, mean, std
+
 
 	def update_planner_mean(self, mean):
 		self._prev_mean.copy_(mean)
