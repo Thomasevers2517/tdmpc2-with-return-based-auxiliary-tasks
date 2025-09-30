@@ -37,14 +37,25 @@ parameters:
       # - reacher-easy
       - quadruped-walk
   utd_ratio:
-    values: [1,2]
+    values: [2, 4]
   ac_utd_multiplier: 
-    values: [2,4]
+    values: [1]
   reset_agent_freq: 
-    values: [512_000, 1_024_000, 256_000] 
+    values: [128_000] 
+  reset:
+    fallbacks:
+    actor_critic:
+        type: full                   # none | full | shrink_perturb (policy + all Q heads)
+        layers: -1                    # -1 ⇒ all learnable layers, otherwise last-k layers
+        alpha: null                  # optional override when type == shrink_perturb
+        noise_std: null              # optional override when type == shrink_perturb
+    encoder_dynamics:
+        type: full         # none | full | shrink_perturb (encoder + dynamics)
+        layers: -1                   # applies to each sub-encoder independently
+        alpha: null                  # optional override when type == shrink_perturb
+        noise_std: null              # optional override when type == shrink_perturb
   multi_gamma_head: 
     values:
-        - separate  
         - joint 
   seed:
     values: [102, 203, 304]
