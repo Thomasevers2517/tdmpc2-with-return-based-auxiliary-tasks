@@ -120,6 +120,16 @@ class TDMPC2(torch.nn.Module):
 			self._all_gammas = [float(self.discount)]
 		log.info('Episode length: %s', cfg.episode_length)
 		log.info('Discount factor: %s', str(self.discount))
+
+		if self.cfg.policy_ema_enabled:
+			log.info('Policy EMA enabled (tau=%s)', self.cfg.policy_ema_tau)
+		else:
+			log.info('Policy EMA disabled')
+
+		if self.cfg.encoder_ema_enabled:
+			log.info('Encoder EMA enabled (tau=%s)', self.cfg.encoder_ema_tau)
+		else:
+			log.info('Encoder EMA disabled')
 		# Buffer for MPPI warm-start action mean; shape (T, A)
 		self.register_buffer(
 			"_prev_mean",
@@ -150,7 +160,7 @@ class TDMPC2(torch.nn.Module):
 
 	def reset_planner_state(self):
 		self._prev_mean.zero_() 
-	
+
 	def reset_agent(self):
 		log.info('===== Agent reset start =====')
 		cfg_reset = self.cfg.reset
@@ -237,6 +247,7 @@ class TDMPC2(torch.nn.Module):
 
 		clear_optimizer_state(self.pi_optim, policy_params, 'policy', logger=log)
 		clear_optimizer_state(self.optim, list({p for p in critic_params + encoder_params}), 'world_model', logger=log)
+		self.model.reset_policy_encoder_targets()
 
 		sync_auxiliary_detach(self.model, logger=log)
 		self.scale.reset()
@@ -295,6 +306,7 @@ class TDMPC2(torch.nn.Module):
 		state_dict = state_dict["model"] if "model" in state_dict else state_dict
 		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
 		self.model.load_state_dict(state_dict)
+		self.model.reset_policy_encoder_targets()
 		return
 
 	@torch.no_grad()
@@ -321,11 +333,11 @@ class TDMPC2(torch.nn.Module):
 				a, std, mean = self.plan(obs, task=task)
 				self.update_planner_mean(mean)
 				if eval_mode:
-					return a
+					return a # TODO not bad idea to perhaps take mean of elites here instead. (this is argmax, used to be a sample)
 				else:
 					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
 			z = self.model.encode(obs, task)
-			action, info = self.model.pi(z, task)
+			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:
 				action = info["mean"]
 			return action[0]
@@ -352,7 +364,7 @@ class TDMPC2(torch.nn.Module):
 				discount = discount * discount_update
 				if self.cfg.episodic:
 					termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
-			action, _ = self.model.pi(z, task)
+			action, _ = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
 
 	@torch.no_grad()
@@ -376,9 +388,9 @@ class TDMPC2(torch.nn.Module):
 				pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 				_z = z.repeat(self.cfg.num_pi_trajs, 1)
 				for t in range(self.cfg.horizon-1):
-					pi_actions[t], _ = self.model.pi(_z, task)
+					pi_actions[t], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled)
 					_z = self.model.next(_z, pi_actions[t], task)
-				pi_actions[-1], _ = self.model.pi(_z, task)
+				pi_actions[-1], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled)
 
 			# Initialize state and parameters
 			z = z.repeat(self.cfg.num_samples, 1)
@@ -479,7 +491,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: TD-target.
 		"""
-		action, _ = self.model.pi(next_z, task)
+		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		# Primary TD target distribution (still stored as distributional bins via CE loss)
 		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)  # (T,B,K)
@@ -506,7 +518,7 @@ class TDMPC2(torch.nn.Module):
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
 			return None
-		action, _ = self.model.pi(next_z, task)
+		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
 		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K) scalar per gamma (single head)
 		if bootstrap is None:
 			return None
@@ -519,15 +531,15 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated, actor_critic_only=False ,task=None):
-     # TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
+		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
-					# Encode next observations (time steps 1..T) → latent sequence next_z
-					next_z = self.model.encode(obs[1:], task)                 # (T,B,L)
-					# Distributional TD targets (primary gamma) vs Q logits
-					td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
-					# Auxiliary scalar TD targets per gamma (optional)
-					aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
+				# Encode next observations (time steps 1..T) → latent sequence next_z
+				next_z = self.model.encode(obs[1:], task, use_ema=self.cfg.encoder_ema_enabled)  # (T,B,L)
+				# Distributional TD targets (primary gamma) vs Q logits
+				td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
+				# Auxiliary scalar TD targets per gamma (optional)
+				aux_td_targets = self._td_target_aux(next_z, reward, terminated, task)  # (G_aux,T,B,1) or None
 
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
@@ -671,6 +683,15 @@ class TDMPC2(torch.nn.Module):
 			# Policy update (detached latent sequence)
 			pi_info = self.update_pi(zs.detach(), task)
 			self.model.soft_update_target_Q()
+			self.model.soft_update_policy_encoder_targets()
+			if self.cfg.encoder_ema_enabled:
+				info.update({
+					"encoder_ema_max_delta": torch.tensor(self.model.encoder_target_max_delta, device=self.device)
+				}, non_blocking=True)
+			if self.cfg.policy_ema_enabled:
+				info.update({
+					"policy_ema_max_delta": torch.tensor(self.model.policy_target_max_delta, device=self.device)
+				}, non_blocking=True)
 
 			# ------------------------------ Logging tensor dict ------------------------------
 			self.model.eval()

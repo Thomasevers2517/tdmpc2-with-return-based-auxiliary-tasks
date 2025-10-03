@@ -30,6 +30,20 @@ class WorldModel(nn.Module):
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
+		self._target_encoder = None
+		self._target_pi = None
+		self.encoder_target_max_delta = 0.0
+		self.policy_target_max_delta = 0.0
+		if cfg.encoder_ema_enabled:
+			self._target_encoder = deepcopy(self._encoder)
+			for param in self._target_encoder.parameters():
+				param.requires_grad_(False)
+			self._target_encoder.eval()
+		if cfg.policy_ema_enabled:
+			self._target_pi = deepcopy(self._pi)
+			for param in self._target_pi.parameters():
+				param.requires_grad_(False)
+			self._target_pi.eval()
 
 		# ------------------------------------------------------------------
 		# Auxiliary multi-gamma action-value heads (training-only)
@@ -65,6 +79,7 @@ class WorldModel(nn.Module):
 
 		self.apply(init.weight_init)
 		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
+		self.reset_policy_encoder_targets()
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
@@ -203,6 +218,36 @@ class WorldModel(nn.Module):
 					for h, sz in zip(self._detach_aux_separate_Qs, self.aux_separate_sizes):
 						vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
 						offset += sz
+
+	def _soft_update_module(self, target_module, source_module, tau):
+		with torch.no_grad():
+			target_params = list(target_module.parameters())
+			source_params = list(source_module.parameters())
+			if len(target_params) != len(source_params):
+				raise RuntimeError('Source/target parameter count mismatch during EMA update')
+			for target, source in zip(target_params, source_params):
+				target.data.lerp_(source.data, tau)
+			online_vec = parameters_to_vector(source_params).detach()
+			target_vec = parameters_to_vector(target_params).detach()
+			return torch.max(torch.abs(online_vec - target_vec)).item()
+
+	def soft_update_policy_encoder_targets(self):
+		updates = {}
+		if self._target_encoder is not None:
+			updates['encoder'] = self._soft_update_module(self._target_encoder, self._encoder, float(self.cfg.encoder_ema_tau))
+			self.encoder_target_max_delta = updates['encoder']
+		if self._target_pi is not None:
+			updates['policy'] = self._soft_update_module(self._target_pi, self._pi, float(self.cfg.policy_ema_tau))
+			self.policy_target_max_delta = updates['policy']
+		return updates
+
+	def reset_policy_encoder_targets(self):
+		if self._target_encoder is not None:
+			self._target_encoder.load_state_dict(self._encoder.state_dict())
+			self.encoder_target_max_delta = 0.0
+		if self._target_pi is not None:
+			self._target_pi.load_state_dict(self._pi.state_dict())
+			self.policy_target_max_delta = 0.0
 				
 	def task_emb(self, x, task):
 		"""
@@ -219,17 +264,23 @@ class WorldModel(nn.Module):
 			emb = emb.repeat(x.shape[0], 1)
 		return torch.cat([x, emb], dim=-1)
 
-	def encode(self, obs, task):
+	def encode(self, obs, task, use_ema=False):
 		"""
 		Encodes an observation into its latent representation.
 		This implementation assumes a single state-based observation.
 		"""
 		with maybe_range('WM/encode', self.cfg):
+			if use_ema:
+				if self._target_encoder is None:
+					raise RuntimeError('Encoder target requested but not initialized')
+				encoder = self._target_encoder
+			else:
+				encoder = self._encoder
 			if self.cfg.multitask:
 				obs = self.task_emb(obs, task)
 			if self.cfg.obs == 'rgb' and obs.ndim == 5:
-				return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
-			return self._encoder[self.cfg.obs](obs)
+				return torch.stack([encoder[self.cfg.obs](o) for o in obs])
+			return encoder[self.cfg.obs](obs)
 
 	def next(self, z, a, task):
 		"""
@@ -263,39 +314,39 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(self._termination(z))
 		
 
-	def pi(self, z, task):
+	def pi(self, z, task, use_ema=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
 		mean and (log) std predicted by a neural network.
 		"""
 		with maybe_range('WM/pi', self.cfg):
+			if use_ema:
+				if self._target_pi is None:
+					raise RuntimeError('Policy target requested but not initialized')
+				module = self._target_pi
+			else:
+				module = self._pi
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 
-			# Gaussian policy prior
-			mean, log_std = self._pi(z).chunk(2, dim=-1)
+			mean, log_std = module(z).chunk(2, dim=-1)
 			log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 			eps = torch.randn_like(mean, device=mean.device)
 
-			if self.cfg.multitask: # Mask out unused action dimensions
+			if self.cfg.multitask:
 				mean = mean * self._action_masks[task]
 				log_std = log_std * self._action_masks[task]
 				eps = eps * self._action_masks[task]
 				action_dims = self._action_masks.sum(-1)[task].unsqueeze(-1)
-			else: # No masking
+			else:
 				action_dims = None
 
 			log_prob = math.gaussian_logprob(eps, log_std)
-
-			# Scale log probability by action dimensions
 			size = eps.shape[-1] if action_dims is None else action_dims
 			scaled_log_prob = log_prob * size
-
-			# Reparameterization trick
 			action = mean + eps * log_std.exp()
 			mean, action, log_prob = math.squash(mean, action, log_prob)
-
 			entropy_scale = scaled_log_prob / (log_prob + 1e-8)
 			info = TensorDict({
 				"mean": mean,
