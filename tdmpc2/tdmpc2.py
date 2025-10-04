@@ -356,7 +356,7 @@ class TDMPC2(torch.nn.Module):
 
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
-		self.pi_optim_step()
+		self.pi_optim.step()
 		self.pi_optim.zero_grad(set_to_none=True)
 
 		info = TensorDict({
@@ -557,7 +557,7 @@ class TDMPC2(torch.nn.Module):
 			
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
-			self.optim_step() #This may be compiled as well
+			self.optim.step()
 			self.optim.zero_grad(set_to_none=True)
 			info.update({
 				"grad_norm": grad_norm,
