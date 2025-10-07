@@ -1,6 +1,11 @@
 import torch
 from torch.nn import Buffer
 
+from common.logging_utils import get_logger
+
+
+log = get_logger(__name__)
+
 
 class RunningScale(torch.nn.Module):
 	"""Running trimmed scale estimator."""
@@ -45,6 +50,11 @@ class RunningScale(torch.nn.Module):
 		if update:
 			self.update(x)
 		return x / self.value
+
+	def reset(self):
+		prev = self.value.detach().clone()
+		self.value.copy_(torch.ones_like(self.value))
+		log.info('RunningScale reset: value %s -> %s', prev.flatten().cpu().tolist(), self.value.flatten().cpu().tolist())
 
 	def __repr__(self):
 		return f'RunningScale(S: {self.value})'
