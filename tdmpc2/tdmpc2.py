@@ -660,14 +660,68 @@ class TDMPC2(torch.nn.Module):
 				info.update({f"aux_value_loss/g{g}_gamma{gamma_val:.4f}": loss_g}, non_blocking=True)
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
-		return total_loss, zs, info
+		target_zs = torch.cat((zs[0:1].detach(), next_z), dim=0).detach()
+		return total_loss, zs, info, target_zs
 	
-	def calc_imagine_value_loss(self, zs, task):
+	def calc_imagine_value_loss(self, target_zs, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
-			# Compute 1-step TD targets along imagined trajectory
-			with torch.no_grad():
-				# Shifted latent sequence (
-     
+			im_horizon = self.cfg.imagine_horizon
+			num_start_states = self.cfg.imagine_num_starts
+			batch_size = target_zs.shape[1]
+			imagine_value_loss = torch.tensor(0., device=self.device)
+			imagine_info = TensorDict({}, device=self.device)
+			# 
+			total_states = target_zs.shape[0]
+			if num_start_states > total_states:
+				raise ValueError(f"Requested {num_start_states} start states but only {total_states} are available.")
+			random_scores = torch.rand(total_states, batch_size, device=target_zs.device)
+			start_states_idx = torch.argsort(random_scores, dim=0)[:num_start_states]
+			index = start_states_idx.unsqueeze(-1).expand(-1, -1, target_zs.size(-1))
+			start_z = torch.gather(target_zs, 0, index)
+   
+			start_z = start_z.reshape(-1, target_zs.size(-1))
+			reward = torch.zeros((num_start_states*batch_size, im_horizon, self.cfg.num_bins), device=self.device)
+			actions = torch.zeros((im_horizon, num_start_states*batch_size, self.cfg.action_dim), device=self.device)
+			rolled_out_z = torch.zeros((im_horizon, num_start_states*batch_size, target_zs.size(-1)), device=self.device)
+			z = start_z
+			for t in range(im_horizon):
+				# Predict action from current state
+				action, pi_info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
+				actions[t, :, :] = action
+				rolled_out_z[t, :, :] = z
+				# Compute Q-values for state and action
+				reward_pred = self.model.reward(z, action, task)  # (num_start_states*B,K)
+				reward[t, :, :] = reward_pred
+				# Step dynamics forward
+				z = self.model.next(z, action, task)  # (num_start_states*B,L)
+			# Compute TD target for final state
+			td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=self.cfg.discount)  # (num_start_states*B,K)
+			# Compute Q-values for all state-action pairs
+			#TODO The idea is to create imagined td targets. Thing is, if we roll out anyways, migh
+			return imagine_value_loss, imagine_info
+
+	def multi_step_td_target(self, actions, rollout_z, rewards, task, discount=None):	
+		"""Compute multi-step TD target for imagined trajectories.	
+		Args:
+			actions: (im_horizon, num_start_states*B, A)
+			rollout_z: (im_horizon, num_start_states*B, L)
+			rewards: (im_horizon, num_start_states*B, K)
+			discount: float or (num_tasks,) tensor
+			task: Task index tensor or None.
+		Returns:
+			(torch.Tensor): (num_start_states*B, K) scalar TD targets
+		"""
+		td_targets = torch.zeros((rewards.shape[0], rewards.shape[1], rewards.shape[2]), device=rewards.device)
+
+		with torch.no_grad():
+			Qs = self.model.Q(rollout_z[-1], actions[-1], task, return_type='min')  # (num_start_states*B, K)
+		td_targets = torch.zero(rewards.shape[1], rewards.shape[2], device=rewards.device)
+		for t in range(rewards.shape[0]):
+			td_targets += (discount**t) * rewards[t]
+		td_targets += (discount**(rewards.shape[0])) * Qs
+      
+			
+		return 
 	def _update(self, obs, action, reward, terminated, actor_critic_only, task=None):
 		"""Single gradient update step.
 
@@ -681,10 +735,12 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
 			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				total_loss, zs, info = self.calc_wm_losses(obs, action, reward, terminated, actor_critic_only=actor_critic_only, task=task)
+				wm_loss, zs, info, target_zs = self.calc_wm_losses(obs, action, reward, terminated, actor_critic_only=actor_critic_only, task=task)
+    		
+				imagine_value_loss, imagine_info = self.calc_imagine_value_loss(target_zs.detach())
 
 			# ------------------------------ Backprop & updates ------------------------------
-			
+			total_loss = wm_loss+imagine_value_loss
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			self.optim_step() #This may be compiled as well
@@ -694,6 +750,11 @@ class TDMPC2(torch.nn.Module):
 			}, non_blocking=True)
 			# Policy update (detached latent sequence)
 			pi_info = self.update_pi(zs.detach(), task)
+
+
+
+   
+   
 			self.model.soft_update_target_Q()
 			self.model.soft_update_policy_encoder_targets()
 			if self.cfg.encoder_ema_enabled:
