@@ -73,19 +73,24 @@ parameters:
     values: [1]
   multi_gamma_loss_weight:
     values: [0.1]
-  policy_ema_enabled:
-    values: [false, true]
-  policy_ema_tau:
-    values: [0.005, 0.05]
-  encoder_ema_enabled:
-    values: [false, true]
-  encoder_ema_tau:
-    values: [0.005, 0.05]
+  # policy_ema_enabled:
+  #   values: [false, true]
+  # policy_ema_tau:
+  #   values: [0.005, 0.05]
+  # encoder_ema_enabled:
+  #   values: [false, true]
+  # encoder_ema_tau:
+  #   values: [0.005, 0.05]
 
-  num_samples:
-    values: [256, 512]
-  iterations:
-    values: [4]
+  # num_samples:
+  #   values: [256, 512]
+  # iterations:
+  #   values: [6]
+  mlp_dim: 
+    values: [256, 384, 512]
+  # latent_dim: 
+  #   values: [256, 512]
+  
 
   steps:
     value: 300000
@@ -94,7 +99,7 @@ parameters:
   batch_size:
     value: 256
   model_size:
-    value: 5
+    value: ???
   obs:
     value: state
   compile:
