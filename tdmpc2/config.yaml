@@ -49,12 +49,12 @@ reset:
         shrink_alpha: 0.9            # fallback α for shrink-perturb resets
         shrink_noise_std: 0.05       # fallback σ for shrink-perturb resets
     actor_critic:
-        type: full                   # none | full | shrink_perturb (policy + all Q heads)
+        type: none                   # none | full | shrink_perturb (policy + all Q heads)
         layers: 1                    # -1 ⇒ all learnable layers, otherwise last-k layers
         alpha: null                  # optional override when type == shrink_perturb
         noise_std: null              # optional override when type == shrink_perturb
     encoder_dynamics:
-        type: shrink_perturb         # none | full | shrink_perturb (encoder + dynamics)
+        type: none         # none | full | shrink_perturb (encoder + dynamics)
         layers: -1                   # applies to each sub-encoder independently
         alpha: null                  # optional override when type == shrink_perturb
         noise_std: null              # optional override when type == shrink_perturb
