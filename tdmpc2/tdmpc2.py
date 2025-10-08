@@ -647,14 +647,23 @@ class TDMPC2(torch.nn.Module):
 			"aux_value_loss_mean": aux_value_loss_mean,
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
+			"consistency_loss_weighted": self.cfg.consistency_coef * consistency_loss,
+			"reward_loss_weighted": self.cfg.reward_coef * reward_loss,
+			"value_loss_weighted": self.cfg.value_coef * value_loss,
+			"aux_value_loss_mean_weighted": self.cfg.multi_gamma_loss_weight * aux_value_loss_mean,
+			"termination_loss_weighted": self.cfg.termination_coef * termination_loss,
 		}, device=self.device, non_blocking=True)
 		for i in range(T):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i]}, non_blocking=True)
+		    #add weighted consistency loss per step
+			info.update({f"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i]}, non_blocking=True)
+		# Add auxiliary losses per gamma
   
 		if aux_value_losses is not None:
 			for g, loss_g in enumerate(aux_value_losses):
 				gamma_val = self._all_gammas[g+1]
 				info.update({f"aux_value_loss/gamma{gamma_val:.4f}": loss_g}, non_blocking=True)
+				info.update({f"aux_value_loss_weighted/gamma{gamma_val:.4f}": self.cfg.multi_gamma_loss_weight * loss_g}, non_blocking=True)
 
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
@@ -711,6 +720,7 @@ class TDMPC2(torch.nn.Module):
 			imagine_value_loss = val_ce.mean(dim=0).squeeze(-1)  # scalar
 			imagine_info = TensorDict({
 				"imagine_value_loss": imagine_value_loss,
+				"imagine_value_loss_weighted": self.cfg.imagine_value_loss_coef * imagine_value_loss,
 			}, device=self.device, non_blocking=True)
 
 			return imagine_value_loss, imagine_info
