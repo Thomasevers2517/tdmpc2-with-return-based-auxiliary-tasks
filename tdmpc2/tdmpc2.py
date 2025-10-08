@@ -552,17 +552,17 @@ class TDMPC2(torch.nn.Module):
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
-		consistency_loss = torch.tensor(0., device=self.device)
-
-
+		consistency_losses = torch.zeros(self.cfg.horizon, device=self.device)
+  
 		with maybe_range('Agent/latent_rollout', self.cfg):
 			z = self.model.encode(obs[0], task)  # initial latent (B,L)
 			zs[0] = z
 			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
 				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
 				# Consistency MSE between predicted & encoded next latent
-				consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
+				consistency_losses[t] = F.mse_loss(z, _target_next_z)
 				zs[t+1] = z
+
 		# ------------------------------ Model predictions for losses ------------------------------
 		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
 		qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
@@ -581,12 +581,12 @@ class TDMPC2(torch.nn.Module):
 			# ------------------------------ Vectorized loss computation ------------------------------
 			T, B = reward_preds.shape[:2]
 			K = reward_preds.shape[-1]
-			# Per-time discount weights rho^t (T,)
-			rho_pows = torch.pow(
-				self.cfg.rho,
-				torch.arange(T, device=self.device, dtype=reward_preds.dtype)
-			)
-
+			rho_pows = torch.pow(self.cfg.rho,
+			torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
+		)
+			# Consistency loss (MSE) over latent prediction errors, weighted by rho^t
+			consistency_loss = (rho_pows * consistency_losses).sum()
+   
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
@@ -648,11 +648,14 @@ class TDMPC2(torch.nn.Module):
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
 		}, device=self.device, non_blocking=True)
+		for i in range(T):
+			info.update({f"consistency_loss/step{i}": consistency_losses[i]}, non_blocking=True)
   
 		if aux_value_losses is not None:
 			for g, loss_g in enumerate(aux_value_losses):
 				gamma_val = self._all_gammas[g+1]
-				info.update({f"aux_value_loss/g{g}_gamma{gamma_val:.4f}": loss_g}, non_blocking=True)
+				info.update({f"aux_value_loss/gamma{gamma_val:.4f}": loss_g}, non_blocking=True)
+
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
 		target_zs = torch.cat((zs[0:1].detach(), next_z), dim=0).detach()
@@ -660,7 +663,7 @@ class TDMPC2(torch.nn.Module):
 	
 	def calc_imagine_value_loss(self, target_zs, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
-			im_horizon = self.cfg.imagine_horizon
+			im_horizon = self.cfg.imagination_horizon
 			num_start_states = self.cfg.imagine_num_starts
 			batch_size = target_zs.shape[1]
 			imagine_value_loss = torch.tensor(0., device=self.device)
@@ -764,7 +767,7 @@ class TDMPC2(torch.nn.Module):
 					imagine_info = TensorDict({}, device=self.device)
 
 			# ------------------------------ Backprop & updates ------------------------------
-			total_loss = wm_loss+imagine_value_loss * self.cfg.imagine_value_loss_coef
+			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			self.optim_step() #This may be compiled as well
