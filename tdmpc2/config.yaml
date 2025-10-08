@@ -11,11 +11,16 @@ episodic: false
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 50000
-
+best_eval: false
 # training
 utd_ratio: 1
 ac_utd_multiplier: 1
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
+
+imagination_enabled: true
+imagine_horizon: 3
+imagine_num_starts: 3
+imagine_value_loss_coef: 0.05
 
 steps: 4_000_000
 batch_size: 256

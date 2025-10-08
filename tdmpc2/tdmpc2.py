@@ -142,6 +142,8 @@ class TDMPC2(torch.nn.Module):
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
+			self.calc_imagine_value_loss = torch.compile(self.calc_imagine_value_loss, mode=self.cfg.compile_type, fullgraph=True)
+   
 			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
 			def optim_step():
 				self.optim.step()
@@ -536,7 +538,7 @@ class TDMPC2(torch.nn.Module):
 		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 
 
-	def calc_wm_losses(self, obs, action, reward, terminated, actor_critic_only=False ,task=None):
+	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):
 		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
@@ -552,22 +554,15 @@ class TDMPC2(torch.nn.Module):
 		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
 		consistency_loss = torch.tensor(0., device=self.device)
 
-		if actor_critic_only:
-			with maybe_range('Agent/latent_rollout', self.cfg):
-				with torch.no_grad():
-					zs[0] = self.model.encode(obs[0], task)  # initial latent (B,L)
-					for t in range(self.cfg.horizon):
-						#TODO For complex observation for which encoding is expensive, consider applying consistency loss between all states in the trajectory
-						zs[t+1] = self.model.next(zs[t], action[t], task)            # model prediction z_{t+1}
-		else:
-			with maybe_range('Agent/latent_rollout', self.cfg):
-				z = self.model.encode(obs[0], task)  # initial latent (B,L)
-				zs[0] = z
-				for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
-					z = self.model.next(z, _a, task)            # model prediction z_{t+1}
-					# Consistency MSE between predicted & encoded next latent
-					consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
-					zs[t+1] = z
+
+		with maybe_range('Agent/latent_rollout', self.cfg):
+			z = self.model.encode(obs[0], task)  # initial latent (B,L)
+			zs[0] = z
+			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
+				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
+				# Consistency MSE between predicted & encoded next latent
+				consistency_loss = consistency_loss + F.mse_loss(z, _target_next_z) * (self.cfg.rho**t)
+				zs[t+1] = z
 		# ------------------------------ Model predictions for losses ------------------------------
 		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
 		qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
@@ -680,49 +675,73 @@ class TDMPC2(torch.nn.Module):
 			start_z = torch.gather(target_zs, 0, index)
    
 			start_z = start_z.reshape(-1, target_zs.size(-1))
-			reward = torch.zeros((num_start_states*batch_size, im_horizon, self.cfg.num_bins), device=self.device)
-			actions = torch.zeros((im_horizon, num_start_states*batch_size, self.cfg.action_dim), device=self.device)
-			rolled_out_z = torch.zeros((im_horizon, num_start_states*batch_size, target_zs.size(-1)), device=self.device)
+			reward = torch.zeros((im_horizon, num_start_states*batch_size, 1), device=self.device, dtype=target_zs.dtype)
+			actions = torch.zeros((im_horizon+1, num_start_states*batch_size, self.cfg.action_dim), device=self.device, dtype=target_zs.dtype)
+			rolled_out_z = torch.zeros((im_horizon+1, num_start_states*batch_size, target_zs.size(-1)), device=self.device, dtype=target_zs.dtype)
 			z = start_z
 			for t in range(im_horizon):
 				# Predict action from current state
-				action, pi_info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
-				actions[t, :, :] = action
-				rolled_out_z[t, :, :] = z
-				# Compute Q-values for state and action
-				reward_pred = self.model.reward(z, action, task)  # (num_start_states*B,K)
-				reward[t, :, :] = reward_pred
-				# Step dynamics forward
-				z = self.model.next(z, action, task)  # (num_start_states*B,L)
-			# Compute TD target for final state
-			td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=self.cfg.discount)  # (num_start_states*B,K)
+				with torch.no_grad():
+					action, pi_info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
+					actions[t, :, :] = action
+					rolled_out_z[t, :, :] = z
+					# Compute Q-values for state and action
+					reward_pred = math.two_hot_inv(self.model.reward(z, action, task), self.cfg)  # (num_start_states*B,1)
+					reward[t, :, :] = reward_pred
+					# Step dynamics forward
+					z = self.model.next(z, action, task)  # (num_start_states*B,L)
+			with torch.no_grad():
+				actions[-1, :, :] = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)[0]
+				rolled_out_z[-1, :, :] = z
+				#TODO Currently only td tagets for states in sample buffer. Could also compute targets for all states in rollout. Might not be stable though.
+				# Compute TD target for final state
+				td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=self.discount)  # (num_start_states*B,K)
 			# Compute Q-values for all state-action pairs
-			#TODO The idea is to create imagined td targets. Thing is, if we roll out anyways, migh
+			Qs = self.model.Q(rolled_out_z[0], actions[0], task, return_type='all')  # (Qe,num_start_states*B,K)
+			Qe = Qs.shape[0]
+			val_ce = math.soft_ce(
+				Qs.reshape(Qe * num_start_states * batch_size, self.cfg.num_bins),
+				# expand td_targets to (Qe,num_start_states*B,1) then flatten; detach to block grads to targets
+				td_target.detach().unsqueeze(0).expand(Qe, -1, -1).reshape(Qe * num_start_states * batch_size, 1),
+				self.cfg,
+			)
+			imagine_value_loss = val_ce.mean(dim=0).squeeze(-1)  # scalar
+			imagine_info = TensorDict({
+				"imagine_value_loss": imagine_value_loss,
+			}, device=self.device, non_blocking=True)
+
 			return imagine_value_loss, imagine_info
 
 	def multi_step_td_target(self, actions, rollout_z, rewards, task, discount=None):	
 		"""Compute multi-step TD target for imagined trajectories.	
 		Args:
-			actions: (im_horizon, num_start_states*B, A)
-			rollout_z: (im_horizon, num_start_states*B, L)
-			rewards: (im_horizon, num_start_states*B, K)
-			discount: float or (num_tasks,) tensor
+			actions: (im_horizon+1, num_start_states*B, A)
+			rollout_z: (im_horizon+1, num_start_states*B, L)
+			rewards: (im_horizon, num_start_states*B, 1)
+			discount: scalar tensor or (num_start_states*B,) tensor of per-sample gammas
 			task: Task index tensor or None.
 		Returns:
-			(torch.Tensor): (num_start_states*B, K) scalar TD targets
+			(torch.Tensor): (num_start_states*B, 1) scalar TD targets
 		"""
-		td_targets = torch.zeros((rewards.shape[0], rewards.shape[1], rewards.shape[2]), device=rewards.device)
+		H = rewards.shape[0]
+		NsB = rewards.shape[1]
+		td_targets = torch.zeros((NsB, rewards.shape[2]), device=rewards.device, dtype=rewards.dtype)
 
 		with torch.no_grad():
-			Qs = self.model.Q(rollout_z[-1], actions[-1], task, return_type='min')  # (num_start_states*B, K)
-		td_targets = torch.zero(rewards.shape[1], rewards.shape[2], device=rewards.device)
-		for t in range(rewards.shape[0]):
-			td_targets += (discount**t) * rewards[t]
-		td_targets += (discount**(rewards.shape[0])) * Qs
-      
-			
-		return 
-	def _update(self, obs, action, reward, terminated, actor_critic_only, task=None):
+			Qs = self.model.Q(rollout_z[-1], actions[-1], task, return_type='min', target=True)  # (num_start_states*B, 1)
+		# Compute discount powers for all time steps at once, supporting scalar or per-sample gammas
+
+			powers = torch.arange(H, device=rewards.device, dtype=rewards.dtype).view(H, 1, 1)
+			discount_powers = (discount ** powers)  # (H,1,1)
+			boot_factor = (discount ** H)
+		
+		# Compute discounted rewards sum
+		td_targets = (discount_powers * rewards).sum(dim=0)  # (NsB,1)
+		# Add final bootstrap value
+		td_targets = td_targets + boot_factor * Qs  # (NsB,1)
+		return td_targets
+
+	def _update(self, obs, action, reward, terminated, imagine=False, task=None):
 		"""Single gradient update step.
 
 		Args:
@@ -730,17 +749,22 @@ class TDMPC2(torch.nn.Module):
 			action: (T, B, A)
 			reward: (T, B, 1) scalar rewards
 			terminated: (T, B, 1) binary (0/1)
+			imagine: (bool) whether to include imagination-augmented value loss
 			task: (optional) task index tensor for multi-task mode
 		"""
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
 			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				wm_loss, zs, info, target_zs = self.calc_wm_losses(obs, action, reward, terminated, actor_critic_only=actor_critic_only, task=task)
-    		
-				imagine_value_loss, imagine_info = self.calc_imagine_value_loss(target_zs.detach())
+				wm_loss, zs, info, target_zs = self.calc_wm_losses(obs, action, reward, terminated, task=task)
+				# Imagination-augmented value loss (optional)
+				if imagine and self.cfg.imagine_value_loss_coef > 0:
+					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(target_zs.detach())
+				else:
+					imagine_value_loss = torch.tensor(0., device=self.device)
+					imagine_info = TensorDict({}, device=self.device)
 
 			# ------------------------------ Backprop & updates ------------------------------
-			total_loss = wm_loss+imagine_value_loss
+			total_loss = wm_loss+imagine_value_loss * self.cfg.imagine_value_loss_coef
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			self.optim_step() #This may be compiled as well
@@ -748,6 +772,7 @@ class TDMPC2(torch.nn.Module):
 			info.update({
 				"grad_norm": grad_norm,
 			}, non_blocking=True)
+			info.update(imagine_info, non_blocking=True)
 			# Policy update (detached latent sequence)
 			pi_info = self.update_pi(zs.detach(), task)
 
@@ -772,7 +797,7 @@ class TDMPC2(torch.nn.Module):
 			info.update(pi_info, non_blocking=True)
 			return info.detach().mean()
 
-	def update(self, buffer, actor_critic_only=False):
+	def update(self, buffer, imagine=False):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -790,5 +815,5 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, actor_critic_only=actor_critic_only, **kwargs)
+		return self._update(obs, action, reward, terminated, imagine=imagine, **kwargs)
 

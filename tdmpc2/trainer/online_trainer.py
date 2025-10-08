@@ -124,12 +124,11 @@ class OnlineTrainer(Trainer):
 				else:
 					num_updates = self.cfg.utd_ratio
 				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer, actor_critic_only=False)
+					_train_metrics = self.agent.update(self.buffer, imagine=self.cfg.imagination_enabled)
 					train_metrics.update(_train_metrics)
-					for i in range(self.cfg.ac_utd_multiplier-1):
-						_train_metrics = self.agent.update(self.buffer, actor_critic_only=True)
 
-			if (self._step * (self.cfg.utd_ratio*self.cfg.ac_utd_multiplier)) % self.cfg.reset_agent_freq == 0 and self._step > 0:
+
+			if (self._step * (self.cfg.utd_ratio)) % self.cfg.reset_agent_freq == 0 and self._step > 0:
 				self.agent.reset_agent()
 				log.info('Reset agent at step %d', self._step)
 					
