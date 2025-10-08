@@ -11,7 +11,7 @@ episodic: false
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 50000
-
+best_eval: false
 # training
 utd_ratio: 1
 ac_utd_multiplier: 1
@@ -36,7 +36,7 @@ encoder_ema_tau: 0.01
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
-buffer_size: 1000_000
+buffer_size: 100_000
 
 pin_memory: true
 prefetch: 4

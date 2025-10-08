@@ -7,7 +7,7 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
-RUN_NAME="tdmpc2_reacher_easy_compiled_default_autocastbf16"
+RUN_NAME="tdmpc2_reacher_easy_compiled_state"
 
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,21 +23,22 @@ mkdir -p "$OUT_DIR"
 # --gpu-metrics-devices=all 
 # --sample=none \
 # Run Nsight Systems profiling; outputs go into $OUT_DIR
-export MUJOCO_GL=egl
-export EGL_PLATFORM=surfaceless
+# export MUJOCO_GL=egl
+# export EGL_PLATFORM=surfaceless
 # export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
-CUDA_VISIBLE_DEVICES=1 nohup nsys profile \
+CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=1200 \
+	--delay=800 \
 	--duration=20 \
 	--sample=none \
 	--force-overwrite=true	-o "$OUT_DIR/profile" \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \
-		obs=rgb \
+		obs=state \
 		compile=true \
-		nvtx_profiler=false \
+		compile_type=reduce-overhead \
+		nvtx_profiler=true \
 		enable_wandb=false \
 		steps=2000000 \
 	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
