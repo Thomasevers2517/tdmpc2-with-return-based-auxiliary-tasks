@@ -27,15 +27,11 @@ metric:
 parameters:
   task:
     values:
-      - acrobot-swingup
-      - cheetah-run
-      # - finger-turn-easy
-      # - finger-turn-hard
-      # - walker-walk
-      - walker-run
-      - reacher-hard
-      # - reacher-easy
-      - quadruped-walk
+      - dog-stand
+      - dog-walk
+      - dog-run
+      - humanoid-walk
+      - humanoid-run
   utd_ratio:
     values: [1]
   ac_utd_multiplier: 
@@ -93,7 +89,7 @@ parameters:
   
 
   steps:
-    value: 300000
+    value: 5_000_000
   eval_freq:
     value: 25000
   batch_size:
