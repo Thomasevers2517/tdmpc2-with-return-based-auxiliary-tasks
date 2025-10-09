@@ -108,6 +108,8 @@ class TDMPC2(torch.nn.Module):
 		self.model.eval()
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
+		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
+		self._update_step = 0  # incremented at end of _update
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
@@ -140,18 +142,26 @@ class TDMPC2(torch.nn.Module):
 			log.info('Compiling update function with torch.compile...')
 			# self._update = torch.compile(self._update, mode="reduce-overhead")
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
+			self.calc_wm_losses_eager = self.calc_wm_losses
+			self.calc_pi_losses_eager = self.calc_pi_losses
+			self.imagine_value_loss_eager = self.calc_imagine_value_loss
+   
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_imagine_value_loss = torch.compile(self.calc_imagine_value_loss, mode=self.cfg.compile_type, fullgraph=True)
    
-			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			# @torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			@torch._dynamo.disable()
 			def optim_step():
 				self.optim.step()
 				return
-			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+
+			# @torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			@torch._dynamo.disable()
 			def pi_optim_step():
 				self.pi_optim.step()
 				return
+
 			self.optim_step = optim_step
 			self.pi_optim_step = pi_optim_step
 		else:
@@ -445,6 +455,62 @@ class TDMPC2(torch.nn.Module):
 		self._prev_mean.copy_(mean)
 		return 
 
+	# ------------------------------ Gradient logging helpers ------------------------------
+	def _grad_param_groups(self):
+		"""Return mapping of component group name -> list of parameters.
+
+		Groups: encoder, dynamics, reward, termination (if episodic), Qs, aux_Qs (combined),
+		task_emb (if multitask), policy.
+		"""
+		groups = {}
+		# encoder: merge all encoders
+		enc_params = []
+		for enc in self.model._encoder.values():
+			enc_params.extend(list(enc.parameters()))
+		if len(enc_params) > 0:
+			groups["encoder"] = enc_params
+		# dynamics
+		groups["dynamics"] = list(self.model._dynamics.parameters())
+		# reward
+		groups["reward"] = list(self.model._reward.parameters())
+		# termination (optional)
+		if self.cfg.episodic:
+			groups["termination"] = list(self.model._termination.parameters())
+		# primary Q ensemble
+		groups["Qs"] = list(self.model._Qs.parameters())
+		# auxiliary Q heads (combined)
+		aux_params = []
+		if getattr(self.model, "_aux_joint_Qs", None) is not None:
+			aux_params.extend(list(self.model._aux_joint_Qs.parameters()))
+		elif getattr(self.model, "_aux_separate_Qs", None) is not None:
+			for head in self.model._aux_separate_Qs:
+				aux_params.extend(list(head.parameters()))
+		if len(aux_params) > 0:
+			groups["aux_Qs"] = aux_params
+		# task embedding (optional)
+		if self.cfg.multitask:
+			groups["task_emb"] = list(self.model._task_emb.parameters())
+		# policy
+		groups["policy"] = list(self.model._pi.parameters())
+		return groups
+
+	@staticmethod
+	def _grad_norm(params):
+		"""Compute true L2 norm across all gradients: sqrt(sum_i ||g_i||^2))."""
+		accum = None
+		device = None
+		for p in params:
+			device = p.device
+			g = p.grad
+			if g is None:
+				continue
+			val = g.detach().float()
+			ss = (val * val).sum()
+			accum = ss if accum is None else (accum + ss)
+		if accum is None:
+			return torch.tensor(0.0, device=device or torch.device('cuda:0'))
+		return torch.sqrt(accum)
+
 	def calc_pi_losses(self, zs, task):
 		with maybe_range('Agent/update_pi', self.cfg):
 			action, info = self.model.pi(zs, task)
@@ -468,8 +534,14 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
+		log_grads = self.cfg.log_gradients_per_loss and (self._update_step % self.cfg.log_gradients_every == 0)
+  
+  
 		with autocast(device_type=self.device.type ,dtype=self.model_data_type):
-			pi_loss, info = self.calc_pi_losses(zs, task)
+			pi_loss, info = self.calc_pi_losses(zs, task) if not log_grads else self.calc_pi_losses_eager(zs, task)
+		# if log_grads:
+		# 	# self.probe_pi_gradients(pi_loss, info)
+			
 
 		pi_loss.backward()
 		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
@@ -538,16 +610,21 @@ class TDMPC2(torch.nn.Module):
 		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
 
 
-	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):
-		# If you want encoder_consistency_loss to train the online encoder, you must not use the EMA encoder.
-		assert not (self.cfg.encoder_ema_enabled and self.cfg.encoder_consistency_coef > 0), "Encoder EMA and encoder_consistency_coef cannot be used together."
-		
-		z_true  = self.model.encode(obs, task, use_ema=self.cfg.encoder_ema_enabled)  # initial latent (T+1,B,L)
+	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):		
+		z_true  = self.model.encode(obs, task)  # initial latent (T+1,B,L)
+
 		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
 				# Encode next observations (time steps 1..T) → latent sequence next_z
-				next_z = z_true[1:].detach()  # (T,B,L)
+				if self.cfg.encoder_ema_enabled:
+					# Use EMA encoder for targets (no grad, no update)
+					z_true_ema = self.model.encode(obs[1:], task, use_ema=True)  # (T+1,B,L)
+					next_z = z_true_ema.detach()  # (T,B,L)
+				else:
+					# Use online encoder for targets (no grad, no update)	
+					next_z = z_true[1:].detach()  # (T,B,L)	
+     
 				# Distributional TD targets (primary gamma) vs Q logits
 				td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
 				# Auxiliary scalar TD targets per gamma (optional)
@@ -560,13 +637,17 @@ class TDMPC2(torch.nn.Module):
 		encoder_consistency_losses = torch.zeros(self.cfg.horizon, device=self.device)
   
 		with maybe_range('Agent/latent_rollout', self.cfg):
-			z = z_true[0]  # initial latent (B,L)
+			z = self.model.encode(obs[0], task)
 			z_rollout[0] = z
 			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
 				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
 				# Consistency MSE between predicted & encoded next latent
 				consistency_losses[t] = F.mse_loss(z, _target_next_z)
-				encoder_consistency_losses[t] = F.mse_loss(z.detach(), z_true[t+1])
+				if self.cfg.encoder_consistency_coef > 0:
+					encoder_consistency_losses[t] = F.mse_loss(z.detach(), z_true[t+1])
+				else:
+					encoder_consistency_losses[t] = torch.tensor(0., device=self.device)
+     
 				z_rollout[t+1] = z
 
 		# ------------------------------ Model predictions for losses ------------------------------
@@ -575,7 +656,7 @@ class TDMPC2(torch.nn.Module):
 		q_aux_logits = None
 
 		# Use the rollout latents for predictions, or the true encoded latents. Original TD-MPC used true latents.
-		if self.cfg.pred_from_true_state:
+		if self.cfg.pred_from == "true_state":
 			qs = self.model.Q(z_true[:-1], action, task, return_type='all')  # (Qe,T,B,K)
 			reward_preds = self.model.reward(z_true[:-1], action, task)         # (T,B,K)
 			if aux_td_targets is not None:
@@ -585,7 +666,7 @@ class TDMPC2(torch.nn.Module):
 			else:
 				termination_pred = None
 
-		else:
+		elif self.cfg.pred_from == "rollout":
 			qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
 			reward_preds = self.model.reward(_zs, action, task)                 # (T,B,K)
    
@@ -594,15 +675,9 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.episodic:
 				termination_pred = self.model.termination(z_rollout[1:], task, unnormalized=True)  # (T,B,1)
 			else:
-				termination_pred = None			
-  
-
-		
-
-
-
-
-
+				termination_pred = None	
+		elif self.cfg.pred_from == "both":
+			raise NotImplementedError("Both pred_from not implemented yet.")
 
 		with maybe_range('Agent/order_losses', self.cfg):
 
@@ -677,6 +752,12 @@ class TDMPC2(torch.nn.Module):
 			"aux_value_loss_mean": aux_value_loss_mean,
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
+			"consistency_loss_weighted": consistency_losses * self.cfg.consistency_coef, 	
+			"encoder_consistency_loss_weighted": encoder_consistency_losses * self.cfg.encoder_consistency_coef,
+			"reward_loss_weighted": reward_loss * self.cfg.reward_coef,
+			"value_loss_weighted": value_loss * self.cfg.value_coef,
+			"termination_loss_weighted": termination_loss * self.cfg.termination_coef,
+			"aux_value_loss_mean_weighted": aux_value_loss_mean * self.cfg.multi_gamma_loss_weight,
 		}, device=self.device, non_blocking=True)
 		for i in range(T):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i]}, non_blocking=True)
@@ -692,7 +773,7 @@ class TDMPC2(torch.nn.Module):
 
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
-		target_zs = torch.cat((z_true[0:1].detach(), next_z), dim=0).detach()
+		target_zs = torch.cat((z_true.detach(), next_z), dim=0).detach()
 		return total_loss, z_rollout, info, target_zs
 	
 	def calc_imagine_value_loss(self, target_zs, task=None):
@@ -794,7 +875,7 @@ class TDMPC2(torch.nn.Module):
 		td_targets = td_targets + boot_factor * Qs  # (NsB,1)
 		return td_targets
 
-	def _update(self, obs, action, reward, terminated, imagine=False, task=None):
+	def _update(self, obs, action, reward, terminated, task=None):
 		"""Single gradient update step.
 
 		Args:
@@ -805,20 +886,27 @@ class TDMPC2(torch.nn.Module):
 			imagine: (bool) whether to include imagination-augmented value loss
 			task: (optional) task index tensor for multi-task mode
 		"""
+		log_grads = self.cfg.log_gradients_per_loss and (self._update_step % self.cfg.log_gradients_every == 0)
+ 
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
 			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				wm_loss, zs, info, target_zs = self.calc_wm_losses(obs, action, reward, terminated, task=task)
+				wm_loss, zs, info, target_zs = self.calc_wm_losses(obs, action, reward, terminated, task=task) if not log_grads else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
 				# Imagination-augmented value loss (optional)
-				if imagine and self.cfg.imagine_value_loss_coef > 0:
-					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(target_zs.detach())
+				if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(target_zs.detach(), task=task) if not log_grads else self.calc_imagine_value_loss_eager(target_zs.detach(), task=task)
 				else:
 					imagine_value_loss = torch.tensor(0., device=self.device)
 					imagine_info = TensorDict({}, device=self.device)
+			if log_grads:
+				info = self.probe_wm_gradients(info, imagine_info)
+		
 
 			# ------------------------------ Backprop & updates ------------------------------
 			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
-			total_loss.backward()
+			with autocast(device_type=self.device.type, dtype=self.model_data_type):
+				total_loss.backward()
+    
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			self.optim_step() #This may be compiled as well
 			self.optim.zero_grad(set_to_none=True)
@@ -848,9 +936,11 @@ class TDMPC2(torch.nn.Module):
 			self.model.eval()
 
 			info.update(pi_info, non_blocking=True)
+			# step counter for gated logging
+			self._update_step += 1
 			return info.detach().mean()
 
-	def update(self, buffer, imagine=False):
+	def update(self, buffer):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -868,5 +958,61 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, imagine=imagine, **kwargs)
+		return self._update(obs, action, reward, terminated, **kwargs)
 
+
+	@torch._dynamo.disable()
+	def probe_wm_gradients(self, info, imagine_info):
+		groups = self._grad_param_groups()
+
+		# Build loss parts as you already do
+		loss_parts = {
+			'consistency': self.cfg.consistency_coef * info['consistency_loss'],
+			'encoder_consistency': self.cfg.encoder_consistency_coef * info['encoder_consistency_loss'],
+			'reward': self.cfg.reward_coef * info['reward_loss'],
+			'value': self.cfg.value_coef * info['value_loss'],
+		}
+		if self.cfg.episodic:
+			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']
+		if 'aux_value_loss_mean' in info and self.cfg.multi_gamma_loss_weight != 0:
+			loss_parts['aux_value_mean'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_mean']
+		if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+			loss_parts['imagine_value'] = self.cfg.imagine_value_loss_coef * imagine_info['imagine_value_loss']
+
+
+		# don’t destroy graph grads; keep buffers allocated for CUDA-graph stability
+		self.optim.zero_grad(set_to_none=False)
+
+		# Flatten all params once for grad calls and remember mapping
+		flat_params = []
+		index = []  # (group_name, param_obj) pairs
+		for gname, params in groups.items():
+			if gname == 'policy':  # skip policy here
+				continue
+			for p in params:
+				flat_params.append(p)
+				index.append((gname, p))
+
+		for lname, lval in loss_parts.items():
+			if (not torch.is_tensor(lval)) or (not lval.requires_grad):
+				continue
+
+			grads = torch.autograd.grad(
+				lval,
+				flat_params,
+				retain_graph=True,   # we’ll still do total_loss.backward() later
+				create_graph=False,
+				allow_unused=True,
+			)
+
+			# accumulate L2 per component
+			per_group_ss = {}
+			for (gname, p), g in zip(index, grads):
+				if g is None:
+					continue
+				ss = (g.detach().float() ** 2).sum()
+				per_group_ss[gname] = per_group_ss.get(gname, 0.0) + ss.item()
+
+			for gname, ss in per_group_ss.items():
+				info.update({f'grad_norm/{lname}/{gname}': (ss ** 0.5)}, non_blocking=True)
+		return info

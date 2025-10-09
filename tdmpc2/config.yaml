@@ -22,7 +22,7 @@ imagination_horizon: 3
 imagine_num_starts: 3
 imagine_value_loss_coef: 0.05
 #Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
-pred_from_true_state: false 
+pred_from: rollout # rollout, true_state, both
 
 
 steps: 4_000_000
@@ -41,7 +41,7 @@ grad_clip_norm: 20
 tau: 0.01
 policy_ema_enabled: false
 policy_ema_tau: 0.005
-encoder_ema_enabled: false
+encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
 encoder_ema_tau: 0.01
 discount_denom: 5
 discount_min: 0.95
@@ -109,6 +109,8 @@ wandb_entity: thomasevers9
 wandb_silent: false
 enable_wandb: true
 save_csv: true
+log_gradients_per_loss: true
+log_gradients_every: 2500
 
 # misc
 compile: false

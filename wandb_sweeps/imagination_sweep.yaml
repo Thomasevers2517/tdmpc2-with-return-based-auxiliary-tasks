@@ -40,8 +40,8 @@ parameters:
     values: [3]
   imagine_value_loss_coef: 
     values: [0.1, 0.05, 0.01]
-  pred_from_true_state:
-    values: [false, true]
+  pred_from:
+    values: ["rollout", "true_state"]
 
   encoder_consistency_coef:
     values: [0,1,5]

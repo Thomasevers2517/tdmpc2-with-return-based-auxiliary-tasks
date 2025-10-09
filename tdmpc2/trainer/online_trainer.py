@@ -124,7 +124,7 @@ class OnlineTrainer(Trainer):
 				else:
 					num_updates = self.cfg.utd_ratio
 				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer, imagine=self.cfg.imagination_enabled)
+					_train_metrics = self.agent.update(self.buffer)
 					train_metrics.update(_train_metrics)
 
 
