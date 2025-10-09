@@ -33,18 +33,18 @@ parameters:
       - humanoid-run
 
   imagination_enabled: 
-    values: [false]
+    values: [false, true]
   imagination_horizon: 
-    values: [3]
+    values: [3,9]
   imagine_num_starts: 
     values: [3]
   imagine_value_loss_coef: 
-    values: [0.1, 0.05, 0.01]
+    values: [0.1]
   pred_from:
     values: ["rollout", "true_state"]
 
   encoder_consistency_coef:
-    values: [0,1,5]
+    values: [0,1,2]
   
   utd_ratio:
     values: [1]
