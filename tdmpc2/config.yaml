@@ -21,6 +21,7 @@ imagination_enabled: true
 imagination_horizon: 3
 imagine_num_starts: 3
 imagine_value_loss_coef: 0.05
+detach_imagine_value: true  # if true, detach the latents used for imagine value loss calculation. This is to prevent gradients from the imagine value loss to flow into the encoder and dynamics model. This is to isolate the effect of the imagine value loss on the value function only.
 #Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
 pred_from: rollout # rollout, true_state, both
 

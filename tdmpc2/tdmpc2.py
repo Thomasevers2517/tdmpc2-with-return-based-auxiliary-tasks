@@ -912,7 +912,9 @@ class TDMPC2(torch.nn.Module):
 				wm_loss, zs, info, z_true = self.calc_wm_losses(obs, action, reward, terminated, task=task) if not log_grads else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
 				# Imagination-augmented value loss (optional)
 				if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
-					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_true.detach(), task=task) if not log_grads else self.calc_imagine_value_loss_eager(z_true.detach(), task=task)
+					z_im = z_true
+					z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
+					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_im, task=task) if not log_grads else self.calc_imagine_value_loss_eager(z_im, task=task)
 				else:
 					imagine_value_loss = torch.tensor(0., device=self.device)
 					imagine_info = TensorDict({}, device=self.device)
