@@ -539,11 +539,12 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):
+		z_true  = self.model.encode(obs, task, use_ema=self.cfg.encoder_ema_enabled)  # initial latent (T+1,B,L)
 		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
 			with torch.no_grad():
 				# Encode next observations (time steps 1..T) → latent sequence next_z
-				next_z = self.model.encode(obs[1:], task, use_ema=self.cfg.encoder_ema_enabled)  # (T,B,L)
+				next_z = z_true[1:].detach()  # (T,B,L)
 				# Distributional TD targets (primary gamma) vs Q logits
 				td_targets = self._td_target(next_z, reward, terminated, task)  # (T,B,K)
 				# Auxiliary scalar TD targets per gamma (optional)
@@ -551,30 +552,50 @@ class TDMPC2(torch.nn.Module):
 
 		# ------------------------------ Latent rollout (consistency) ------------------------------
 		self.model.train()
-		zs = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
+		z_rollout = torch.empty(self.cfg.horizon+1, self.cfg.batch_size, self.cfg.latent_dim, device=self.device)  # allocate (T+1,B,L)
 		consistency_losses = torch.zeros(self.cfg.horizon, device=self.device)
+		encoder_consistency_losses = torch.zeros(self.cfg.horizon, device=self.device)
   
 		with maybe_range('Agent/latent_rollout', self.cfg):
-			z = self.model.encode(obs[0], task)  # initial latent (B,L)
-			zs[0] = z
+			z = z_true[0]  # initial latent (B,L)
+			z_rollout[0] = z
 			for t, (_a, _target_next_z) in enumerate(zip(action.unbind(0), next_z.unbind(0))):  # iterate T steps
 				z = self.model.next(z, _a, task)            # model prediction z_{t+1}
 				# Consistency MSE between predicted & encoded next latent
 				consistency_losses[t] = F.mse_loss(z, _target_next_z)
-				zs[t+1] = z
+				encoder_consistency_losses[t] = F.mse_loss(z.detach(), z_true[t+1])
+				z_rollout[t+1] = z
 
 		# ------------------------------ Model predictions for losses ------------------------------
-		_zs = zs[:-1]                                 # (T,B,L) latents aligned with actions
-		qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
-		reward_preds = self.model.reward(_zs, action, task)                 # (T,B,K)
+		_zs = z_rollout[:-1]                                 # (T,B,L) latents aligned with actions
+  		# Auxiliary logits (if enabled)
+		q_aux_logits = None
+
+		# Use the rollout latents for predictions, or the true encoded latents. Original TD-MPC used true latents.
+		if self.cfg.pred_from_true_state:
+			qs = self.model.Q(z_true[:-1], action, task, return_type='all')  # (Qe,T,B,K)
+			reward_preds = self.model.reward(z_true[:-1], action, task)         # (T,B,K)
+			if aux_td_targets is not None:
+				q_aux_logits = self.model.Q_aux(z_true[:-1], action, task, return_type='all')  # (G_aux,T,B,K)
+
+		else:
+			qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
+			reward_preds = self.model.reward(_zs, action, task)                 # (T,B,K)
+   
+			if aux_td_targets is not None:
+				q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (G_aux,T,B,K)
+		
+  
 		if self.cfg.episodic:
-			termination_pred = self.model.termination(zs[1:], task, unnormalized=True)  # (T,B,1)
+			termination_pred = self.model.termination(z_rollout[1:], task, unnormalized=True)  # (T,B,1)
 		else:
 			termination_pred = None
-		# Auxiliary logits (if enabled)
-		q_aux_logits = None
-		if aux_td_targets is not None:
-			q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (G_aux,T,B,K)
+		
+
+
+
+
+
 
 		with maybe_range('Agent/order_losses', self.cfg):
 
@@ -585,8 +606,9 @@ class TDMPC2(torch.nn.Module):
 			torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
 		)
 			# Consistency loss (MSE) over latent prediction errors, weighted by rho^t
-			consistency_loss = (rho_pows * consistency_losses).sum()
-   
+			consistency_loss = (rho_pows * consistency_losses).mean()
+			encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
+
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
@@ -619,8 +641,7 @@ class TDMPC2(torch.nn.Module):
 				aux_ce = aux_ce.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # (G_aux,T)
 				aux_value_losses = (aux_ce * rho_pows.unsqueeze(0)).sum(dim=1) / T  # (G_aux,)
 
-			# Normalize losses
-			consistency_loss = consistency_loss / self.cfg.horizon
+
 			# reward_loss and value_loss were already normalized by T and T*Qe above
 			if self.cfg.episodic:
 				termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
@@ -635,6 +656,7 @@ class TDMPC2(torch.nn.Module):
 			# Total loss (auxiliary added with its own weight separate from value_coef)
 			total_loss = (
 				self.cfg.consistency_coef * consistency_loss +
+				self.cfg.encoder_consistency_coef * encoder_consistency_loss +
 				self.cfg.reward_coef * reward_loss +
 				self.cfg.termination_coef * termination_loss +
 				self.cfg.value_coef * value_loss +
@@ -642,16 +664,12 @@ class TDMPC2(torch.nn.Module):
 			)
 		info = TensorDict({
 			"consistency_loss": consistency_loss,
+			"encoder_consistency_loss": encoder_consistency_loss,
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
 			"aux_value_loss_mean": aux_value_loss_mean,
 			"termination_loss": termination_loss,
 			"total_loss": total_loss,
-			"consistency_loss_weighted": self.cfg.consistency_coef * consistency_loss,
-			"reward_loss_weighted": self.cfg.reward_coef * reward_loss,
-			"value_loss_weighted": self.cfg.value_coef * value_loss,
-			"aux_value_loss_mean_weighted": self.cfg.multi_gamma_loss_weight * aux_value_loss_mean,
-			"termination_loss_weighted": self.cfg.termination_coef * termination_loss,
 		}, device=self.device, non_blocking=True)
 		for i in range(T):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i]}, non_blocking=True)
@@ -667,8 +685,8 @@ class TDMPC2(torch.nn.Module):
 
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
-		target_zs = torch.cat((zs[0:1].detach(), next_z), dim=0).detach()
-		return total_loss, zs, info, target_zs
+		target_zs = torch.cat((z_true[0:1].detach(), next_z), dim=0).detach()
+		return total_loss, z_rollout, info, target_zs
 	
 	def calc_imagine_value_loss(self, target_zs, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):

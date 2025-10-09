@@ -21,6 +21,9 @@ imagination_enabled: true
 imagination_horizon: 3
 imagine_num_starts: 3
 imagine_value_loss_coef: 0.05
+#Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
+pred_from_true_state: false 
+
 
 steps: 4_000_000
 batch_size: 256
@@ -28,6 +31,9 @@ reward_coef: 0.1
 value_coef: 0.1
 termination_coef: 1
 consistency_coef: 20
+
+encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style
+
 rho: 0.5
 lr: 3e-4
 enc_lr_scale: 0.3

@@ -28,24 +28,23 @@ parameters:
   task:
     values:
       - acrobot-swingup
-      - cheetah-run
-      # - finger-turn-easy
-      # - finger-turn-hard
-      # - walker-walk
-      - walker-run
       - reacher-hard
-      # - reacher-easy
       - quadruped-walk
+      - humanoid-run
 
   imagination_enabled: 
-    values: [true]
+    values: [true, false]
   imagination_horizon: 
-    values: [1, 3]
+    values: [3]
   imagine_num_starts: 
-    values: [1, 3]
+    values: [3]
   imagine_value_loss_coef: 
     values: [0.1, 0.05, 0.01]
+  pred_from_true_state:
+    values: [false, true]
 
+  encoder_consistency_coef:
+    values: [0,1,5]
   
   utd_ratio:
     values: [1]
