@@ -933,16 +933,19 @@ class TDMPC2(torch.nn.Module):
 			}, non_blocking=True)
 			info.update(imagine_info, non_blocking=True)
 			# ------------------------------ Policy update ------------------------------
-			# raise NotImplementedError("Yet to decide on attaching/detaching latents for policy update") 
+			ratio = self.cfg.policy_loss_encoder_ratio # How much of the policy loss is backpropped through the encoder 
+			
 			if self.cfg.pred_from == "rollout":
+				z_for_pi = ratio * zs + (1-ratio) * zs.detach()
 				# Policy update (detached rollout latents)
-				pi_info = self.update_pi(zs.detach(), task)
 			elif self.cfg.pred_from == "true_state":
+				z_for_pi = ratio * z_true + (1-ratio) * z_true.detach()
 				# Policy update (detached latent sequence)
-				pi_info = self.update_pi(z_true.detach(), task)
 			elif self.cfg.pred_from == "both":
+				z_both = torch.cat([zs, z_true], dim=1)  # (T,B*2,L)
+				z_for_pi = ratio * z_both + (1-ratio) * z_both.detach()
 				# Policy update (mixed latents)
-				pi_info = self.update_pi(torch.cat([zs, z_true].detach(), dim=1), task)
+			pi_info = self.update_pi(z_for_pi, task)
 
 
 
