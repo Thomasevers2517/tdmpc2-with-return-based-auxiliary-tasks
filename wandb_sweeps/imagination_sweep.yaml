@@ -33,7 +33,7 @@ parameters:
       - humanoid-run
 
   imagination_enabled: 
-    values: [true, false]
+    values: [false]
   imagination_horizon: 
     values: [3]
   imagine_num_starts: 

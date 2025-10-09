@@ -539,6 +539,9 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):
+		# If you want encoder_consistency_loss to train the online encoder, you must not use the EMA encoder.
+		assert not (self.cfg.encoder_ema_enabled and self.cfg.encoder_consistency_coef > 0), "Encoder EMA and encoder_consistency_coef cannot be used together."
+		
 		z_true  = self.model.encode(obs, task, use_ema=self.cfg.encoder_ema_enabled)  # initial latent (T+1,B,L)
 		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
 		with maybe_range('Agent/calc_td_target', self.cfg):
@@ -577,6 +580,10 @@ class TDMPC2(torch.nn.Module):
 			reward_preds = self.model.reward(z_true[:-1], action, task)         # (T,B,K)
 			if aux_td_targets is not None:
 				q_aux_logits = self.model.Q_aux(z_true[:-1], action, task, return_type='all')  # (G_aux,T,B,K)
+			if self.cfg.episodic:
+				termination_pred = self.model.termination(z_true[1:], task, unnormalized=True)  # (T,B,1)
+			else:
+				termination_pred = None
 
 		else:
 			qs = self.model.Q(_zs, action, task, return_type='all')              # (Qe,T,B,K)
@@ -584,12 +591,12 @@ class TDMPC2(torch.nn.Module):
    
 			if aux_td_targets is not None:
 				q_aux_logits = self.model.Q_aux(_zs, action, task, return_type='all')  # (G_aux,T,B,K)
-		
+			if self.cfg.episodic:
+				termination_pred = self.model.termination(z_rollout[1:], task, unnormalized=True)  # (T,B,1)
+			else:
+				termination_pred = None			
   
-		if self.cfg.episodic:
-			termination_pred = self.model.termination(z_rollout[1:], task, unnormalized=True)  # (T,B,1)
-		else:
-			termination_pred = None
+
 		
 
 
@@ -723,9 +730,16 @@ class TDMPC2(torch.nn.Module):
 			with torch.no_grad():
 				actions[-1, :, :] = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)[0]
 				rolled_out_z[-1, :, :] = z
-				#TODO Currently only td tagets for states in sample buffer. Could also compute targets for all states in rollout. Might not be stable though.
-				# Compute TD target for final state
-				td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=self.discount)  # (num_start_states*B,K)
+				# Compute TD target for final state with correct per-sample discounts in multitask
+				if self.cfg.multitask and task is not None:
+					# task may be (B,) or (T,B); take per-sample task ids for the batch
+					task_b = task[0] if isinstance(task, torch.Tensor) and task.ndim == 2 else task
+					gamma_b = self.discount[task_b.long()]  # (B,)
+					# Each batch sample appears num_start_states times in Ns*B
+					discount_samples = gamma_b.repeat_interleave(num_start_states)  # (Ns*B,)
+				else:
+					discount_samples = self.discount  # scalar tensor
+				td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=discount_samples)  # (num_start_states*B,1)
 			# Compute Q-values for all state-action pairs
 			Qs = self.model.Q(rolled_out_z[0], actions[0], task, return_type='all')  # (Qe,num_start_states*B,K)
 			Qe = Qs.shape[0]
@@ -759,12 +773,20 @@ class TDMPC2(torch.nn.Module):
 		td_targets = torch.zeros((NsB, rewards.shape[2]), device=rewards.device, dtype=rewards.dtype)
 
 		with torch.no_grad():
-			Qs = self.model.Q(rollout_z[-1], actions[-1], task, return_type='min', target=True)  # (num_start_states*B, 1)
+			Qs = self.model.Q(rollout_z[-1], actions[-1], task, return_type='min', target=True)  # (NsB,1)
 		# Compute discount powers for all time steps at once, supporting scalar or per-sample gammas
-
-			powers = torch.arange(H, device=rewards.device, dtype=rewards.dtype).view(H, 1, 1)
-			discount_powers = (discount ** powers)  # (H,1,1)
-			boot_factor = (discount ** H)
+		if torch.is_tensor(discount) and discount.ndim == 1:
+			# discount: (NsB,) -> broadcast to (H,NsB,1)
+			gamma = discount.view(1, NsB, 1)
+			steps = torch.arange(H, device=rewards.device, dtype=rewards.dtype).view(H, 1, 1)
+			discount_powers = gamma.pow(steps)  # (H,NsB,1)
+			boot_factor = discount.pow(H).view(NsB, 1)  # (NsB,1)
+		else:
+			# scalar tensor or float
+			disc = discount if torch.is_tensor(discount) else torch.as_tensor(discount, device=rewards.device, dtype=rewards.dtype)
+			steps = torch.arange(H, device=rewards.device, dtype=rewards.dtype).view(H, 1, 1)
+			discount_powers = disc.pow(steps)  # (H,1,1)
+			boot_factor = disc.pow(H)  # scalar
 		
 		# Compute discounted rewards sum
 		td_targets = (discount_powers * rewards).sum(dim=0)  # (NsB,1)
