@@ -144,7 +144,7 @@ class TDMPC2(torch.nn.Module):
 			# self._update = torch.compile(self._update, mode="default", fullgraph=True)
 			self.calc_wm_losses_eager = self.calc_wm_losses
 			self.calc_pi_losses_eager = self.calc_pi_losses
-			self.imagine_value_loss_eager = self.calc_imagine_value_loss
+			self.calc_imagine_value_loss_eager = self.calc_imagine_value_loss
    
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
@@ -542,21 +542,15 @@ class TDMPC2(torch.nn.Module):
 			pi_loss, info = self.calc_pi_losses(zs, task) if not log_grads else self.calc_pi_losses_eager(zs, task)
 		# if log_grads:
 		# 	# self.probe_pi_gradients(pi_loss, info)
-			
-
-		pi_loss.backward()
-		pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
-		self.pi_optim_step()
-		self.pi_optim.zero_grad(set_to_none=True)
 
 		info = TensorDict({
 			"pi_loss": pi_loss,
-			"pi_grad_norm": pi_grad_norm,
+			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
 			"pi_entropy": info["entropy"],
 			"pi_scaled_entropy": info["scaled_entropy"],
 			"pi_scale": self.scale.value,
 		}, device=self.device)
-		return info
+		return pi_loss, info
 
 	@torch.no_grad()
 	def _td_target(self, next_z, reward, terminated, task):
@@ -600,7 +594,7 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema, detach=False)  # (G_aux,T,B,K) scalar per gamma (single head)
+		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema)  # (G_aux,T,B,K) scalar per gamma (single head)
 		if bootstrap is None:
 			return None
 		aux_targets = []
@@ -608,7 +602,7 @@ class TDMPC2(torch.nn.Module):
 			gamma = self._all_gammas[g+1]
 			boot_g = bootstrap[g, ...]  # (T,B,1)
 			aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
-		return torch.stack(aux_targets, dim=0) # (G_aux,T,B,1)
+		return torch.stack(aux_targets, dim=0).detach() # (G_aux,T,B,1)
 
 
 	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):		
@@ -702,9 +696,17 @@ class TDMPC2(torch.nn.Module):
 			# ------------------------------ Vectorized loss computation ------------------------------
 			T, B = reward_preds.shape[:2]
 			K = reward_preds.shape[-1]
-			rho_pows = torch.pow(self.cfg.rho,
-			torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
-		)
+			if self.cfg.pred_from == "roll_out":
+				rho_pows = torch.pow(self.cfg.rho,
+				torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
+			)
+			elif self.cfg.pred_from == "true_state":
+				rho_pows = torch.pow(1,
+				torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
+			)
+			elif self.cfg.pred_from == "both":
+				raise NotImplementedError("rho weighting not implemented for 'both' pred_from setting")
+			
 			# Consistency loss (MSE) over latent prediction errors, weighted by rho^t
 			consistency_loss = (rho_pows * consistency_losses).mean()
 			encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
@@ -782,53 +784,72 @@ class TDMPC2(torch.nn.Module):
 		    #add weighted consistency loss per step
 			info.update({f"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i]}, non_blocking=True)
 		# Add auxiliary losses per gamma
-  
+		
+		info.update({
+			"td_target_mean": td_targets.mean(),
+			"td_target_mstd": td_targets.std(),
+			"value_mean": math.two_hot_inv(qs, self.cfg).mean(),
+			"value_std": math.two_hot_inv(qs, self.cfg).std(),
+			"reward_target_mean": reward.mean(),
+			"reward_target_std": reward.std(),
+			"reward_mean": math.two_hot_inv(reward_preds, self.cfg).mean(),
+			"reward_std": math.two_hot_inv(reward_preds, self.cfg).std(),
+			"aux_td_target_mean": aux_td_targets.mean() if aux_td_targets is not None else torch.tensor(0., device=self.device),
+			"aux_td_target_std": aux_td_targets.std() if aux_td_targets is not None else torch.tensor(0., device=self.device),
+			"aux_value_mean": math.two_hot_inv(q_aux_logits, self.cfg).mean() if q_aux_logits is not None else torch.tensor(0., device=self.device),
+			"aux_value_std": math.two_hot_inv(q_aux_logits, self.cfg).std() if q_aux_logits is not None else torch.tensor(0., device=self.device),
+		})
 		if aux_value_losses is not None:
 			for g, loss_g in enumerate(aux_value_losses):
 				gamma_val = self._all_gammas[g+1]
 				info.update({f"aux_value_loss/gamma{gamma_val:.4f}": loss_g}, non_blocking=True)
 				info.update({f"aux_value_loss_weighted/gamma{gamma_val:.4f}": self.cfg.multi_gamma_loss_weight * loss_g}, non_blocking=True)
-
+				info.update({f"aux_td_target_mean/gamma{gamma_val:.4f}": aux_td_targets[g].mean()}, non_blocking=True)
+				info.update({f"aux_td_target_std/gamma{gamma_val:.4f}": aux_td_targets[g].std()}, non_blocking=True)
+				info.update({f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits, self.cfg).mean()}, non_blocking=True)
+				info.update({f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits, self.cfg).std()}, non_blocking=True)	
+		
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
 
+
 		return total_loss, z_rollout, info, z_true
 	
-	def calc_imagine_value_loss(self, z_true, task=None):
+	def calc_imagine_value_loss(self, z, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
 			im_horizon = self.cfg.imagination_horizon
 			num_start_states = self.cfg.imagine_num_starts
-			batch_size = z_true.shape[1]
+			batch_size = z.shape[1]
 			imagine_value_loss = torch.tensor(0., device=self.device)
 			imagine_info = TensorDict({}, device=self.device)
 			# 
-			total_states = z_true.shape[0]
+			total_states = z.shape[0]
 			if num_start_states > total_states:
 				raise ValueError(f"Requested {num_start_states} start states but only {total_states} are available.")
-			random_scores = torch.rand(total_states, batch_size, device=z_true.device)
+			random_scores = torch.rand(total_states, batch_size, device=z.device)
 			start_states_idx = torch.argsort(random_scores, dim=0)[:num_start_states]
-			index = start_states_idx.unsqueeze(-1).expand(-1, -1, z_true.size(-1))
-			start_z = torch.gather(z_true, 0, index)
+			index = start_states_idx.unsqueeze(-1).expand(-1, -1, z.size(-1))
+			start_z = torch.gather(z, 0, index)
    
-			start_z = start_z.reshape(-1, z_true.size(-1))
-			reward = torch.zeros((im_horizon, num_start_states*batch_size, 1), device=self.device, dtype=z_true.dtype)
-			actions = torch.zeros((im_horizon+1, num_start_states*batch_size, self.cfg.action_dim), device=self.device, dtype=target_zs.dtype)
-			rolled_out_z = torch.zeros((im_horizon+1, num_start_states*batch_size, z_true.size(-1)), device=self.device, dtype=target_zs.dtype)
-			z = start_z
+			start_z = start_z.reshape(-1, z.size(-1))
+			reward = torch.zeros((im_horizon, num_start_states*batch_size, 1), device=self.device, dtype=z.dtype)
+			actions = torch.zeros((im_horizon+1, num_start_states*batch_size, self.cfg.action_dim), device=self.device, dtype=z.dtype)
+			rolled_out_z = torch.zeros((im_horizon+1, num_start_states*batch_size, z.size(-1)), device=self.device, dtype=z.dtype)
+			z_step = start_z
 			for t in range(im_horizon):
 				# Predict action from current state
 				with torch.no_grad():
-					action, pi_info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
+					action, pi_info = self.model.pi(z_step.detach(), task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
 					actions[t, :, :] = action
-					rolled_out_z[t, :, :] = z
+					rolled_out_z[t, :, :] = z_step
 					# Compute Q-values for state and action
-					reward_pred = math.two_hot_inv(self.model.reward(z, action, task), self.cfg)  # (num_start_states*B,1)
+					reward_pred = math.two_hot_inv(self.model.reward(z_step, action, task), self.cfg)  # (num_start_states*B,1)
 					reward[t, :, :] = reward_pred
 					# Step dynamics forward
-					z = self.model.next(z, action, task)  # (num_start_states*B,L)
+					z_step = self.model.next(z_step, action, task)  # (num_start_states*B,L)
 			with torch.no_grad():
-				actions[-1, :, :] = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)[0]
-				rolled_out_z[-1, :, :] = z
+				actions[-1, :, :] = self.model.pi(z_step.detach(), task, use_ema=self.cfg.policy_ema_enabled)[0]
+				rolled_out_z[-1, :, :] = z_step
 				# Compute TD target for final state with correct per-sample discounts in multitask
 				if self.cfg.multitask and task is not None:
 					# task may be (B,) or (T,B); take per-sample task ids for the batch
@@ -922,18 +943,7 @@ class TDMPC2(torch.nn.Module):
 				info = self.probe_wm_gradients(info, imagine_info)
 		
 
-			# ------------------------------ Backprop & updates ------------------------------
-			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
-			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				total_loss.backward()
-    
-			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
-			self.optim_step() #This may be compiled as well
-			self.optim.zero_grad(set_to_none=True)
-			info.update({
-				"grad_norm": grad_norm,
-			}, non_blocking=True)
-			info.update(imagine_info, non_blocking=True)
+
 			# ------------------------------ Policy update ------------------------------
 			ratio = self.cfg.policy_loss_encoder_ratio # How much of the policy loss is backpropped through the encoder 
 			
@@ -947,9 +957,28 @@ class TDMPC2(torch.nn.Module):
 				z_both = torch.cat([zs, z_true], dim=1)  # (T,B*2,L)
 				z_for_pi = ratio * z_both + (1-ratio) * z_both.detach()
 				# Policy update (mixed latents)
-			pi_info = self.update_pi(z_for_pi, task)
+			pi_loss, pi_info = self.update_pi(z_for_pi, task)
 
 
+			# ------------------------------ Backprop & updates ------------------------------
+			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef + pi_loss * self.cfg.policy_coef
+			with autocast(device_type=self.device.type, dtype=self.model_data_type):
+				total_loss.backward()
+			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+
+			self.pi_optim_step()
+			self.pi_optim.zero_grad(set_to_none=True)
+			self.optim_step() #This may be compiled as well
+			self.optim.zero_grad(set_to_none=True)
+   
+			pi_info.update({
+				"pi_grad_norm": pi_grad_norm,
+			}, non_blocking=True)
+			info.update({
+				"grad_norm": grad_norm,
+			}, non_blocking=True)
+			info.update(imagine_info, non_blocking=True)
 
    
    

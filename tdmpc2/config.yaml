@@ -33,8 +33,9 @@ reward_coef: 0.1
 value_coef: 0.1
 termination_coef: 1
 consistency_coef: 20
+policy_coef: 1
 
-encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style
+encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
 rho: 0.5
 lr: 3e-4

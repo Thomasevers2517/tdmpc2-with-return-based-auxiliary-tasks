@@ -30,39 +30,27 @@ parameters:
       - acrobot-swingup
       - reacher-hard
       - quadruped-walk
-      - humanoid-run
+      # - humanoid-run
 
   imagination_enabled: 
-    values: [false, true]
+    values: [false]
   imagination_horizon: 
     values: [3,9]
   imagine_num_starts: 
     values: [3]
   imagine_value_loss_coef: 
     values: [0.1]
+  detach_imagine_value:
+    values: [true]
+
   pred_from:
     values: ["rollout", "true_state"]
 
   encoder_consistency_coef:
     values: [0,1,2]
-  
-  utd_ratio:
-    values: [1]
-  reset_agent_freq: 
-    values: [100_000_000] 
 
-  # reset.actor_critic.type:
-  #   values: [full]
-  # reset.encoder_dynamics.type:  
-  #   values: [full ]
-  # # reset.fallbacks.shrink_alpha:
-  # #   values: [0.9]
-  # # reset.fallbacks.shrink_noise_std:
-  # #   values: [0.05]
-  # reset.actor_critic.layers:
-  #   values: [-1]
-  # reset.encoder_dynamics.layers:
-  #   values: [-1]
+  policy_loss_encoder_ratio: 
+    values: [0, 0.05]
 
   multi_gamma_head: 
     values:
@@ -82,16 +70,16 @@ parameters:
     values: [1]
   multi_gamma_loss_weight:
     values: [0.1]
-  # policy_ema_enabled:
-  #   values: [false, true]
-  # policy_ema_tau:
-  #   values: [0.005, 0.05]
+  policy_ema_enabled:
+    values: [false, true]
+  policy_ema_tau:
+    values: [0.05, 0.01]
   encoder_ema_enabled:
     values: [false, true]
   encoder_ema_tau:
-    values: [0.005, 0.05]
+    values: [0.05, 0.01]
   steps:
-    value: 400000
+    value: 250000
   eval_freq:
     value: 25000
   batch_size:
