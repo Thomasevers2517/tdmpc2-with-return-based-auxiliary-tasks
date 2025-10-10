@@ -714,7 +714,7 @@ class TDMPC2(torch.nn.Module):
 			consistency_loss = (rho_pows * consistency_losses).mean()
 			encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
-			
+
 			rho_pows = 1 if self.cfg.pred_from == "true_state" else rho_pows
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
@@ -811,8 +811,8 @@ class TDMPC2(torch.nn.Module):
 				info.update({f"aux_value_loss_weighted/gamma{gamma_val:.4f}": self.cfg.multi_gamma_loss_weight * loss_g}, non_blocking=True)
 				info.update({f"aux_td_target_mean/gamma{gamma_val:.4f}": aux_td_targets[g].mean()}, non_blocking=True)
 				info.update({f"aux_td_target_std/gamma{gamma_val:.4f}": aux_td_targets[g].std()}, non_blocking=True)
-				info.update({f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits, self.cfg).mean()}, non_blocking=True)
-				info.update({f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits, self.cfg).std()}, non_blocking=True)	
+				info.update({f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).mean()}, non_blocking=True)
+				info.update({f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).std()}, non_blocking=True)	
 		
 		if self.cfg.episodic:
 			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)

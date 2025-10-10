@@ -358,13 +358,7 @@ class WorldModel(nn.Module):
 			return action, info
 
 	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
-		"""Predict auxiliary state-action value distributions (no ensemble).
 
-		Args:
-			z: (T,B,L) or (B,L) latent states
-			a: aligned actions
-			return_type: 'all' -> logits (T,B,G_aux,K); 'min'/'avg' -> scalar values (T,B,G_aux,1)
-		"""
 		with maybe_range('WM/Q_aux', self.cfg):
 			if self._num_aux_gamma == 0:
 				return None
@@ -380,9 +374,13 @@ class WorldModel(nn.Module):
 					out = self._detach_aux_joint_Qs(za)
 				else:
 					out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
-		
+				# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
 				T, B = out.shape[0], out.shape[1]
-				out = out.view(self._num_aux_gamma, T, B,  self.cfg.num_bins)
+				G = self._num_aux_gamma
+				K = self.cfg.num_bins
+				if out.shape[-1] != G * K:
+					raise RuntimeError(f"Q_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
+				out = out.view(T, B, G, K).permute(2, 0, 1, 3).contiguous()  # (G,T,B,K)
 			elif self._aux_separate_Qs is not None:
 				if target:
 					outs = [head(za) for head in self._target_aux_separate_Qs]
