@@ -520,8 +520,17 @@ class TDMPC2(torch.nn.Module):
 			qs = self.scale(qs)
 
 			# Loss is a weighted sum of Q-values
-			rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
-			pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho).mean()
+			if self.cfg.pred_from == "roll_out":
+				rho_pows = torch.pow(self.cfg.rho,
+				torch.arange(len(qs), device=self.device)
+			)
+			elif self.cfg.pred_from == "true_state":
+				rho_pows = torch.pow(1, torch.arange(len(qs), device=self.device)
+			)
+			elif self.cfg.pred_from == "both":
+				raise NotImplementedError("rho weighting not implemented for 'both' pred_from setting")	
+		
+			pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
 			return pi_loss, info
 
 	def update_pi(self, zs, task):
@@ -696,21 +705,17 @@ class TDMPC2(torch.nn.Module):
 			# ------------------------------ Vectorized loss computation ------------------------------
 			T, B = reward_preds.shape[:2]
 			K = reward_preds.shape[-1]
-			if self.cfg.pred_from == "roll_out":
-				rho_pows = torch.pow(self.cfg.rho,
+
+			rho_pows = torch.pow(self.cfg.rho,
 				torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
 			)
-			elif self.cfg.pred_from == "true_state":
-				rho_pows = torch.pow(1,
-				torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
-			)
-			elif self.cfg.pred_from == "both":
-				raise NotImplementedError("rho weighting not implemented for 'both' pred_from setting")
 			
 			# Consistency loss (MSE) over latent prediction errors, weighted by rho^t
 			consistency_loss = (rho_pows * consistency_losses).mean()
 			encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
+			
+			rho_pows = 1 if self.cfg.pred_from == "true_state" else rho_pows
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
@@ -718,7 +723,7 @@ class TDMPC2(torch.nn.Module):
 				self.cfg,
 			)
 			rew_ce = rew_ce.view(T, B, 1).mean(dim=1).squeeze(-1)  # (T,)
-			reward_loss = (rho_pows * rew_ce).sum() / T
+			reward_loss = (rho_pows * rew_ce).mean() 
 
 			# Value CE across ensemble heads (Qe,T,B) -> mean over B, sum over heads, weight by rho
 			Qe = qs.shape[0]
