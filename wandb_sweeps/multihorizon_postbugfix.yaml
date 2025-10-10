@@ -1,0 +1,102 @@
+# W&B sweep: 1M-step runs over selected control tasks, 3 seeds each.
+# Requested (interpreted) tasks:
+#   acrobot-swingup, finger-turn-easy, finger-turn-hard, walker-walk, walker-run
+# Updated: removed finger-spin (too easy), added quadruped-walk, reacher-hard per user request.
+# If you intended another task (e.g., fish-swim, hopper-walk variant, etc.), let me know to add it.
+#
+# Sweep is a full grid: tasks x seeds. All other hyperparameters fixed.
+# Steps fixed to 1_000_000 as requested.
+#
+# Launch:
+#   wandb sweep wandb_sweeps/one_million_task_sweep.yaml
+#   wandb agent <entity>/<project>/<sweep_id>
+# To run multiple agents in parallel (e.g., 2 GPUs): start multiple wandb agent commands.
+#
+# Each run calls tdmpc2/train.py with hydra overrides from these parameters.
+
+program: tdmpc2/train.py
+method: random
+command:
+  - ${env}
+  - /space/thomasevers/conda-envs/tdmpc2/bin/python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  task:
+    values:
+      - acrobot-swingup
+      # - reacher-hard
+      # - quadruped-walk
+      # - humanoid-run
+
+  imagination_enabled: 
+    values: [false]
+  imagination_horizon: 
+    values: [3]
+  imagine_num_starts: 
+    values: [3]
+  imagine_value_loss_coef: 
+    values: [0.1]
+  detach_imagine_value:
+    values: [true]
+
+  pred_from:
+    values: ["rollout", "true_state"]
+
+  encoder_consistency_coef:
+    values: [0,2]
+
+  policy_loss_encoder_ratio: 
+    values: [0]
+
+  multi_gamma_head: 
+    values:
+        - joint 
+        - separate
+  seed:
+    values: [102, 203, 304]
+  best_eval: 
+    values: [true, false]
+
+  # Multi-gamma auxiliary value experiments (mirroring earlier setup)
+  multi_gamma_gammas:
+    values:
+      # - [0.9]
+      - [0.9, 0.95]
+      - [0.8, 0.9, 0.95, 0.97]
+
+  joint_aux_dim_mult:
+    values: [1, 2]
+  multi_gamma_loss_weight:
+    values: [0.1, 0.3, 0.03]
+  policy_ema_enabled:
+    values: [false, true]
+  policy_ema_tau:
+    values: [0.05] # 0.99 is half life of ~70 updates at tau=0.01. 0.05 is half life of ~14 updates.
+  encoder_ema_enabled:
+    values: [false, true]
+  encoder_ema_tau:
+    values: [0.05]
+  steps:
+    value: 150000
+  eval_freq:
+    value: 25000
+  batch_size:
+    value: 256
+  model_size:
+    value: 5
+  obs:
+    value: state
+  compile:
+    value: true
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

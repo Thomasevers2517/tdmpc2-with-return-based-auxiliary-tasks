@@ -43,9 +43,9 @@ enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
 policy_ema_enabled: false
-policy_ema_tau: 0.005
+policy_ema_tau: 0.05
 encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
-encoder_ema_tau: 0.01
+encoder_ema_tau: 0.05
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995

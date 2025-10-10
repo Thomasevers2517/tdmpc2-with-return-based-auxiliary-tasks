@@ -512,7 +512,7 @@ class TDMPC2(torch.nn.Module):
 		return torch.sqrt(accum)
 
 	def calc_pi_losses(self, z, task):
-		
+		#Z is shape (T,B,L)
 		with maybe_range('Agent/update_pi', self.cfg):
 			action, info = self.model.pi(z, task)
 			qs = self.model.Q(z, action, task, return_type='avg', detach=True)
@@ -520,12 +520,12 @@ class TDMPC2(torch.nn.Module):
 			qs = self.scale(qs)
 
 			# Loss is a weighted sum of Q-values
-			if self.cfg.pred_from == "roll_out":
+			if self.cfg.pred_from == "rollout":
 				rho_pows = torch.pow(self.cfg.rho,
-				torch.arange(len(qs), device=self.device)
+				torch.arange(z.shape[0], device=self.device)
 			)
 			elif self.cfg.pred_from == "true_state":
-				rho_pows = torch.pow(1, torch.arange(len(qs), device=self.device)
+				rho_pows = torch.pow(1, torch.arange(z.shape[0], device=self.device)
 			)
 			elif self.cfg.pred_from == "both":
 				raise NotImplementedError("rho weighting not implemented for 'both' pred_from setting")	
@@ -715,7 +715,10 @@ class TDMPC2(torch.nn.Module):
 			encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
 
-			rho_pows = 1 if self.cfg.pred_from == "true_state" else rho_pows
+			rho_pows = torch.pow(1,
+				torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
+			) if self.cfg.pred_from == "true_state" else rho_pows
+   
 			# Reward CE over all (T,B) at once -> shape (T,)
 			rew_ce = math.soft_ce(
 				reward_preds.reshape(T * B, K),
@@ -747,7 +750,6 @@ class TDMPC2(torch.nn.Module):
 				)
 				aux_ce = aux_ce.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # (G_aux,T)
 				aux_value_losses = (aux_ce * rho_pows.unsqueeze(0)).mean(dim=1)  # (G_aux,)
-
 
 			# reward_loss and value_loss were already normalized by T and T*Qe above
 			if self.cfg.episodic:
@@ -788,7 +790,15 @@ class TDMPC2(torch.nn.Module):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i]}, non_blocking=True)
 		    #add weighted consistency loss per step
 			info.update({f"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i]}, non_blocking=True)
-		# Add auxiliary losses per gamma
+			
+   			#add reward/aux, value loss per step
+			info.update({f"reward_loss/step{i}": rew_ce[i],
+						"value_loss/step{i}": val_ce[i]}, non_blocking=True)
+			info.update({f"aux_value_loss/step{i}": aux_ce[:,i].mean()}, non_blocking=True) if aux_value_losses is not None else None
+
+
+
+                
 		
 		info.update({
 			"td_target_mean": td_targets.mean(),
