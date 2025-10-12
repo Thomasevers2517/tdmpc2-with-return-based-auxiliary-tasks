@@ -25,53 +25,35 @@ metric:
   name: eval/episode_reward
   goal: maximize
 parameters:
+  use_bfloat16: 
+    values: [true, false]
   task:
     values:
       - acrobot-swingup
-      - reacher-hard
-      - quadruped-walk
-      - humanoid-run
-
-  imagination_enabled: 
-    values: [false]
-  imagination_horizon: 
-    values: [3]
-  imagine_num_starts: 
-    values: [3]
-  imagine_value_loss_coef: 
-    values: [0.1]
-  detach_imagine_value:
-    values: [true]
 
   pred_from:
-    values: ["rollout", "true_state"]
+    values: ["rollout"]
 
-  encoder_consistency_coef:
-    values: [0,2]
 
   multi_gamma_head: 
     values:
-        - joint 
         - separate
   seed:
     values: [102, 203, 304]
   best_eval: 
-    values: [true]
+    values: [false]
 
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
-      - [0.8]
-      - [0.9]
-      - [0.95]
-      - [0.97]
+      # - [0.9]
       - [0.9, 0.95]
 
 
   joint_aux_dim_mult:
     values: [1]
   multi_gamma_loss_weight:
-    values: [0.1, 0.03]
+    values: [0.1]
   policy_ema_enabled:
     values: [false]
   policy_ema_tau:
@@ -79,7 +61,7 @@ parameters:
   encoder_ema_enabled:
     values: [false]
   encoder_ema_tau:
-    values: [0.05, 0.01]
+    values: [0.05]
   steps:
     value: 150000
   eval_freq:
@@ -90,7 +72,6 @@ parameters:
     value: 5
   obs:
     values:
-      - rgb
       - state
   compile:
     value: true

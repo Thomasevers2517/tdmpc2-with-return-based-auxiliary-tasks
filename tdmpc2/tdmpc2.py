@@ -960,32 +960,36 @@ class TDMPC2(torch.nn.Module):
 
 
 			# ------------------------------ Policy update ------------------------------
-			ratio = self.cfg.policy_loss_encoder_ratio # How much of the policy loss is backpropped through the encoder 
 			
 			if self.cfg.pred_from == "rollout":
-				z_for_pi = ratio * zs + (1-ratio) * zs.detach()
+				z_for_pi = zs.detach()
 				# Policy update (detached rollout latents)
 			elif self.cfg.pred_from == "true_state":
-				z_for_pi = ratio * z_true + (1-ratio) * z_true.detach()
+				z_for_pi = z_true.detach()
 				# Policy update (detached latent sequence)
 			elif self.cfg.pred_from == "both":
 				z_both = torch.cat([zs, z_true], dim=1)  # (T,B*2,L)
-				z_for_pi = ratio * z_both + (1-ratio) * z_both.detach()
+				z_for_pi = z_both.detach()
 				# Policy update (mixed latents)
-			pi_loss, pi_info = self.update_pi(z_for_pi, task)
+
 
 
 			# ------------------------------ Backprop & updates ------------------------------
-			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef + pi_loss * self.cfg.policy_coef
-			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				total_loss.backward()
-			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
+			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+
+
+			self.optim_step() #This may be compiled as well
+			self.optim.zero_grad(set_to_none=True)
+   
+			pi_loss, pi_info = self.update_pi(z_for_pi, task)
+			pi_loss = pi_loss * self.cfg.policy_coef
+			pi_loss.backward()	
+			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 
 			self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
-			self.optim_step() #This may be compiled as well
-			self.optim.zero_grad(set_to_none=True)
    
 			pi_info.update({
 				"pi_grad_norm": pi_grad_norm,

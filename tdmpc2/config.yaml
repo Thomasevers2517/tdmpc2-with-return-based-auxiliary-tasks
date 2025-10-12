@@ -25,8 +25,6 @@ detach_imagine_value: true  # if true, detach the latents used for imagine value
 #Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
 pred_from: rollout # rollout, true_state, both
 
-policy_loss_encoder_ratio: 0 # weight on policy loss backpropagated to encoder, 0 means no backprop to encoder from policy loss. 1 means full backprop to encoder from policy loss.
-
 steps: 4_000_000
 batch_size: 256
 reward_coef: 0.1
