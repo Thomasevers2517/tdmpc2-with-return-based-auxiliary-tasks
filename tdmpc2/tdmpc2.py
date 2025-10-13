@@ -532,8 +532,8 @@ class TDMPC2(torch.nn.Module):
 				pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
     
 			elif self.cfg.pred_from == "both":
-				qs = qs.view(T, 2, B, -1)  # (T,2,B,K)
-				scaled_entropy = info["scaled_entropy"].view(T, 2, B)  # (T,2,B)
+				qs = qs.view(T, 2, B, -1)  # (T,2,B,1)
+				scaled_entropy = info["scaled_entropy"].contiguous().view(T, 2, B, 1)  # (T,2,B)
 
 				true_state_loss = (-(self.cfg.entropy_coef * scaled_entropy[:,0] + qs[:, 0, ...]).mean(dim=(1,2)) * rho_pows.mean()).mean()
 				rollout_loss = (-(self.cfg.entropy_coef * scaled_entropy[:,1] + qs[:, 1, ...]).mean(dim=(1,2)) * rho_pows).mean()
@@ -690,7 +690,12 @@ class TDMPC2(torch.nn.Module):
 			else:
 				termination_pred = None	
 		elif self.cfg.pred_from == "both":
-			z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
+			# z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
+			if self.cfg.split_batch:
+				Bh = self.cfg.batch_size // 2
+				z_both = torch.cat([z_true[:-1, Bh:].unsqueeze(1), _zs[:, :Bh].unsqueeze(1)], dim=1)  # (T,2,B/2,L)
+			else:
+				z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
 			T, _, B, L = z_both.shape
 			z_both = z_both.view(T, B*2, L)
 			action = action.unsqueeze(1).expand(-1, 2, -1, -1).reshape(T, B*2, -1)  # (T,2,B,A) → (T,B*2,A)
@@ -710,7 +715,7 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/order_losses', self.cfg):
 			total_loss, info = self.order_wm_losses(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses)
 
-		return total_loss, z_rollout, info, z_true
+		return total_loss, z_rollout, info, z_true, z_both
 	
 	def order_wm_losses(self, qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses):
 		T, B = reward_preds.shape[:2]
@@ -1006,7 +1011,7 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
 			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				wm_loss, zs, info, z_true = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
+				wm_loss, zs, info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
 				# Imagination-augmented value loss (optional)
 				if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
 					z_im = z_true
@@ -1029,7 +1034,6 @@ class TDMPC2(torch.nn.Module):
 				z_for_pi = z_true.detach()
 				# Policy update (detached latent sequence)
 			elif self.cfg.pred_from == "both":
-				z_both = torch.cat([zs.unsqueeze(1), z_true.unsqueeze(1)], dim=1)  # (T,2,B,L)
 				z_for_pi = z_both.detach()
 				# Policy update (mixed latents)
 

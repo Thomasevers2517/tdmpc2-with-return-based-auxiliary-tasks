@@ -24,7 +24,11 @@ imagine_value_loss_coef: 0.05
 detach_imagine_value: true  # if true, detach the latents used for imagine value loss calculation. This is to prevent gradients from the imagine value loss to flow into the encoder and dynamics model. This is to isolate the effect of the imagine value loss on the value function only.
 #Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
 pred_from: rollout # rollout, true_state, both 
-rollout_fraction: 0.5 # If Both, what fraction of the loss NOT IMPLENETED
+
+#if both is selected
+split_batch: true # If Both, do we split the batch in two, one half for rollout, one half for true state
+rollout_fraction: 0.5 # If Both, what how much is the rollout weighted
+
 
 steps: 4_000_000
 batch_size: 256

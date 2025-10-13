@@ -28,8 +28,8 @@ parameters:
   task:
     values:
       - acrobot-swingup
-      - reacher-hard
-      - quadruped-walk
+      # - reacher-hard
+      # - quadruped-walk
       # - humanoid-run
 
   imagination_enabled: 
@@ -44,14 +44,16 @@ parameters:
     values: [true]
 
   pred_from:
-    values: ["rollout"]
+    values: ["both"]
+  split_batch: 
+    values: [true, false]
 
   encoder_consistency_coef:
-    values: [0,0.05,2]
+    values: [0.05]
 
   multi_gamma_head: 
     values:
-        - joint 
+        # - joint 
         - separate
   seed:
     values: [102, 203, 304]
@@ -61,12 +63,12 @@ parameters:
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
-      - [0.8]
       - [0.9]
       - [0.95]
       - [0.97]
       - [0.9, 0.95]
-      - [0.9, 0.95, 0.97]
+      - [0.95, 0.97]
+
 
 
   joint_aux_dim_mult:
