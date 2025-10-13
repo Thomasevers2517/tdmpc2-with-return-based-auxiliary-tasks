@@ -694,11 +694,14 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.split_batch:
 				Bh = self.cfg.batch_size // 2
 				z_both = torch.cat([z_true[:-1, Bh:].unsqueeze(1), _zs[:, :Bh].unsqueeze(1)], dim=1)  # (T,2,B/2,L)
+				T, _, B, L = z_both.shape
 			else:
 				z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
-			T, _, B, L = z_both.shape
+				T, _, B, L = z_both.shape
+				action = action.unsqueeze(1).expand(-1, 2, -1, -1).reshape(T, B*2, -1)  # (T,2,B,A) → (T,B*2,A)
+
+	
 			z_both = z_both.view(T, B*2, L)
-			action = action.unsqueeze(1).expand(-1, 2, -1, -1).reshape(T, B*2, -1)  # (T,2,B,A) → (T,B*2,A)
 			qs = self.model.Q(z_both, action, task, return_type='all').view(-1, T, 2, B, self.cfg.num_bins)  # (Qe,T,2,B,K)    
 			reward_preds = self.model.reward(z_both, action, task).view(T, 2, B, self.cfg.num_bins)         # (T,2,B,K)
    
