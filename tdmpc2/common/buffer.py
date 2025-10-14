@@ -118,20 +118,9 @@ class Buffer():
 			torch.cuda.current_stream().wait_stream(self._copy_stream)  # first batch only
 			self._primed = True
 		torch.cuda.current_stream().wait_stream(self._copy_stream)
-		td = self._prefetched_td_gpu
+		obs, action, reward, terminated, task = self._prefetched_td_gpu
 		self._preload_gpu()  # overlap next copy with your compute on 'ready'
 
-		obs = td.get('obs').contiguous()
-		action = td.get('action')[1:].contiguous()
-		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
-		terminated = td.get('terminated', None)
-		if terminated is not None:
-			terminated = td.get('terminated')[1:].unsqueeze(-1).contiguous()
-		else:
-			terminated = torch.zeros_like(reward).contiguous()
-		task = td.get('task', None)
-		if task is not None:
-			task = task[0].contiguous()
 		return obs, action, reward, terminated, task
 
 
@@ -140,3 +129,21 @@ class Buffer():
 		with torch.cuda.stream(self._copy_stream):
 			# one async H2D per tensor; pinned + non_blocking allows overlap
 			self._prefetched_td_gpu = td_cpu.to(self._device, non_blocking=True)
+			self._prefetched_td_gpu = self.from_td(self._prefetched_td_gpu)
+   
+	def from_td(self, td):
+		"""
+		Create a buffer from a TensorDict of episodes.
+		"""
+		obs = td.get('obs').contiguous()
+		action = td.get('action')[1:].contiguous()
+		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
+		terminated = td.get('terminated', None)
+		if self.cfg.episodic:
+			terminated = td.get('terminated')[1:].unsqueeze(-1).contiguous()
+		else:
+			terminated = torch.zeros_like(reward).contiguous()
+		task = td.get('task')
+		if task is not None:
+			task = task[0].contiguous()
+		return obs, action, reward, terminated, task

@@ -7,7 +7,7 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
-RUN_NAME="tdmpc2_reacher_easy_compiled_default_autocastbf16"
+RUN_NAME="reacher-easy-state"
 
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +29,7 @@ export EGL_PLATFORM=surfaceless
 
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=600 \
+	--delay=900 \
 	--duration=20 \
 	--sample=none \
 	--force-overwrite=true	-o "$OUT_DIR/profile" \
@@ -37,9 +37,9 @@ CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 		task=reacher-easy \
 		obs=state \
 		compile=true \
-		compile_type=default \
+		compile_type=reduce-overhead \
 		nvtx_profiler=true \
-		enable_wandb=false \
+		enable_wandb=true \
 		steps=2000000 \
 	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
 

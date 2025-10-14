@@ -154,15 +154,15 @@ class TDMPC2(torch.nn.Module):
 			self.calc_wm_losses = torch.compile(self.calc_wm_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_imagine_value_loss = torch.compile(self.calc_imagine_value_loss, mode=self.cfg.compile_type, fullgraph=True)
-   
-			# @torch.compile(mode=self.cfg.compile_type, fullgraph=False)
-			@torch._dynamo.disable()
+
+			# @torch._dynamo.disable()
+			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
 			def optim_step():
 				self.optim.step()
 				return
 
-			# @torch.compile(mode=self.cfg.compile_type, fullgraph=False)
-			@torch._dynamo.disable()
+			# @torch._dynamo.disable()
+			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
 			def pi_optim_step():
 				self.pi_optim.step()
 				return
@@ -760,14 +760,15 @@ class TDMPC2(torch.nn.Module):
 			roll_out_aux_td_targets = aux_td_targets if aux_td_targets is None or not self.cfg.split_batch else aux_td_targets[:, :, B:]
 			true_state_aux_td_targets = aux_td_targets if aux_td_targets is None or not self.cfg.split_batch else aux_td_targets[:, :, :B]
    
-			#Output is (reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce)
-			roll_out_losses = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, roll_out_reward, roll_out_td_targets, roll_out_aux_td_targets, roll_out_q_aux_logits, roll_out_terminated, roll_out_termination_pred, time_decay=True)
-			true_state_losses = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, true_state_reward, true_state_td_targets, true_state_aux_td_targets, true_state_q_aux_logits, true_state_terminated, true_state_termination_pred, time_decay=False)
+			with maybe_range('Agent/calc_wm_loss_from_preds', self.cfg):
+				#Output is (reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce)
+				roll_out_losses = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, roll_out_reward, roll_out_td_targets, roll_out_aux_td_targets, roll_out_q_aux_logits, roll_out_terminated, roll_out_termination_pred, time_decay=True)
+				true_state_losses = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, true_state_reward, true_state_td_targets, true_state_aux_td_targets, true_state_q_aux_logits, true_state_terminated, true_state_termination_pred, time_decay=False)
 			
 			reward_loss = self.cfg.rollout_fraction* roll_out_losses[0] + true_state_losses[0]*(1-self.cfg.rollout_fraction)
 			value_loss = self.cfg.rollout_fraction* roll_out_losses[1] + true_state_losses[1]*(1-self.cfg.rollout_fraction)
 			if roll_out_losses[2] is not None and true_state_losses[2] is not None:
-				aux_value_losses = torch.zeros_like(roll_out_losses[2])
+				aux_value_losses = torch.zeros_like(roll_out_losses[2], device=self.device)
 				for g in range(len(roll_out_losses[2])):
 					aux_value_losses[g] = self.cfg.rollout_fraction*roll_out_losses[2][g] + true_state_losses[2][g]*(1-self.cfg.rollout_fraction)
 				aux_value_loss_mean = self.cfg.rollout_fraction*roll_out_losses[3] + true_state_losses[3]*(1-self.cfg.rollout_fraction)
@@ -860,7 +861,7 @@ class TDMPC2(torch.nn.Module):
 			time_decay (bool): Whether to apply time decay (rho^t) to losses. 
 		Returns:
 			tuple: (reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce)
-  """
+  		"""
 		T, B, K, = reward_preds.shape
 		rho_pows = torch.pow(self.cfg.rho,
 			torch.arange(T, device=self.device, dtype=qs.dtype)
@@ -1053,22 +1054,31 @@ class TDMPC2(torch.nn.Module):
 
 
 			# ------------------------------ Backprop & updates ------------------------------
-			total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
+			if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+				total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
+    		else:
+				total_loss = wm_loss
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 
+			if log_grads:
+				self.optim.step()
+			else:
+				self.optim_step() #This one is compiled
 
-			self.optim_step() #This may be compiled as well
 			self.optim.zero_grad(set_to_none=True)
-   
+
 			pi_loss, pi_info = self.update_pi(z_for_pi, task)
 			pi_loss = pi_loss * self.cfg.policy_coef
 			pi_loss.backward()	
 			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+			if log_grads:
+				self.pi_optim.step()
+			else:
+				self.pi_optim_step() #This one is compiled
 
-			self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
-   
+
 			pi_info.update({
 				"pi_grad_norm": pi_grad_norm,
 			}, non_blocking=True)
