@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from torch import autocast
 
 
 from common import math
@@ -79,7 +78,9 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
-		self.model_data_type = torch.bfloat16 if cfg.use_bfloat16 else torch.float32
+		autocast_dtype = torch.bfloat16 if cfg.use_bfloat16  else torch.float32
+		self.model_data_type = autocast_dtype
+		self.model.autocast_dtype = autocast_dtype if autocast_dtype != torch.float32 else None
   		# ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
@@ -553,10 +554,7 @@ class TDMPC2(torch.nn.Module):
 			float: Loss of the policy update.
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and (self._update_step % self.cfg.log_gradients_every == 0)
-  
-  
-		with autocast(device_type=self.device.type ,dtype=self.model_data_type):
-			pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+		pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
 		# if log_grads:
 		# 	# self.probe_pi_gradients(pi_loss, info)
 
@@ -693,7 +691,7 @@ class TDMPC2(torch.nn.Module):
 			# z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
 			if self.cfg.split_batch:
 				Bh = self.cfg.batch_size // 2
-				z_both = torch.cat([z_true[:-1, Bh:].unsqueeze(1), _zs[:, :Bh].unsqueeze(1)], dim=1)  # (T,2,B/2,L)
+				z_both = torch.cat([z_true[:-1, :Bh].unsqueeze(1), _zs[:, Bh:].unsqueeze(1)], dim=1)  # (T,2,B/2,L)
 				T, _, B, L = z_both.shape
 			else:
 				z_both = torch.cat([z_true[:-1].unsqueeze(1), _zs.unsqueeze(1)], dim=1)  # (T,2,B,L)
@@ -718,10 +716,11 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/order_losses', self.cfg):
 			total_loss, info = self.order_wm_losses(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses)
 
-		return total_loss, z_rollout, info, z_true, z_both
+		return total_loss, z_rollout, info, z_true, z_both.view(T, 2, B, L) 
 	
 	def order_wm_losses(self, qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses):
-		T, B = reward_preds.shape[:2]
+		T = reward_preds.shape[0]
+		B = reward_preds.shape[-2]
 		K = reward_preds.shape[-1]
 
 		rho_pows = torch.pow(self.cfg.rho,
@@ -748,10 +747,18 @@ class TDMPC2(torch.nn.Module):
 			true_state_termination_pred = termination_pred[ :, 0, ...] if termination_pred is not None else None  # (T,B,1)
 			# Compute losses separately for both prediction sources and average
 			# ------------------------------ Separate loss computation for both prediction sources ------------------------------
+			roll_out_reward = reward if not self.cfg.split_batch else reward[:, B:]
+			true_state_reward = reward if not self.cfg.split_batch else reward[:, :B]
+			roll_out_terminated = terminated if not self.cfg.split_batch else terminated[:, B:]
+			true_state_terminated = terminated if not self.cfg.split_batch else terminated[:, :B]
+			roll_out_td_targets = td_targets if not self.cfg.split_batch else td_targets[:, B:]
+			true_state_td_targets = td_targets if not self.cfg.split_batch else td_targets[:, :B]
+			roll_out_aux_td_targets = aux_td_targets if aux_td_targets is None or not self.cfg.split_batch else aux_td_targets[:, :, B:]
+			true_state_aux_td_targets = aux_td_targets if aux_td_targets is None or not self.cfg.split_batch else aux_td_targets[:, :, :B]
+   
 			#Output is (reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce)
-
-			roll_out_losses = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, reward, td_targets, aux_td_targets, roll_out_q_aux_logits, terminated, roll_out_termination_pred, time_decay=True)
-			true_state_losses = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, reward, td_targets, aux_td_targets, true_state_q_aux_logits, terminated, true_state_termination_pred, time_decay=False)
+			roll_out_losses = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, roll_out_reward, roll_out_td_targets, roll_out_aux_td_targets, roll_out_q_aux_logits, roll_out_terminated, roll_out_termination_pred, time_decay=True)
+			true_state_losses = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, true_state_reward, true_state_td_targets, true_state_aux_td_targets, true_state_q_aux_logits, true_state_terminated, true_state_termination_pred, time_decay=False)
 			
 			reward_loss = self.cfg.rollout_fraction* roll_out_losses[0] + true_state_losses[0]*(1-self.cfg.rollout_fraction)
 			value_loss = self.cfg.rollout_fraction* roll_out_losses[1] + true_state_losses[1]*(1-self.cfg.rollout_fraction)
@@ -1013,16 +1020,15 @@ class TDMPC2(torch.nn.Module):
  
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			with autocast(device_type=self.device.type, dtype=self.model_data_type):
-				wm_loss, zs, info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
-				# Imagination-augmented value loss (optional)
-				if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
-					z_im = z_true
-					z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
-					imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_im, task=task) if (not log_grads or not self.cfg.compile) else self.calc_imagine_value_loss_eager(z_im, task=task)
-				else:
-					imagine_value_loss = torch.tensor(0., device=self.device)
-					imagine_info = TensorDict({}, device=self.device)
+			wm_loss, zs, info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
+			# Imagination-augmented value loss (optional)
+			if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+				z_im = z_true
+				z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
+				imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_im, task=task) if (not log_grads or not self.cfg.compile) else self.calc_imagine_value_loss_eager(z_im, task=task)
+			else:
+				imagine_value_loss = torch.tensor(0., device=self.device)
+				imagine_info = TensorDict({}, device=self.device)
 			if log_grads:
 				info = self.probe_wm_gradients(info, imagine_info)
 		

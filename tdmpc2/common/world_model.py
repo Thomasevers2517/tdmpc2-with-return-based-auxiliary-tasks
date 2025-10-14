@@ -1,7 +1,9 @@
 from copy import deepcopy
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+from torch import autocast
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from common import layers, math, init
@@ -19,6 +21,7 @@ class WorldModel(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		self.autocast_dtype = None
 		if cfg.multitask:
 			self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
@@ -84,6 +87,15 @@ class WorldModel(nn.Module):
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
 		self.init()
+
+	def _autocast_context(self):
+		dtype = self.autocast_dtype
+		if dtype is None or dtype == torch.float32:
+			return nullcontext()
+		device = next(self.parameters()).device
+		if device.type != 'cuda':
+			return nullcontext()
+		return autocast(device_type=device.type, dtype=dtype)
 
 	def init(self):
 		# Create params
@@ -279,8 +291,12 @@ class WorldModel(nn.Module):
 			if self.cfg.multitask:
 				obs = self.task_emb(obs, task)
 			if self.cfg.obs == 'rgb' and obs.ndim == 5:
-				return torch.stack([encoder[self.cfg.obs](o) for o in obs])
-			return encoder[self.cfg.obs](obs)
+				with self._autocast_context():
+					encoded = [encoder[self.cfg.obs](o) for o in obs]
+				return torch.stack([e.float() for e in encoded])
+			with self._autocast_context():
+				out = encoder[self.cfg.obs](obs)
+			return out.float()
 
 	def next(self, z, a, task):
 		"""
@@ -289,8 +305,10 @@ class WorldModel(nn.Module):
 		with maybe_range('WM/dynamics', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
-			z = torch.cat([z, a], dim=-1)
-			return self._dynamics(z)
+			za = torch.cat([z, a], dim=-1)
+			with self._autocast_context():
+				out = self._dynamics(za)
+			return out.float()
 
 	def reward(self, z, a, task):
 		"""
@@ -299,8 +317,10 @@ class WorldModel(nn.Module):
 		with maybe_range('WM/reward', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
-			z = torch.cat([z, a], dim=-1)
-			return self._reward(z)
+			za = torch.cat([z, a], dim=-1)
+			with self._autocast_context():
+				out = self._reward(za)
+			return out.float()
 	
 	def termination(self, z, task, unnormalized=False):
 		"""
@@ -309,9 +329,12 @@ class WorldModel(nn.Module):
 		assert task is None
 		if self.cfg.multitask:
 			z = self.task_emb(z, task)
+		with self._autocast_context():
+			logits = self._termination(z)
+		logits = logits.float()
 		if unnormalized:
-			return self._termination(z)
-		return torch.sigmoid(self._termination(z))
+			return logits
+		return torch.sigmoid(logits)
 		
 
 	def pi(self, z, task, use_ema=False):
@@ -329,8 +352,9 @@ class WorldModel(nn.Module):
 				module = self._pi
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
-
-			mean, log_std = module(z).chunk(2, dim=-1)
+			with self._autocast_context():
+				raw = module(z)
+			mean, log_std = raw.float().chunk(2, dim=-1)
 			log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 			eps = torch.randn_like(mean, device=mean.device)
 
@@ -368,12 +392,14 @@ class WorldModel(nn.Module):
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			if self._aux_joint_Qs is not None:
-				if target:
-					out = self._target_aux_joint_Qs(za)
-				elif detach:
-					out = self._detach_aux_joint_Qs(za)
-				else:
-					out = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+				with self._autocast_context():
+					if target:
+						raw = self._target_aux_joint_Qs(za)
+					elif detach:
+						raw = self._detach_aux_joint_Qs(za)
+					else:
+						raw = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+				out = raw.float()
 				# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
 				T, B = out.shape[0], out.shape[1]
 				G = self._num_aux_gamma
@@ -382,12 +408,14 @@ class WorldModel(nn.Module):
 					raise RuntimeError(f"Q_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
 				out = out.view(T, B, G, K).permute(2, 0, 1, 3).contiguous()  # (G,T,B,K)
 			elif self._aux_separate_Qs is not None:
-				if target:
-					outs = [head(za) for head in self._target_aux_separate_Qs]
-				elif detach:
-					outs = [head(za) for head in self._detach_aux_separate_Qs]
-				else:
-					outs = [head(za) for head in self._aux_separate_Qs]  # list[(T,B,K)]
+				with self._autocast_context():
+					if target:
+						raw_list = [head(za) for head in self._target_aux_separate_Qs]
+					elif detach:
+						raw_list = [head(za) for head in self._detach_aux_separate_Qs]
+					else:
+						raw_list = [head(za) for head in self._aux_separate_Qs]
+				outs = [rl.float() for rl in raw_list]
 				out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
 	
 			if return_type == 'all':
@@ -409,15 +437,16 @@ class WorldModel(nn.Module):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 
-			z = torch.cat([z, a], dim=-1)
+			za = torch.cat([z, a], dim=-1)
 			if target:
 				qnet = self._target_Qs
 			elif detach:
 				qnet = self._detach_Qs
 			else:
 				qnet = self._Qs
-    
-			out = qnet(z)
+			with self._autocast_context():
+				out = qnet(za)
+			out = out.float()
 
 			if return_type == 'all':
 				return out
