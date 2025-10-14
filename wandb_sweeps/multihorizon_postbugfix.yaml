@@ -51,7 +51,7 @@ parameters:
     values: [0.5]
 
   encoder_consistency_coef:
-    values: [5]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+    values: [1,5]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
   multi_gamma_head: 
     values:
@@ -65,8 +65,8 @@ parameters:
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
-      # - [0.8]
-      # - [0.95]
+      - [0.9]
+      - [0.95]
       # - [0.8, 0.95]
       - [0.9, 0.95]
 
@@ -76,7 +76,7 @@ parameters:
   joint_aux_dim_mult:
     values: [1]
   multi_gamma_loss_weight:
-    values: [0.1]
+    values: [0.1, 0.03]
   # policy_ema_enabled:
   #   values: [false]
   # policy_ema_tau:
@@ -92,7 +92,7 @@ parameters:
   batch_size:
     value: 256
   model_size:
-    value: 1
+    value: 5
   obs:
     values:
       # - rgb

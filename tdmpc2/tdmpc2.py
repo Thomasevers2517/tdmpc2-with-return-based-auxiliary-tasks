@@ -1056,7 +1056,7 @@ class TDMPC2(torch.nn.Module):
 			# ------------------------------ Backprop & updates ------------------------------
 			if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
 				total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
-    		else:
+			else:
 				total_loss = wm_loss
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
