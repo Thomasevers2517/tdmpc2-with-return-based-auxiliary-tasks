@@ -21,7 +21,13 @@ class WorldModel(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		self.autocast_dtype = None
+		if self.cfg.dtype == 'float16':
+			self.autocast_dtype = torch.float16
+		elif self.cfg.dtype == 'bfloat16':
+			self.autocast_dtype = torch.bfloat16	
+		else:
+			self.autocast_dtype = None
+   
 		if cfg.multitask:
 			self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
 			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))

@@ -25,8 +25,11 @@ metric:
   name: eval/episode_reward
   goal: maximize
 parameters:
-  use_bfloat16: 
-    values: [true, false]
+  dtype:
+    values: 
+      - float16
+      - bfloat16
+      - float32
   task:
     values:
       - acrobot-swingup

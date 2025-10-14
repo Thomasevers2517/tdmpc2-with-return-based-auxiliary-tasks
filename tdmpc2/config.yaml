@@ -147,7 +147,7 @@ multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics 
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true
 
-use_bfloat16: false            # If true: use bfloat16 precision with autocast where applicable (saves memory, may be faster).
+dtype : float32
 
 distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixed distractors)
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'

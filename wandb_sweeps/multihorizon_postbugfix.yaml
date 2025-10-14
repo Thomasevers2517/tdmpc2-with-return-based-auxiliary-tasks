@@ -28,8 +28,8 @@ parameters:
   task:
     values:
       - acrobot-swingup
-      - reacher-hard
-      - quadruped-walk
+      # - reacher-hard
+      # - quadruped-walk
       # - humanoid-run
 
   # imagination_enabled: 
@@ -43,14 +43,12 @@ parameters:
   # detach_imagine_value:
   #   values: [true]
 
-  latent_dim:
-    values: [512]
   pred_from:
     values: ["both"]
   split_batch: 
-    values: [true, false]
+    values: [true]
   rollout_fraction:
-    values: [0.5, 0.75]
+    values: [0.5]
 
   encoder_consistency_coef:
     values: [5]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
@@ -67,9 +65,10 @@ parameters:
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
-      - [0.8]
-      - [0.95]
-      - [0.8, 0.95]
+      # - [0.8]
+      # - [0.95]
+      # - [0.8, 0.95]
+      - [0.9, 0.95]
 
 
 
@@ -93,7 +92,7 @@ parameters:
   batch_size:
     value: 256
   model_size:
-    value: 5
+    value: 1
   obs:
     values:
       # - rgb

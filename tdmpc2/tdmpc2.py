@@ -78,9 +78,13 @@ class TDMPC2(torch.nn.Module):
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
 		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
-		autocast_dtype = torch.bfloat16 if cfg.use_bfloat16  else torch.float32
-		self.model_data_type = autocast_dtype
-		self.model.autocast_dtype = autocast_dtype if autocast_dtype != torch.float32 else None
+		if self.cfg.dtype == 'float16':
+			self.autocast_dtype = torch.float16
+		elif self.cfg.dtype == 'bfloat16':
+			self.autocast_dtype = torch.bfloat16
+		else:	
+			self.autocast_dtype = None
+
   		# ------------------------------------------------------------------
 		# Optimizer parameter groups
 		# Base groups mirror original implementation; we now optionally append
@@ -716,7 +720,7 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/order_losses', self.cfg):
 			total_loss, info = self.order_wm_losses(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses)
 
-		return total_loss, z_rollout, info, z_true, z_both.view(T, 2, B, L) 
+		return total_loss, z_rollout, info, z_true, z_both.view(T, 2, B, L) if self.cfg.pred_from == "both" else None 
 	
 	def order_wm_losses(self, qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses):
 		T = reward_preds.shape[0]
