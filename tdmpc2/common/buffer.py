@@ -28,7 +28,7 @@ class Buffer():
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
   
-          # --- GPU prefetch machinery ---
+		  # --- GPU prefetch machinery ---
 		self._copy_stream = torch.cuda.Stream()
 		self._prefetched_td_gpu = None
 		self._primed = False
@@ -81,7 +81,7 @@ class Buffer():
 		if self._storage_device.type == 'cpu':
 			td = td.pin_memory()
 		return td
-     
+	 
 	def load(self, td):
 		"""
 		Load a batch of episodes into the buffer. This is useful for loading data from disk,
@@ -118,7 +118,7 @@ class Buffer():
 			torch.cuda.current_stream().wait_stream(self._copy_stream)  # first batch only
 			self._primed = True
 		torch.cuda.current_stream().wait_stream(self._copy_stream)
-		obs, action, reward, terminated, task = self._prefetched_td_gpu
+		obs, action, reward, terminated, task = self.from_td(self._prefetched_td_gpu)
 		self._preload_gpu()  # overlap next copy with your compute on 'ready'
 
 		return obs, action, reward, terminated, task
@@ -126,24 +126,27 @@ class Buffer():
 
 	def _preload_gpu(self):
 		td_cpu = self._buffer.sample()  # CPU, pinned, already sliced/reshaped
+
 		with torch.cuda.stream(self._copy_stream):
+
 			# one async H2D per tensor; pinned + non_blocking allows overlap
 			self._prefetched_td_gpu = td_cpu.to(self._device, non_blocking=True)
-			self._prefetched_td_gpu = self.from_td(self._prefetched_td_gpu)
-   
+
+    
+
+	# @torch.compile(mode='reduce-overhead')
 	def from_td(self, td):
-		"""
-		Create a buffer from a TensorDict of episodes.
-		"""
+
 		obs = td.get('obs').contiguous()
 		action = td.get('action')[1:].contiguous()
 		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
-		terminated = td.get('terminated', None)
 		if self.cfg.episodic:
 			terminated = td.get('terminated')[1:].unsqueeze(-1).contiguous()
 		else:
-			terminated = torch.zeros_like(reward).contiguous()
-		task = td.get('task', None)
-		if task is not None:
-			task = task[0].contiguous()
+			terminated = torch.zeros_like(reward, device=reward.device)
+		if self.cfg.multitask:
+			task = td.get('task')[0].contiguous()
+		else:
+			task = None
 		return obs, action, reward, terminated, task
+
