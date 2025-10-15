@@ -764,8 +764,8 @@ class TDMPC2(torch.nn.Module):
    
 			with maybe_range('Agent/calc_wm_loss_from_preds', self.cfg):
 				#Output is (reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce)
-				ro = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, roll_out_reward, roll_out_td_targets, roll_out_aux_td_targets, roll_out_q_aux_logits, roll_out_terminated, roll_out_termination_pred, time_decay=True)
-				ts = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, true_state_reward, true_state_td_targets, true_state_aux_td_targets, true_state_q_aux_logits, true_state_terminated, true_state_termination_pred, time_decay=False)
+				ro, ro_info = self.calc_wm_loss_from_preds(roll_out_qs, roll_out_reward_preds, roll_out_reward, roll_out_td_targets, roll_out_aux_td_targets, roll_out_q_aux_logits, roll_out_terminated, roll_out_termination_pred, time_decay=True)
+				ts, ts_info = self.calc_wm_loss_from_preds(true_state_qs, true_state_reward_preds, true_state_reward, true_state_td_targets, true_state_aux_td_targets, true_state_q_aux_logits, true_state_terminated, true_state_termination_pred, time_decay=False)
 			
 			reward_loss = self.cfg.rollout_fraction* ro["reward_loss"] + ts["reward_loss"]*(1-self.cfg.rollout_fraction)
 			value_loss = self.cfg.rollout_fraction* ro["value_loss"] + ts["value_loss"]*(1-self.cfg.rollout_fraction)
@@ -776,11 +776,13 @@ class TDMPC2(torch.nn.Module):
 			val_ce = self.cfg.rollout_fraction* ro["val_ce"] + ts["val_ce"]*(1-self.cfg.rollout_fraction)
 			aux_ce = self.cfg.rollout_fraction* ro["aux_ce"] + ts["aux_ce"]*(1-self.cfg.rollout_fraction) if ro["aux_ce"] is not None else None
 		elif self.cfg.pred_from == "true_state":
-			info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=False)
-			reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce = info["reward_loss"], info["value_loss"], info["aux_value_losses"], info["aux_value_loss_mean"], info["termination_loss"], info["rew_ce"], info["val_ce"], info["aux_ce"]
+			ro_info = None
+			losses, ts_info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=False)
+			reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce = losses["reward_loss"], losses["value_loss"], losses["aux_value_losses"], losses["aux_value_loss_mean"], losses["termination_loss"], losses["rew_ce"], losses["val_ce"], losses["aux_ce"]
 		elif self.cfg.pred_from == "rollout":
-			info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=True)
-			reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce = info["reward_loss"], info["value_loss"], info["aux_value_losses"], info["aux_value_loss_mean"], info["termination_loss"], info["rew_ce"], info["val_ce"], info["aux_ce"]
+			ts_info = None
+			losses, ro_info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=True)
+			reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce = losses["reward_loss"], losses["value_loss"], losses["aux_value_losses"], losses["aux_value_loss_mean"], losses["termination_loss"], losses["rew_ce"], losses["val_ce"], losses["aux_ce"]
   		# ------------------------------ Vectorized loss computation ------------------------------
 
 		# Total loss (auxiliary added with its own weight separate from value_coef)
@@ -793,6 +795,10 @@ class TDMPC2(torch.nn.Module):
 			self.cfg.multi_gamma_loss_weight * aux_value_loss_mean
 		)
 		info = TensorDict({
+			"rollout": ro_info,
+			"true_state": ts_info,
+   
+			"consistency_losses": consistency_losses,
 			"consistency_loss": consistency_loss,
 			"encoder_consistency_loss": encoder_consistency_loss,
 			"reward_loss": reward_loss,
@@ -910,7 +916,7 @@ class TDMPC2(torch.nn.Module):
 		# Debug check: ensure value_loss matches MSE to expected values
 
 		
-		info = torch.TensorDict({
+		losses = torch.TensorDict({
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
 			"aux_value_losses": aux_value_losses if aux_value_losses is not None else torch.zeros((G_aux,), device=self.device),
@@ -924,7 +930,7 @@ class TDMPC2(torch.nn.Module):
 		value_error = (math.two_hot_inv(qs.reshape(Qe, T, B, K), self.cfg) - td_targets.unsqueeze(0).expand(Qe,-1, -1, -1).reshape(Qe, T, B, 1))
 		reward_error = (math.two_hot_inv(reward_preds.reshape(T, B, K), self.cfg) - reward.reshape(T, B, 1))
 		for i in range(T):
-			info.update({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
+			info = TensorDict({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
 						f"value_error_mean/step{i}": value_error[:,i].mean(),
 						f"value_error_std/step{i}": value_error[:,i].std(),
 						f"value_error_max/step{i}": value_error[:,i].abs().max(),
@@ -938,7 +944,7 @@ class TDMPC2(torch.nn.Module):
 
 	
   
-		return info
+		return losses, info
  
 	def calc_imagine_value_loss(self, z, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
