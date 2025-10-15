@@ -42,16 +42,17 @@ parameters:
   #   values: [0.1]
   # detach_imagine_value:
   #   values: [true]
-
+  enc_lr_scale:
+    values: [0.3, 0.1, 0.03, 0.003]
   pred_from:
-    values: ["both"]
+    values: ["rollout"]
   split_batch: 
     values: [true]
   rollout_fraction:
     values: [0.5]
 
   encoder_consistency_coef:
-    values: [1,5]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+    values: [1, 3]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
   multi_gamma_head: 
     values:
@@ -65,10 +66,10 @@ parameters:
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
     values:
-      - [0.9]
+      # - [0.97]
       - [0.95]
       # - [0.8, 0.95]
-      - [0.9, 0.95]
+      # - [0.9, 0.95]
 
 
 

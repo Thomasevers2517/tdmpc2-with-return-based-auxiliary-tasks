@@ -568,7 +568,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_entropy": info["entropy"],
 			"pi_scaled_entropy": info["scaled_entropy"],
 			"pi_scale": self.scale.value,
-			"pi_std": info["std"].mean(),
+			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
 		}, device=self.device)
 		return pi_loss, info
@@ -769,12 +769,12 @@ class TDMPC2(torch.nn.Module):
 			
 			reward_loss = self.cfg.rollout_fraction* ro["reward_loss"] + ts["reward_loss"]*(1-self.cfg.rollout_fraction)
 			value_loss = self.cfg.rollout_fraction* ro["value_loss"] + ts["value_loss"]*(1-self.cfg.rollout_fraction)
-			aux_value_losses = [self.cfg.rollout_fraction* r + s*(1-self.cfg.rollout_fraction) for r, s in zip(ro["aux_value_losses"], ts["aux_value_losses"])] if ro["aux_value_losses"] is not None else None
-			aux_value_loss_mean = self.cfg.rollout_fraction* ro["aux_value_loss_mean"] + ts["aux_value_loss_mean"]*(1-self.cfg.rollout_fraction)
+			aux_value_losses = [self.cfg.rollout_fraction* r + s*(1-self.cfg.rollout_fraction) for r, s in zip(ro["aux_value_losses"], ts["aux_value_losses"])] if ro["aux_value_losses"] is not None else [torch.tensor(0., device=self.device) for _ in range(len(self._all_gammas)-1)]
+			aux_value_loss_mean = self.cfg.rollout_fraction* ro["aux_value_loss_mean"] + ts["aux_value_loss_mean"]*(1-self.cfg.rollout_fraction) if ro["aux_value_loss_mean"] is not None else torch.tensor(0., device=self.device)
 			termination_loss = self.cfg.rollout_fraction* ro["termination_loss"] + ts["termination_loss"]*(1-self.cfg.rollout_fraction)
 			rew_ce = self.cfg.rollout_fraction* ro["rew_ce"] + ts["rew_ce"]*(1-self.cfg.rollout_fraction)
 			val_ce = self.cfg.rollout_fraction* ro["val_ce"] + ts["val_ce"]*(1-self.cfg.rollout_fraction)
-			aux_ce = self.cfg.rollout_fraction* ro["aux_ce"] + ts["aux_ce"]*(1-self.cfg.rollout_fraction) if ro["aux_ce"] is not None else None
+			aux_ce = self.cfg.rollout_fraction* ro["aux_ce"] + ts["aux_ce"]*(1-self.cfg.rollout_fraction) if ro["aux_ce"] is not None else  torch.tensor(0., device=self.device)
 		elif self.cfg.pred_from == "true_state":
 			ro_info = None
 			losses, ts_info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=False)
@@ -795,9 +795,6 @@ class TDMPC2(torch.nn.Module):
 			self.cfg.multi_gamma_loss_weight * aux_value_loss_mean
 		)
 		info = TensorDict({
-			"rollout": ro_info,
-			"true_state": ts_info,
-   
 			"consistency_losses": consistency_losses,
 			"consistency_loss": consistency_loss,
 			"encoder_consistency_loss": encoder_consistency_loss,
@@ -826,6 +823,12 @@ class TDMPC2(torch.nn.Module):
 			"aux_value_mean": math.two_hot_inv(q_aux_logits, self.cfg).mean() if q_aux_logits is not None else torch.tensor(0., device=self.device),
 			"aux_value_std": math.two_hot_inv(q_aux_logits, self.cfg).std() if q_aux_logits is not None else torch.tensor(0., device=self.device)
 		}, device=self.device, non_blocking=True)
+  
+		# if ro_info is not None:
+		# 	info.update(ro_info, non_blocking=True)
+		# if ts_info is not None:
+		# 	info.update(ts_info, non_blocking=True)
+  
 		for i in range(T):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i],
 						"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i],
@@ -901,7 +904,9 @@ class TDMPC2(torch.nn.Module):
 			)
 			aux_ce = aux_ce.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # (G_aux,T)
 			aux_value_losses = (aux_ce * rho_pows.unsqueeze(0)).mean(dim=1) if time_decay else aux_ce.mean(dim=1)* rho_pows.mean()  # (G_aux,)
-
+		else:
+			aux_ce = None
+			G_aux = 0
 		# reward_loss and value_loss were already normalized by T and T*Qe above
 		if self.cfg.episodic:
 			termination_loss = F.binary_cross_entropy_with_logits(termination_pred, terminated)
@@ -915,8 +920,7 @@ class TDMPC2(torch.nn.Module):
    
 		# Debug check: ensure value_loss matches MSE to expected values
 
-		
-		losses = torch.TensorDict({
+		losses = TensorDict({
 			"reward_loss": reward_loss,
 			"value_loss": value_loss,
 			"aux_value_losses": aux_value_losses if aux_value_losses is not None else torch.zeros((G_aux,), device=self.device),
