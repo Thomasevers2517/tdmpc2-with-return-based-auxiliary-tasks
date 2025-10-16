@@ -114,7 +114,8 @@ class TDMPC2(torch.nn.Module):
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
-		self._update_step = 0  # incremented at end of _update
+		self._step = 0  # incremented at end of _update
+		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
@@ -567,7 +568,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			float: Loss of the policy update.
 		"""
-		log_grads = self.cfg.log_gradients_per_loss and (self._update_step % self.cfg.log_gradients_every == 0)
+		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 		pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
 		# if log_grads:
 		# 	# self.probe_pi_gradients(pi_loss, info)
@@ -818,51 +819,60 @@ class TDMPC2(torch.nn.Module):
 			"reward_loss_weighted": reward_loss * self.cfg.reward_coef,
 			"value_loss_weighted": value_loss * self.cfg.value_coef,
 			"termination_loss_weighted": termination_loss * self.cfg.termination_coef,
-			"aux_value_loss_mean_weighted": aux_value_loss_mean * self.cfg.multi_gamma_loss_weight,
-   
+			"aux_value_loss_mean_weighted": aux_value_loss_mean * self.cfg.multi_gamma_loss_weight}, device=self.device, non_blocking=True)
+		if self.log_detailed:
+			info.update({
 			"td_target_mean": td_targets.mean(),
-			"td_target_mstd": td_targets.std(),
+			"td_target_std": td_targets.std(),
+			"td_target_min": td_targets.min(),
+			"td_target_max": td_targets.max(),
 			"value_mean": math.two_hot_inv(qs, self.cfg).mean(),
 			"value_std": math.two_hot_inv(qs, self.cfg).std(),
+			"value_min": math.two_hot_inv(qs, self.cfg).min(),
+			"value_max": math.two_hot_inv(qs, self.cfg).max(),
 			"reward_target_mean": reward.mean(),
 			"reward_target_std": reward.std(),
 			"reward_mean": math.two_hot_inv(reward_preds, self.cfg).mean(),
 			"reward_std": math.two_hot_inv(reward_preds, self.cfg).std(),
-			"aux_td_target_mean": aux_td_targets.mean() if aux_td_targets is not None else torch.tensor(0., device=self.device),
-			"aux_td_target_std": aux_td_targets.std() if aux_td_targets is not None else torch.tensor(0., device=self.device),
-			"aux_value_mean": math.two_hot_inv(q_aux_logits, self.cfg).mean() if q_aux_logits is not None else torch.tensor(0., device=self.device),
-			"aux_value_std": math.two_hot_inv(q_aux_logits, self.cfg).std() if q_aux_logits is not None else torch.tensor(0., device=self.device)
-		}, device=self.device, non_blocking=True)
+			}, non_blocking=True)
   
-		if self.cfg.pred_from == "both":
-			info.update(ro_info, non_blocking=True)
-			info.update(ts_info, non_blocking=True)
-		elif self.cfg.pred_from == "true_state":
-			info.update(ts_info, non_blocking=True)
-		elif self.cfg.pred_from == "rollout":
-			info.update(ro_info, non_blocking=True)	
-  
-		for i in range(T):
-			info.update({f"consistency_loss/step{i}": consistency_losses[i],
-						"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i],
-						"encoder_consistency_loss/step{i}": encoder_consistency_losses[i],
-						"encoder_consistency_loss_weighted/step{i}": self.cfg.encoder_consistency_coef * encoder_consistency_losses[i] * rho_pows[i],
-						"reward_loss/step{i}": rew_ce[i],
-						"value_loss/step{i}": val_ce[i], 
-						"aux_value_loss/step{i}": aux_ce[:,i].mean() if aux_ce is not None else torch.tensor(0., device=self.device)}, non_blocking=True)
-
-		if aux_value_losses is not None:
-			for g, loss_g in enumerate(aux_value_losses):
-				gamma_val = self._all_gammas[g+1]	
-				info.update({f"aux_value_loss/gamma{gamma_val:.4f}": loss_g,
-							f"aux_value_loss_weighted/gamma{gamma_val:.4f}": self.cfg.multi_gamma_loss_weight * loss_g,
-							f"aux_td_target_mean/gamma{gamma_val:.4f}": aux_td_targets[g].mean(),
-							f"aux_td_target_std/gamma{gamma_val:.4f}": aux_td_targets[g].std(),
-							f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).mean(),
-							f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).std()}, non_blocking=True)
+			for g in range(len(self._all_gammas)-1):
+				gamma_val = self._all_gammas[g+1]
+				info.update({f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).mean() if q_aux_logits is not None else torch.tensor(0., device=self.device),
+							f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).std() if q_aux_logits is not None else torch.tensor(0., device=self.device),
+							f"aux_value_min/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).min() if q_aux_logits is not None else torch.tensor(0., device=self.device),		
+							f"aux_value_max/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).max() if q_aux_logits is not None else torch.tensor(0., device=self.device)}, non_blocking=True)	
 		
-		if self.cfg.episodic:
-			info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
+
+			if self.cfg.pred_from == "both":
+				info.update(ro_info, non_blocking=True)
+				info.update(ts_info, non_blocking=True)
+			elif self.cfg.pred_from == "true_state":
+				info.update(ts_info, non_blocking=True)
+			elif self.cfg.pred_from == "rollout":
+				info.update(ro_info, non_blocking=True)	
+	
+			for i in range(T):
+				info.update({f"consistency_loss/step{i}": consistency_losses[i],
+							"consistency_loss_weighted/step{i}": self.cfg.consistency_coef * consistency_losses[i] * rho_pows[i],
+							"encoder_consistency_loss/step{i}": encoder_consistency_losses[i],
+							"encoder_consistency_loss_weighted/step{i}": self.cfg.encoder_consistency_coef * encoder_consistency_losses[i] * rho_pows[i],
+							"reward_loss/step{i}": rew_ce[i],
+							"value_loss/step{i}": val_ce[i], 
+							"aux_value_loss/step{i}": aux_ce[:,i].mean() if aux_ce is not None else torch.tensor(0., device=self.device)}, non_blocking=True)
+
+			if aux_value_losses is not None:
+				for g, loss_g in enumerate(aux_value_losses):
+					gamma_val = self._all_gammas[g+1]	
+					info.update({f"aux_value_loss/gamma{gamma_val:.4f}": loss_g,
+								f"aux_value_loss_weighted/gamma{gamma_val:.4f}": self.cfg.multi_gamma_loss_weight * loss_g,
+								f"aux_td_target_mean/gamma{gamma_val:.4f}": aux_td_targets[g].mean(),
+								f"aux_td_target_std/gamma{gamma_val:.4f}": aux_td_targets[g].std(),
+								f"aux_value_mean/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).mean(),
+								f"aux_value_std/gamma{gamma_val:.4f}": math.two_hot_inv(q_aux_logits[g], self.cfg).std()}, non_blocking=True)
+			
+			if self.cfg.episodic:
+				info.update(math.termination_statistics(torch.sigmoid(termination_pred[-1]), terminated[-1]), non_blocking=True)
    
 		return total_loss, info
  
@@ -1066,7 +1076,7 @@ class TDMPC2(torch.nn.Module):
 			imagine: (bool) whether to include imagination-augmented value loss
 			task: (optional) task index tensor for multi-task mode
 		"""
-		log_grads = self.cfg.log_gradients_per_loss and (self._update_step % self.cfg.log_gradients_every == 0)
+		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
  
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
@@ -1150,10 +1160,9 @@ class TDMPC2(torch.nn.Module):
 
 			info.update(pi_info, non_blocking=True)
 			# step counter for gated logging
-			self._update_step += 1
 			return info.detach().mean()
 
-	def update(self, buffer):
+	def update(self, buffer, step=0):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -1166,7 +1175,12 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('update/sample_buffer', self.cfg):
 			obs, action, reward, terminated, task = buffer.sample()
 
-    
+		self._step = step
+		if self._step % self.cfg.log_detail_freq == 0:
+			self.log_detailed = True
+		else:
+			self.log_detailed = False
+   
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task

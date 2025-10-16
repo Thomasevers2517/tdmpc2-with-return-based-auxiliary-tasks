@@ -135,7 +135,7 @@ class OnlineTrainer(Trainer):
 				else:
 					num_updates = self.cfg.utd_ratio
 				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer)
+					_train_metrics = self.agent.update(self.buffer, step = self._step)
 					train_metrics.update(_train_metrics)
 
 
