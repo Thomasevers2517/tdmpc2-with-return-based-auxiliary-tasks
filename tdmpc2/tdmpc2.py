@@ -169,6 +169,10 @@ class TDMPC2(torch.nn.Module):
 
 			self.optim_step = optim_step
 			self.pi_optim_step = pi_optim_step
+   
+			self.model.pi = torch.compile(self.model.pi, mode=self.cfg.compile_type, fullgraph=True)
+			self.model.encode = torch.compile(self.model.encode, mode=self.cfg.compile_type, fullgraph=True)
+	
 		else:
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
@@ -327,7 +331,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode=False, task=None):
+	def act(self, obs, eval_mode=False, task=None, mpc=True):
 		"""
 		Select an action by planning in latent space (MPPI) or by single policy prior.
 
@@ -344,7 +348,7 @@ class TDMPC2(torch.nn.Module):
 			obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
 			if task is not None:
 				task = torch.tensor([task], device=self.device)
-			if self.cfg.mpc:
+			if mpc:
 				# if not eval_mode:
 				# a = (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
 				score, elite_actions, mean, std = self.plan(obs, task=task)
