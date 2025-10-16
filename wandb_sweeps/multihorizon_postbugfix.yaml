@@ -48,7 +48,7 @@ parameters:
     values: [true, false]
 
   lr:
-    values: [3e-4, 1e-3]
+    values: [3e-4]
   enc_lr_scale:
     values: [0.1]
   horizon:

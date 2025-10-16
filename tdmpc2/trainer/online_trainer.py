@@ -31,27 +31,36 @@ class OnlineTrainer(Trainer):
 	def eval(self):
 		"""Evaluate a TD-MPC2 agent."""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
+		ep_elite_std, ep_elite_mean = [], []
 		for i in range(self.cfg.eval_episodes):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
 			if self.cfg.save_video:
 				self.logger.video.init(self.env, enabled=(i==0))
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
-				action = self.agent.act(obs, eval_mode=True, mpc=self.cfg.eval_mpc).cpu()
+				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
+				action, act_info = self.agent.act(obs, eval_mode=True, mpc=self.cfg.eval_mpc)
+				action = action.cpu()
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
 				t += 1
 				if self.cfg.save_video:
 					self.logger.video.record(self.env)
+     
 			ep_rewards.append(ep_reward)
 			ep_successes.append(info['success'])
 			ep_lengths.append(t)
+			ep_elite_std.append(act_info.get('std', torch.tensor(float('nan'))).mean().cpu())
+			ep_elite_mean.append(act_info.get('mean', torch.tensor(float('nan'))).abs().mean().cpu())
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),
 			episode_success=np.nanmean(ep_successes),
 			episode_length= np.nanmean(ep_lengths),
+			episode_elite_std=np.nanmean(ep_elite_std),
+			episode_elite_mean=np.nanmean(ep_elite_mean),
+
 		)
 
 	def to_td(self, obs, action=None, reward=None, terminated=None):
@@ -110,7 +119,9 @@ class OnlineTrainer(Trainer):
 
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
-				action = self.agent.act(obs, mpc= self.cfg.train_mpc).cpu()
+				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
+				action, info = self.agent.act(obs, mpc= self.cfg.train_mpc)
+				action = action.cpu()
 			else:
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)

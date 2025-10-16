@@ -170,9 +170,7 @@ class TDMPC2(torch.nn.Module):
 			self.optim_step = optim_step
 			self.pi_optim_step = pi_optim_step
    
-			self.model.pi = torch.compile(self.model.pi, mode=self.cfg.compile_type, fullgraph=True)
-			self.model.encode = torch.compile(self.model.encode, mode=self.cfg.compile_type, fullgraph=True)
-	
+			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=True)
 		else:
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
@@ -345,7 +343,7 @@ class TDMPC2(torch.nn.Module):
 			torch.Tensor: Action to take in the environment.
 		"""
 		with maybe_range('Agent/act', self.cfg):
-			obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+			
 			if task is not None:
 				task = torch.tensor([task], device=self.device)
 			if mpc:
@@ -361,16 +359,24 @@ class TDMPC2(torch.nn.Module):
 				actions = torch.index_select(elite_actions, 1, idx).squeeze(1)
 				a, std = actions[0], std[0]
 				
+				plan_info = TensorDict({
+						'score': score,
+						'elite_actions': elite_actions,
+						'mean': mean,
+						'std': std
+					}, device=std.device, non_blocking=True)
+    
 				self.update_planner_mean(mean)
 				if eval_mode:
-					return a # TODO not bad idea to perhaps take mean of elites here instead. (this is argmax, used to be a sample)
+
+					return a, plan_info # TODO not bad idea to perhaps take mean of elites here instead. (this is argmax, used to be a sample)
 				else:
-					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
+					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1), plan_info
 			z = self.model.encode(obs, task)
 			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:
 				action = info["mean"]
-			return action[0]
+			return action[0], TensorDict({}, device=action.device, non_blocking=True)
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
@@ -828,10 +834,13 @@ class TDMPC2(torch.nn.Module):
 			"aux_value_std": math.two_hot_inv(q_aux_logits, self.cfg).std() if q_aux_logits is not None else torch.tensor(0., device=self.device)
 		}, device=self.device, non_blocking=True)
   
-		# if ro_info is not None:
-		# 	info.update(ro_info, non_blocking=True)
-		# if ts_info is not None:
-		# 	info.update(ts_info, non_blocking=True)
+		if self.cfg.pred_from == "both":
+			info.update(ro_info, non_blocking=True)
+			info.update(ts_info, non_blocking=True)
+		elif self.cfg.pred_from == "true_state":
+			info.update(ts_info, non_blocking=True)
+		elif self.cfg.pred_from == "rollout":
+			info.update(ro_info, non_blocking=True)	
   
 		for i in range(T):
 			info.update({f"consistency_loss/step{i}": consistency_losses[i],
@@ -937,22 +946,15 @@ class TDMPC2(torch.nn.Module):
   
 		value_error = (math.two_hot_inv(qs.reshape(Qe, T, B, K), self.cfg) - td_targets.unsqueeze(0).expand(Qe,-1, -1, -1).reshape(Qe, T, B, 1))
 		reward_error = (math.two_hot_inv(reward_preds.reshape(T, B, K), self.cfg) - reward.reshape(T, B, 1))
+		info = TensorDict({}, device=self.device)
 		for i in range(T):
-			info = TensorDict({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
-						f"value_error_mean/step{i}": value_error[:,i].mean(),
+			info.update({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
 						f"value_error_std/step{i}": value_error[:,i].std(),
 						f"value_error_max/step{i}": value_error[:,i].abs().max(),
-						f"vallue_error_min/step{i}": value_error[:,i].abs().min(),
 						f"reward_error_abs_mean/step{i}": reward_error[i].abs().mean(),
-						f"reward_error_mean/step{i}": reward_error[i].mean(),
 						f"reward_error_std/step{i}": reward_error[i].std(),
-						f"reward_error_max/step{i}": reward_error[i].abs().max(),
-						f"reward_error_min/step{i}": reward_error[i].abs().min()}, non_blocking=True)
-
-
-	
-  
-		return losses, info
+						f"reward_error_max/step{i}": reward_error[i].abs().max()}, non_blocking=True)
+		return losses, info.detach()
  
 	def calc_imagine_value_loss(self, z, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
