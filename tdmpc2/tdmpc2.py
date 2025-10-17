@@ -343,6 +343,7 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: Action to take in the environment.
 		"""
+		self.model.eval()
 		with maybe_range('Agent/act', self.cfg):
 			
 			if task is not None:
@@ -1243,3 +1244,35 @@ class TDMPC2(torch.nn.Module):
 			for gname, ss in per_group_ss.items():
 				info.update({f'grad_norm/{lname}/{gname}': (ss ** 0.5)}, non_blocking=True)
 		return info
+
+	def validate(self, buffer, num_batches=1):
+		"""
+		Perform validation on a separate dataset.
+
+		Args:
+			buffer (common.buffer.Buffer): Replay buffer.
+			num_batches (int): Number of batches to use for validation.
+
+		Returns:
+			dict: Dictionary of validation statistics.
+		"""
+		self.model.eval()
+
+		with torch.no_grad():
+			infos = []
+			for _ in range(num_batches):
+				obs, action, reward, terminated, task = buffer.sample()
+				with maybe_range('Agent/validate', self.cfg):
+					# Just return the value loss component for validation
+					self.log_detailed = True
+					with torch.no_grad():
+						val_info = self.calc_wm_losses(obs, action, reward, terminated, task=task)[2]
+					self.log_detailed = False
+				infos.append(val_info)
+    
+			avg_info = TensorDict({}, device=self.device)
+			for key in infos[0].keys():
+				avg_info[key] = torch.stack([info[key] for info in infos], dim=0).mean(dim=0)
+
+     
+		return avg_info.detach()

@@ -26,6 +26,8 @@ CAT_TO_COLOR = {
 	"pretrain": "yellow",
 	"train": "blue",
 	"eval": "green",
+	"validation_all": "magenta",
+	"validation_recent": "cyan",
 }
 
 
@@ -225,12 +227,14 @@ class Logger:
 			_log.info("%s", colored(f'  {"metaworld":<22}\tS: {metaworld_success:.02f}', 'yellow', attrs=['bold']))
 
 	def log(self, d, category="train"):
-		assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
+		# assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
 		if self._wandb:
 			if category in {"train", "eval"}:
 				xkey = "step"
 			elif category == "pretrain":
 				xkey = "iteration"
+			else:
+				xkey = "step"
 			_d = dict()
 			for k, v in d.items():
 				_d[category + "/" + k] = v

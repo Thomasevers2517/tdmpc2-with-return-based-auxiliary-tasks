@@ -5,7 +5,7 @@ import torch
 from tensordict.tensordict import TensorDict
 from trainer.base import Trainer
 from common.logging_utils import get_logger
-
+from common.buffer import Buffer
 log = get_logger(__name__)
 
 
@@ -17,6 +17,9 @@ class OnlineTrainer(Trainer):
 		self._step = 0
 		self._ep_idx = 0
 		self._start_time = time()
+
+		self.validation_buffer = Buffer(cfg=self.cfg)
+		self.recent_validation_buffer = Buffer(cfg=self.cfg)
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -32,8 +35,11 @@ class OnlineTrainer(Trainer):
 		"""Evaluate a TD-MPC2 agent."""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
+		# self.validation_buffer.empty()
+  
 		for i in range(self.cfg.eval_episodes):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
+			self.val_tds = [self.to_td(obs)]
 			if self.cfg.save_video:
 				self.logger.video.init(self.env, enabled=(i==0))
 			while not done:
@@ -46,6 +52,8 @@ class OnlineTrainer(Trainer):
 				t += 1
 				if self.cfg.save_video:
 					self.logger.video.record(self.env)
+				val_td = self.to_td(obs, action, reward, info['terminated'])
+				self.val_tds.append(val_td)
      
 			ep_rewards.append(ep_reward)
 			ep_successes.append(info['success'])
@@ -54,6 +62,16 @@ class OnlineTrainer(Trainer):
 			ep_elite_mean.append(act_info.get('mean', torch.tensor(float('nan'))).abs().mean().cpu())
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
+
+			self.validation_buffer.add(torch.cat(self.val_tds))
+			self.recent_validation_buffer.add(torch.cat(self.val_tds))
+   
+		val_info_rand, val_info_recent = self.validate()
+		val_info_rand.update(self.common_metrics())
+		val_info_recent.update(self.common_metrics())
+		self.logger.log(val_info_rand, 'validation_all')
+		self.logger.log(val_info_recent, 'validation_recent') #TODO need to rename these such that we can log them separately in wandb
+  
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),
 			episode_success=np.nanmean(ep_successes),
@@ -89,7 +107,7 @@ class OnlineTrainer(Trainer):
 		train_metrics, done, eval_next = {}, True, False
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
-			if self._step % self.cfg.eval_freq == 0:
+			if self._step % (self.cfg.eval_freq/self.cfg.utd_ratio) == 0:
 				eval_next = True
 
 			# Reset environment
@@ -148,3 +166,9 @@ class OnlineTrainer(Trainer):
 
 		self.logger.finish(self.agent)
 
+	def validate(self):
+		import math
+		random_val_info= self.agent.validate(self.validation_buffer, num_batches=1)
+		val_info_recent = self.agent.validate(self.recent_validation_buffer, num_batches=math.floor(self.cfg.eval_episodes*self.cfg.episode_length / self.cfg.batch_size))
+		self.recent_validation_buffer.empty()
+		return random_val_info, val_info_recent

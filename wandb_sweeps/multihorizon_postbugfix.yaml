@@ -46,7 +46,8 @@ parameters:
     values: [true]
   train_mpc:
     values: [true]
-
+  utd_ratio:
+    values: [1, 32]
   lr:
     values: [3e-4]
   enc_lr_scale:
@@ -100,7 +101,9 @@ parameters:
   steps:
     value: 100000
   eval_freq:
-    value: 25000
+    value: 10000
+  eval_episodes: 
+    value: 5
   batch_size:
     value: 256
   model_size:
@@ -119,3 +122,4 @@ parameters:
     value: thomasevers9
   save_video:
     value: false
+

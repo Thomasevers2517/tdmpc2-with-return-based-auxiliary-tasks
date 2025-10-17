@@ -150,3 +150,10 @@ class Buffer():
 			task = None
 		return obs, action, reward, terminated, task
 
+	def empty(self):
+		"""Empty the buffer."""
+		self._num_eps = 0
+		self._primed = False
+		self._prefetched_td_gpu = None
+		self._buffer.empty()
+		return
