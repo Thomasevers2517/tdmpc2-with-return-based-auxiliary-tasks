@@ -20,10 +20,10 @@ utd_ratio: 1
 ac_utd_multiplier: 1
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
 
-imagination_enabled: false
 imagination_horizon: 3
-imagine_num_starts: 3
-imagine_value_loss_coef: 0.05
+imagine_num_starts: -1
+imagine_value_loss_coef: 0 # 0 to disable, 0.1 - 0.01 seems reasonable
+num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 detach_imagine_value: true  # if true, detach the latents used for imagine value loss calculation. This is to prevent gradients from the imagine value loss to flow into the encoder and dynamics model. This is to isolate the effect of the imagine value loss on the value function only.
 #Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
 pred_from: rollout # rollout, true_state, both 

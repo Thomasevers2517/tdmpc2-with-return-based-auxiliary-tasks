@@ -582,6 +582,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_scale": self.scale.value,
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
+			"pi_abs_mean": info["mean"].abs().mean()
 		}, device=self.device)
 		return pi_loss, info
 
@@ -969,36 +970,41 @@ class TDMPC2(torch.nn.Module):
  
 	def calc_imagine_value_loss(self, z, task=None):
 		with maybe_range('Agent/calc_imagine_value_loss', self.cfg):
-			im_horizon = self.cfg.imagination_horizon
+			total_states = z.shape[0]
+			im_horizon = self.cfg.imagination_horizon if self.cfg.imagination_horizon != -1 else self.cfg.horizon
 			num_start_states = self.cfg.imagine_num_starts
+			n_rollouts = self.cfg.num_rollouts
+			if num_start_states ==-1:	
+				num_start_states = total_states
 			batch_size = z.shape[1]
 			imagine_value_loss = torch.tensor(0., device=self.device)
 			imagine_info = TensorDict({}, device=self.device)
 			# 
-			total_states = z.shape[0]
+
 			if num_start_states > total_states:
 				raise ValueError(f"Requested {num_start_states} start states but only {total_states} are available.")
 			random_scores = torch.rand(total_states, batch_size, device=z.device)
 			start_states_idx = torch.argsort(random_scores, dim=0)[:num_start_states]
 			index = start_states_idx.unsqueeze(-1).expand(-1, -1, z.size(-1))
 			start_z = torch.gather(z, 0, index)
+			start_z = start_z.reshape(-1, z.size(-1)) # (num_start_states*B,L)
+			start_z = start_z.unsqueeze(0).expand(n_rollouts, -1, -1).reshape(-1, z.size(-1))  # (num_start_states*B*n_rollouts,L)
    
-			start_z = start_z.reshape(-1, z.size(-1))
-			reward = torch.zeros((im_horizon, num_start_states*batch_size, 1), device=self.device, dtype=z.dtype)
-			actions = torch.zeros((im_horizon+1, num_start_states*batch_size, self.cfg.action_dim), device=self.device, dtype=z.dtype)
-			rolled_out_z = torch.zeros((im_horizon+1, num_start_states*batch_size, z.size(-1)), device=self.device, dtype=z.dtype)
+			reward = torch.zeros((im_horizon, n_rollouts*num_start_states*batch_size, 1), device=self.device, dtype=z.dtype)
+			actions = torch.zeros((im_horizon+1, n_rollouts*num_start_states*batch_size, self.cfg.action_dim), device=self.device, dtype=z.dtype)
+			rolled_out_z = torch.zeros((im_horizon+1, n_rollouts*num_start_states*batch_size, z.size(-1)), device=self.device, dtype=z.dtype)
 			z_step = start_z
 			for t in range(im_horizon):
 				# Predict action from current state
 				with torch.no_grad():
-					action, pi_info = self.model.pi(z_step.detach(), task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B,A)
+					action, pi_info = self.model.pi(z_step.detach(), task, use_ema=self.cfg.policy_ema_enabled) # (num_start_states*B*n_rollouts,A)
 					actions[t, :, :] = action
 					rolled_out_z[t, :, :] = z_step
 					# Compute Q-values for state and action
-					reward_pred = math.two_hot_inv(self.model.reward(z_step, action, task), self.cfg)  # (num_start_states*B,1)
+					reward_pred = math.two_hot_inv(self.model.reward(z_step, action, task), self.cfg)  #  (num_start_states*B*n_rollouts,1)
 					reward[t, :, :] = reward_pred
 					# Step dynamics forward
-					z_step = self.model.next(z_step, action, task)  # (num_start_states*B,L)
+					z_step = self.model.next(z_step, action, task)  #  (num_start_states*B*n_rollouts,L)
 			with torch.no_grad():
 				actions[-1, :, :] = self.model.pi(z_step.detach(), task, use_ema=self.cfg.policy_ema_enabled)[0]
 				rolled_out_z[-1, :, :] = z_step
@@ -1008,17 +1014,17 @@ class TDMPC2(torch.nn.Module):
 					task_b = task[0] if isinstance(task, torch.Tensor) and task.ndim == 2 else task
 					gamma_b = self.discount[task_b.long()]  # (B,)
 					# Each batch sample appears num_start_states times in Ns*B
-					discount_samples = gamma_b.repeat_interleave(num_start_states)  # (Ns*B,)
+					discount_samples = gamma_b.repeat_interleave(num_start_states)  # 
 				else:
 					discount_samples = self.discount  # scalar tensor
-				td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=discount_samples)  # (num_start_states*B,1)
+				td_target = self.multi_step_td_target(actions, rolled_out_z, reward, task, discount=discount_samples) 
 			# Compute Q-values for all state-action pairs
 			Qs = self.model.Q(rolled_out_z[0], actions[0], task, return_type='all')  # (Qe,num_start_states*B,K)
 			Qe = Qs.shape[0]
 			val_ce = math.soft_ce(
-				Qs.reshape(Qe * num_start_states * batch_size, self.cfg.num_bins),
+				Qs.reshape(Qe * n_rollouts * num_start_states * batch_size, self.cfg.num_bins),
 				# expand td_targets to (Qe,num_start_states*B,1) then flatten; detach to block grads to targets
-				td_target.detach().unsqueeze(0).expand(Qe, -1, -1).reshape(Qe * num_start_states * batch_size, 1),
+				td_target.detach().unsqueeze(0).expand(Qe, -1, -1).reshape(Qe * n_rollouts * num_start_states * batch_size, 1),
 				self.cfg,
 			)
 			imagine_value_loss = val_ce.mean(dim=0).squeeze(-1)  # scalar
@@ -1083,7 +1089,7 @@ class TDMPC2(torch.nn.Module):
 			# ------------------------------ Targets (no grad) ------------------------------
 			wm_loss, zs, info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
 			# Imagination-augmented value loss (optional)
-			if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+			if self.cfg.imagine_value_loss_coef != 0:
 				z_im = z_true
 				z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
 				imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_im, task=task) if (not log_grads or not self.cfg.compile) else self.calc_imagine_value_loss_eager(z_im, task=task)
@@ -1110,7 +1116,7 @@ class TDMPC2(torch.nn.Module):
 
 
 			# ------------------------------ Backprop & updates ------------------------------
-			if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+			if self.cfg.imagine_value_loss_coef != 0:
 				total_loss = wm_loss+ imagine_value_loss * self.cfg.imagine_value_loss_coef
 			else:
 				total_loss = wm_loss
@@ -1204,7 +1210,7 @@ class TDMPC2(torch.nn.Module):
 			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']
 		if 'aux_value_loss_mean' in info and self.cfg.multi_gamma_loss_weight != 0:
 			loss_parts['aux_value_mean'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_mean']
-		if self.cfg.imagination_enabled and self.cfg.imagine_value_loss_coef > 0:
+		if self.cfg.imagine_value_loss_coef != 0:
 			loss_parts['imagine_value'] = self.cfg.imagine_value_loss_coef * imagine_info['imagine_value_loss']
 
 
@@ -1266,7 +1272,17 @@ class TDMPC2(torch.nn.Module):
 					# Just return the value loss component for validation
 					self.log_detailed = True
 					with torch.no_grad():
-						val_info = self.calc_wm_losses(obs, action, reward, terminated, task=task)[2]
+						wm_loss, zs, val_info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task)
+						if self.cfg.pred_from == "rollout":
+							z_for_pi = zs.detach()
+							# Policy update (detached rollout latents)
+						elif self.cfg.pred_from == "true_state":
+							z_for_pi = z_true.detach()
+							# Policy update (detached latent sequence)
+						elif self.cfg.pred_from == "both":
+							z_for_pi = z_both.detach()
+						pi_loss, pi_info = self.update_pi(z_for_pi, task)
+						val_info.update(pi_info, non_blocking=True)
 					self.log_detailed = False
 				infos.append(val_info)
     

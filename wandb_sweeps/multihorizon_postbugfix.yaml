@@ -32,30 +32,34 @@ parameters:
       # - quadruped-walk
       # - humanoid-run
 
-  # imagination_enabled: 
-  #   values: [false]
-  # imagination_horizon: 
-  #   values: [3]
-  # imagine_num_starts: 
-  #   values: [3]
-  # imagine_value_loss_coef: 
-  #   values: [0.1]
-  # detach_imagine_value:
-  #   values: [true]
+  value_coef: 
+    values: [0]
+
+  imagination_horizon: 
+    values: [1, 3]
+  imagine_num_starts: 
+    values: [-1]
+  imagine_value_loss_coef: 
+    values: [0.1, 0.4] #[0.1, 0.01, 0] # 0 to disable
+  num_rollouts:
+    values: [1, 4, 12]
+  detach_imagine_value:
+    values: [false]
+
   eval_mpc:
     values: [true]
   train_mpc:
     values: [true]
   utd_ratio:
-    values: [1, 32]
+    values: [1]
   lr:
     values: [3e-4]
   enc_lr_scale:
     values: [0.1]
   horizon:
-    values: [3, 6, 12]
+    values: [3]
   rho:
-    values: [0.5, 0.8]
+    values: [0.5]
   pred_from:
     values: ["rollout"] # rollout, true_state or both
   split_batch: 
@@ -99,7 +103,7 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 100000
+    value: 60000
   eval_freq:
     value: 10000
   eval_episodes: 
