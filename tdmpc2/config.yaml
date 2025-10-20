@@ -12,11 +12,26 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 50000
 best_eval: false
+
+
+
 # training
 utd_ratio: 1
 ac_utd_multiplier: 1
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
-best_eval: false
+
+imagination_horizon: 3
+imagine_num_starts: -1
+imagine_value_loss_coef: 0 # 0 to disable, 0.1 - 0.01 seems reasonable
+num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
+detach_imagine_value: true  # if true, detach the latents used for imagine value loss calculation. This is to prevent gradients from the imagine value loss to flow into the encoder and dynamics model. This is to isolate the effect of the imagine value loss on the value function only.
+#Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
+pred_from: rollout # rollout, true_state, both 
+
+#if both is selected
+split_batch: true # If Both, do we split the batch in two, one half for rollout, one half for true state
+rollout_fraction: 0.5 # If Both, what how much is the rollout weighted
+
 
 steps: 4_000_000
 batch_size: 256
@@ -24,15 +39,19 @@ reward_coef: 0.1
 value_coef: 0.1
 termination_coef: 1
 consistency_coef: 20
+policy_coef: 1
+
+encoder_consistency_coef: 0  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+
 rho: 0.5
 lr: 3e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
 policy_ema_enabled: false
-policy_ema_tau: 0.005
-encoder_ema_enabled: false
-encoder_ema_tau: 0.01
+policy_ema_tau: 0.05
+encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
+encoder_ema_tau: 0.05
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
@@ -61,7 +80,8 @@ reset:
         noise_std: null              # optional override when type == shrink_perturb
 
 # planning
-mpc: true
+eval_mpc: true
+train_mpc: true
 iterations: 6
 num_samples: 512
 num_elites: 64
@@ -99,6 +119,8 @@ wandb_entity: thomasevers9
 wandb_silent: false
 enable_wandb: true
 save_csv: true
+log_gradients_per_loss: true
+log_detail_freq: 1000
 
 # misc
 compile: false
@@ -129,7 +151,7 @@ multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics 
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true
 
-use_bfloat16: false            # If true: use bfloat16 precision with autocast where applicable (saves memory, may be faster).
+dtype : float32
 
 distracted_dynamic: true    # 'dynamic' (changing distractors) or 'static' (fixed distractors)
 distracted_difficulty: medium   # 'easy', 'medium', 'hard'

@@ -4,7 +4,15 @@ from tensordict import TensorDict
 
 
 def soft_ce(pred, target, cfg):
-	"""Computes the cross entropy loss between predictions and soft targets."""
+	"""Computes the cross entropy loss between predictions and soft targets. 
+	Args:	
+		pred: (batch_size, num_bins) - Logits
+		target: (batch_size, 1) - Soft targets
+		cfg: Config object with num_bins attribute
+	Returns:
+		loss: (batch_size, 1) - Cross entropy loss
+	"""
+ 
 	pred = F.log_softmax(pred, dim=-1)
 	target = two_hot(target, cfg)
 	return -(target * pred).sum(-1, keepdim=True)
