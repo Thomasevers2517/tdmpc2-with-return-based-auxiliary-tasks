@@ -639,7 +639,7 @@ class TDMPC2(torch.nn.Module):
 		return torch.stack(aux_targets, dim=0).detach() # (G_aux,T,B,1)
 
 
-	def calc_wm_losses(self, obs, action, reward, terminated ,task=None):		
+	def calc_wm_losses(self, obs, action, reward, terminated, ac_only,task=None):		
 		z_true  = self.model.encode(obs, task)  # initial latent (T+1,B,L)
 
 		# TODO   fetching longer trajectories from buffer and using data overlap for increased efficiency
@@ -732,12 +732,13 @@ class TDMPC2(torch.nn.Module):
 		else:
 			raise ValueError(f'Invalid pred_from value: {self.cfg.pred_from}')
 
+
 		with maybe_range('Agent/order_losses', self.cfg):
-			total_loss, info = self.order_wm_losses(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses)
+			total_loss, info = self.order_wm_losses(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses, ac_only=ac_only)
 
 		return total_loss, z_rollout, info, z_true, z_both.view(T, 2, B, L) if self.cfg.pred_from == "both" else None 
 	
-	def order_wm_losses(self, qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses):
+	def order_wm_losses(self, qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, consistency_losses, encoder_consistency_losses, ac_only):
 		T = reward_preds.shape[0]
 		B = reward_preds.shape[-2]
 		K = reward_preds.shape[-1]
@@ -745,7 +746,10 @@ class TDMPC2(torch.nn.Module):
 		rho_pows = torch.pow(self.cfg.rho,
 			torch.arange(T, device=self.device, dtype=consistency_losses.dtype)
 		)
-		
+		if ac_only:
+			consistency_losses = torch.zeros_like(consistency_losses, device=self.device)
+			encoder_consistency_losses = torch.zeros_like(encoder_consistency_losses, device=self.device)
+   
 		# Consistency loss (MSE) over latent prediction errors, weighted by rho^t
 		consistency_loss = (rho_pows * consistency_losses).mean()
 		encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
@@ -797,6 +801,10 @@ class TDMPC2(torch.nn.Module):
 			losses, ro_info = self.calc_wm_loss_from_preds(qs, reward_preds, reward, td_targets, aux_td_targets, q_aux_logits, terminated, termination_pred, time_decay=True)
 			reward_loss, value_loss, aux_value_losses, aux_value_loss_mean, termination_loss, rew_ce, val_ce, aux_ce = losses["reward_loss"], losses["value_loss"], losses["aux_value_losses"], losses["aux_value_loss_mean"], losses["termination_loss"], losses["rew_ce"], losses["val_ce"], losses["aux_ce"]
   		# ------------------------------ Vectorized loss computation ------------------------------
+		if ac_only:
+			reward_loss = torch.tensor(0., device=self.device)
+			termination_loss = torch.tensor(0., device=self.device)
+			rew_ce = torch.zeros(T, device=self.device)
 
 		# Total loss (auxiliary added with its own weight separate from value_coef)
 		total_loss = (
@@ -1072,7 +1080,7 @@ class TDMPC2(torch.nn.Module):
 		td_targets = td_targets + boot_factor * Qs  # (NsB,1)
 		return td_targets
 
-	def _update(self, obs, action, reward, terminated, task=None):
+	def _update(self, obs, action, reward, terminated, ac_only, task=None):
 		"""Single gradient update step.
 
 		Args:
@@ -1087,8 +1095,10 @@ class TDMPC2(torch.nn.Module):
  
 		with maybe_range('Agent/update', self.cfg):
 			# ------------------------------ Targets (no grad) ------------------------------
-			wm_loss, zs, info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task) if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager(obs, action, reward, terminated, task=task)
-			# Imagination-augmented value loss (optional)
+
+			func = self.calc_wm_losses if (not log_grads or not self.cfg.compile) else self.calc_wm_losses_eager
+			wm_loss, zs, info, z_true, z_both = func(obs, action, reward, terminated, ac_only, task=task)
+		
 			if self.cfg.imagine_value_loss_coef != 0:
 				z_im = z_true
 				z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
@@ -1169,7 +1179,7 @@ class TDMPC2(torch.nn.Module):
 			# step counter for gated logging
 			return info.detach().mean()
 
-	def update(self, buffer, step=0):
+	def update(self, buffer, step=0, ac_only=False):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -1192,7 +1202,7 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, **kwargs)
+		return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
 
 
 	@torch._dynamo.disable()

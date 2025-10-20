@@ -120,4 +120,6 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		assert len(gammas) <= 6, f'multi_gamma supports at most 6 auxiliary gammas (got {len(gammas)}).'
 		assert cfg.multi_gamma_head in {'joint', 'separate'}, f"Invalid multi_gamma_head {cfg.multi_gamma_head}."
 
+	assert not (cfg.value_coef > 0 and cfg.imagine_value_loss_coef > 0)
+ 
 	return cfg_to_dataclass(cfg)

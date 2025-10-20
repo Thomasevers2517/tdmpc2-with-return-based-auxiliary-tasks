@@ -153,8 +153,11 @@ class OnlineTrainer(Trainer):
 				else:
 					num_updates = self.cfg.utd_ratio
 				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer, step = self._step)
+					_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=False)
 					train_metrics.update(_train_metrics)
+					for _ in range(self.cfg.ac_utd_multiplier):
+						_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=True)
+						train_metrics.update(_train_metrics)
 
 
 			if (self._step * (self.cfg.utd_ratio)) % self.cfg.reset_agent_freq == 0 and self._step > 0:
