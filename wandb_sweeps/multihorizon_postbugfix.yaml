@@ -40,9 +40,9 @@ parameters:
   imagine_num_starts: 
     values: [-1]
   imagine_value_loss_coef: 
-    values: [0.1, 0.4] #[0.1, 0.01, 0] # 0 to disable
+    values: [0.1] #[0.1, 0.01, 0] # 0 to disable
   num_rollouts:
-    values: [1, 4, 12]
+    values: [4, 12]
   detach_imagine_value:
     values: [false]
 
@@ -52,6 +52,8 @@ parameters:
     values: [true]
   utd_ratio:
     values: [1]
+  ac_utd_multiplier:
+    values: [1, 4]
   lr:
     values: [3e-4]
   enc_lr_scale:

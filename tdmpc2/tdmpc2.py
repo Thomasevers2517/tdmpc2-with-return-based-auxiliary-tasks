@@ -1282,7 +1282,7 @@ class TDMPC2(torch.nn.Module):
 					# Just return the value loss component for validation
 					self.log_detailed = True
 					with torch.no_grad():
-						wm_loss, zs, val_info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, task=task)
+						wm_loss, zs, val_info, z_true, z_both = self.calc_wm_losses(obs, action, reward, terminated, ac_only=False, task=task)
 						if self.cfg.pred_from == "rollout":
 							z_for_pi = zs.detach()
 							# Policy update (detached rollout latents)
