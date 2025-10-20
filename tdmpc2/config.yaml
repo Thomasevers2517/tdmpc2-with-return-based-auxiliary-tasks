@@ -115,7 +115,7 @@ task_dim: 96
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8
-
+reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value
 # logging
 wandb_project: test_auxiliary
 wandb_entity: thomasevers9
