@@ -1101,7 +1101,7 @@ class TDMPC2(torch.nn.Module):
 		
 			if self.cfg.imagine_value_loss_coef != 0:
 				z_im = z_true
-				z_im = z_im.detach() if self.cfg.detach_imagine_value else z_im
+				z_im = z_im.detach() if (self.cfg.detach_imagine_value or ac_only) else z_im
 				imagine_value_loss, imagine_info = self.calc_imagine_value_loss(z_im, task=task) if (not log_grads or not self.cfg.compile) else self.calc_imagine_value_loss_eager(z_im, task=task)
 			else:
 				imagine_value_loss = torch.tensor(0., device=self.device)
