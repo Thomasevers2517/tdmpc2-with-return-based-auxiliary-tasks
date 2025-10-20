@@ -376,9 +376,11 @@ class WorldModel(nn.Module):
 			size = eps.shape[-1] if action_dims is None else action_dims
 			scaled_log_prob = log_prob * size
 			action = mean + eps * log_std.exp()
+			presquash_mean = mean
 			mean, action, log_prob = math.squash(mean, action, log_prob)
 			entropy_scale = scaled_log_prob / (log_prob + 1e-8)
 			info = TensorDict({
+				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,

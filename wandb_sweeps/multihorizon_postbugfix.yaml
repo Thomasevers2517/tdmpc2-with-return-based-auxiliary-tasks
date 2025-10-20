@@ -28,9 +28,13 @@ parameters:
   task:
     values:
       - acrobot-swingup
-      # - reacher-hard
-      # - quadruped-walk
+      - reacher-hard
+      - quadruped-walk
       # - humanoid-run
+  entropy_coef:
+    values: [1e-3, 1e-4] #originally 1e-4
+  hinge_coef:
+    values: [0.01]
 
   value_coef: 
     values: [0]
@@ -50,10 +54,12 @@ parameters:
     values: [true]
   train_mpc:
     values: [true]
+
   utd_ratio:
     values: [1]
   ac_utd_multiplier:
-    values: [1, 4]
+    values: [1]
+
   lr:
     values: [3e-4]
   enc_lr_scale:

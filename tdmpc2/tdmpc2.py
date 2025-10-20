@@ -528,6 +528,37 @@ class TDMPC2(torch.nn.Module):
 			return torch.tensor(0.0, device=device or torch.device('cuda:0'))
 		return torch.sqrt(accum)
 
+	def calc_hinge_loss(self, presquash_mean: torch.Tensor, rho_pows: torch.Tensor) -> torch.Tensor:
+		"""Hinge^p penalty on pre-squash mean μ, aggregated with same time-weighting as policy loss.
+
+		Args:
+			presquash_mean: Tensor of shape (T,B,A) or (T,2*B,A) when pred_from=="both".
+			rho_pows: Tensor of shape (T,) containing rho^t weights.
+
+		Config (must exist):
+			- pi_hinge_power (int)
+			- pi_hinge_tau (float)
+			- pi_hinge_lambda (float) [not used here, applied at caller]
+		"""
+		p = int(self.cfg.hinge_power)
+		tau = float(self.cfg.hinge_tau)
+		if self.cfg.pred_from == "both":
+			T = presquash_mean.shape[0]
+			B2 = presquash_mean.shape[1]
+			assert B2 % 2 == 0, "Expected second dim to be 2*B for pred_from=='both'"
+			B = B2 // 2
+			mu_both = presquash_mean.view(T, 2, B, -1)
+			hinge_tb = F.relu(mu_both.abs() - tau).pow(p).mean(dim=(2, 3))  # (T,2)
+			hinge_true = hinge_tb[:, 0].mean() * rho_pows.mean()
+			hinge_roll = (hinge_tb[:, 1] * rho_pows).mean()
+			return (1 - self.cfg.rollout_fraction) * hinge_true + self.cfg.rollout_fraction * hinge_roll
+		elif self.cfg.pred_from == "rollout":
+			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))  # (T,)
+			return (hinge_t * rho_pows).mean()
+		else:  # true_state
+			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))
+			return hinge_t.mean() * rho_pows.mean()
+
 	def calc_pi_losses(self, z, task):
 		#Z is shape (T,B,L) or (T,2,B,L)
 		if self.cfg.pred_from == "both":
@@ -556,6 +587,11 @@ class TDMPC2(torch.nn.Module):
 				rollout_loss = (-(self.cfg.entropy_coef * scaled_entropy[:,1] + qs[:, 1, ...]).mean(dim=(1,2)) * rho_pows).mean()
 				pi_loss = (1-self.cfg.rollout_fraction)* true_state_loss + self.cfg.rollout_fraction*rollout_loss
 
+			# Add hinge^p penalty on pre-squash mean μ
+			lam = float(self.cfg.hinge_coef)
+			hinge_loss = self.calc_hinge_loss(info["presquash_mean"], rho_pows)
+			pi_loss = pi_loss + lam * hinge_loss
+
 			return pi_loss, info
 
 	def update_pi(self, zs, task):
@@ -582,7 +618,10 @@ class TDMPC2(torch.nn.Module):
 			"pi_scale": self.scale.value,
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
-			"pi_abs_mean": info["mean"].abs().mean()
+			"pi_abs_mean": info["mean"].abs().mean(),
+			"pi_presquash_mean": info["presquash_mean"].mean(),
+			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
+			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
 		}, device=self.device)
 		return pi_loss, info
 
