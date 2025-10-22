@@ -4,7 +4,7 @@ defaults:
 
 # environment
 task: reacher-easy
-obs: rgb
+obs: state
 episodic: false
 
 # evaluation
@@ -20,18 +20,14 @@ utd_ratio: 1
 ac_utd_multiplier: 1
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
 
-imagination_horizon: 3
-imagine_num_starts: -1
-imagine_value_loss_coef: 0 # 0 to disable, 0.1 - 0.01 seems reasonable
-num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
-detach_imagine_value: true  # if true, detach the latents used for imagine value loss calculation. This is to prevent gradients from the imagine value loss to flow into the encoder and dynamics model. This is to isolate the effect of the imagine value loss on the value function only.
-#Origianl TD-MPC did not use the true state for predictions, they used the rollouts. 
-pred_from: rollout # rollout, true_state, both 
-
-#if both is selected
-split_batch: true # If Both, do we split the batch in two, one half for rollout, one half for true state
-rollout_fraction: 0.5 # If Both, what how much is the rollout weighted
-
+num_rollouts: 1 # number of parallel rollouts to do in imagination for each starting state
+pred_from: rollout # rollout, true_state, both (controls reward/termination prediction source)
+split_batch: true # If pred_from == both, split batch evenly between true and rollout predictions
+ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
+aux_value_source: replay_rollout # replay_true | replay_rollout | imagine
+imagination_horizon: 1 
+detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
+actor_source: ac # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
 steps: 4_000_000
 batch_size: 256
@@ -42,6 +38,8 @@ consistency_coef: 20
 policy_coef: 1
 
 encoder_consistency_coef: 0  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+
+imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts, only used if ac_source or aux_value_source is imagine
 
 rho: 0.5
 lr: 3e-4

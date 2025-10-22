@@ -27,33 +27,42 @@ metric:
 parameters:
   task:
     values:
-      # - acrobot-swingup
+      - acrobot-swingup
       # - reacher-hard
       - quadruped-walk
       # - humanoid-run
 
+  detach_imagine_value:
+    values: [false, true]
+  imagination_horizon:
+    values: [1, 3]
+  pred_from: 
+    values: ["rollout"] # rollout, true_state or both
+  split_batch: 
+    values: [true] 
+  ac_source:
+    values: ["imagine"] # replay_rollout | imagine (controls critic/actor source)
+  actor_source:
+    values: ["replay_rollout", "replay_true"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+  aux_value_source:
+    values: ["replay_true"] # replay_true | replay_rollout | imagine
+
+  log_std_max:
+    values: [2]
   reward_dim_div:
-    values: [128]
-  num_enc_layers:
-    values: [2, 4] # originally 2
+    values: [1]
+  # num_enc_layers:
+  #   values: [2] # originally 2
   entropy_coef:
-    values: [1e-4, 1e-5, 1e-6] #originally 1e-4
+    values: [1e-4] #originally 1e-4
   hinge_coef:
     values: [0.01]
 
-  value_coef: 
-    values: [0]
-
-  imagination_horizon: 
-    values: [1]
-  imagine_num_starts: 
-    values: [-1]
-  imagine_value_loss_coef: 
-    values: [0.1] #[0.1, 0.01, 0] # 0 to disable
+  imagine_value_loss_coef_mult:
+    values: [1] #[0.1, 0.01, 0] # 0 to disable
   num_rollouts:
-    values: [4, 12]
-  detach_imagine_value:
-    values: [false]
+    values: [4]
+
 
   eval_mpc:
     values: [true]
@@ -63,7 +72,7 @@ parameters:
   utd_ratio:
     values: [1]
   ac_utd_multiplier:
-    values: [1]
+    values: [1,2]
 
   lr:
     values: [3e-4]
@@ -73,12 +82,7 @@ parameters:
     values: [3]
   rho:
     values: [0.5]
-  pred_from:
-    values: ["rollout"] # rollout, true_state or both
-  split_batch: 
-    values: [true]
-  rollout_fraction:
-    values: [0.5] # for when both
+
 
   encoder_consistency_coef:
     values: [1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
@@ -97,7 +101,7 @@ parameters:
     values:
       # - [0.97]
       - [0.95]
-      - [0.8, 0.95]
+      # - [0.8, 0.95]
       # - [0.9, 0.95]
 
 
