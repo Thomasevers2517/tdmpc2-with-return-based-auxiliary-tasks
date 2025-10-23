@@ -1198,7 +1198,10 @@ class TDMPC2(torch.nn.Module):
 			self.pi_optim.zero_grad(set_to_none=True)
 
 			info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
-		return info
+		if self._step % self.cfg.log_freq == 0 or self.log_detailed:
+			return info
+		else:
+			return TensorDict({})
 
 
 	@torch.compile(mode='reduce-overhead')
