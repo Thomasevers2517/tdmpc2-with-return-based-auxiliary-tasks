@@ -7,7 +7,7 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
-RUN_NAME="compile-fullupdate"
+RUN_NAME="ac2rollout4m5"
 
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,14 +29,16 @@ export EGL_PLATFORM=surfaceless
 
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=800 \
+	--delay=1100 \
 	--duration=20 \
 	--sample=none \
-	--force-overwrite=true	-o "$OUT_DIR/profile" \
+	--force-overwrite=true\
+	--capture-child-processes=all \
+	--cuda-graph-trace=nodes \ -o "$OUT_DIR/profile" \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \
 		obs=state \
-		compile=True \
+		compile=true \
 		compile_type=reduce-overhead \
 		nvtx_profiler=true \
 		enable_wandb=true \
