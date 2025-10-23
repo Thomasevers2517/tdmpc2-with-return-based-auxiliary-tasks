@@ -7,7 +7,7 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
-RUN_NAME="reacher-easy-state"
+RUN_NAME="compile-fullupdate"
 
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +29,7 @@ export EGL_PLATFORM=surfaceless
 
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=600 \
+	--delay=800 \
 	--duration=20 \
 	--sample=none \
 	--force-overwrite=true	-o "$OUT_DIR/profile" \

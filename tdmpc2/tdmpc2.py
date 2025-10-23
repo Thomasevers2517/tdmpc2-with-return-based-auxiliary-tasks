@@ -146,6 +146,9 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
+			self._update_eager = self._update
+			self._update = torch.compile(self._update, mode=self.cfg.compile_type)
+
 			self._compute_loss_components_eager = self._compute_loss_components
 			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses_eager = self.calc_pi_losses
@@ -581,6 +584,20 @@ class TDMPC2(torch.nn.Module):
 			hinge_loss = self.calc_hinge_loss(info["presquash_mean"], rho_pows)
 			pi_loss = pi_loss + lam * hinge_loss
 
+			info = TensorDict({
+			"pi_loss": pi_loss,
+			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
+			"pi_entropy": info["entropy"],
+			"pi_scaled_entropy": info["scaled_entropy"],
+			"pi_scale": self.scale.value,
+			"pi_std": info["log_std"].mean(),
+			"pi_mean": info["mean"].mean(),
+			"pi_abs_mean": info["mean"].abs().mean(),
+			"pi_presquash_mean": info["presquash_mean"].mean(),
+			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
+			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
+				}, device=self.device)
+
 			return pi_loss, info
 
 	def update_pi(self, zs, task):
@@ -598,20 +615,7 @@ class TDMPC2(torch.nn.Module):
 		pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
 		# if log_grads:
 		# 	# self.probe_pi_gradients(pi_loss, info)
-		
-		info = TensorDict({
-			"pi_loss": pi_loss,
-			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
-			"pi_entropy": info["entropy"],
-			"pi_scaled_entropy": info["scaled_entropy"],
-			"pi_scale": self.scale.value,
-			"pi_std": info["log_std"].mean(),
-			"pi_mean": info["mean"].mean(),
-			"pi_abs_mean": info["mean"].abs().mean(),
-			"pi_presquash_mean": info["presquash_mean"].mean(),
-			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
-			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
-		}, device=self.device)
+
 		return pi_loss, info
 
 	@torch.no_grad()
@@ -1192,12 +1196,12 @@ class TDMPC2(torch.nn.Module):
 			else:
 				self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
-   
-			info = self.update_end(info, grad_norm, pi_grad_norm, total_loss, pi_info)
+
+			info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
 		return info
 
 
-
+	@torch.compile(mode='reduce-overhead')
 	def update_end(self, info, grad_norm, pi_grad_norm, total_loss, pi_info):
 		"""Function called at the end of each update iteration."""
 		info.update({
@@ -1244,7 +1248,12 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
+		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
+
+		if log_grads:
+			return self._update_eager(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
+		else:
+			return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
 
 
 	@torch._dynamo.disable()
