@@ -146,14 +146,9 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
-			self.world_model_losses_eager = self.world_model_losses
-			self.calculate_value_loss_eager = self.calculate_value_loss
-			self.calculate_aux_value_loss_eager = self.calculate_aux_value_loss
+			self._compute_loss_components_eager = self._compute_loss_components
+			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses_eager = self.calc_pi_losses
-
-			self.world_model_losses = torch.compile(self.world_model_losses, mode=self.cfg.compile_type, fullgraph=True)
-			self.calculate_value_loss = torch.compile(self.calculate_value_loss, mode=self.cfg.compile_type, fullgraph=True)
-			self.calculate_aux_value_loss = torch.compile(self.calculate_aux_value_loss, mode=self.cfg.compile_type, fullgraph=True)
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=True)
 
 			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
@@ -171,9 +166,7 @@ class TDMPC2(torch.nn.Module):
 
 			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=True)
 		else:
-			self.world_model_losses_eager = self.world_model_losses
-			self.calculate_value_loss_eager = self.calculate_value_loss
-			self.calculate_aux_value_loss_eager = self.calculate_aux_value_loss
+			self._calculate_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
@@ -1022,14 +1015,9 @@ class TDMPC2(torch.nn.Module):
 	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads):
 		device = self.device
 
-		if self.cfg.compile and log_grads:
-			wm_fn = self.world_model_losses_eager
-			value_fn = self.calculate_value_loss_eager
-			aux_fn = self.calculate_aux_value_loss_eager
-		else:
-			wm_fn = self.world_model_losses
-			value_fn = self.calculate_value_loss
-			aux_fn = self.calculate_aux_value_loss
+		wm_fn = self.world_model_losses
+		value_fn = self.calculate_value_loss
+		aux_fn = self.calculate_aux_value_loss
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
 			steps, batch = obs_seq.shape[0], obs_seq.shape[1]
@@ -1147,7 +1135,11 @@ class TDMPC2(torch.nn.Module):
 
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
-			components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads)
+			if log_grads:
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads)
+			else:
+				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads)
+    
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
 			aux_loss = components['aux_loss']
@@ -1175,10 +1167,11 @@ class TDMPC2(torch.nn.Module):
 			self.optim.zero_grad(set_to_none=True)
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
-			if self.cfg.compile and log_grads:
+			if log_grads:
 				self.optim.step()
 			else:
 				self.optim_step()
+    
 			self.optim.zero_grad(set_to_none=True)
 
 			if self.cfg.actor_source == 'ac':

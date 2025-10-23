@@ -27,7 +27,7 @@ ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: replay_rollout # replay_true | replay_rollout | imagine
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
-actor_source: ac # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+actor_source: replay_true # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
 steps: 4_000_000
 batch_size: 256

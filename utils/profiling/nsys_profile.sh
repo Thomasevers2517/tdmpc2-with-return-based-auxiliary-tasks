@@ -29,18 +29,19 @@ export EGL_PLATFORM=surfaceless
 
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=900 \
+	--delay=600 \
 	--duration=20 \
 	--sample=none \
 	--force-overwrite=true	-o "$OUT_DIR/profile" \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \
 		obs=state \
-		compile=true \
-		compile_type=reduce-overhead \
+		compile=false \
+		compile_type=default \
 		nvtx_profiler=true \
 		enable_wandb=true \
 		steps=2000000 \
+		model_size=1\
 	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
 
 echo "Nsight profiling started. Reports: $OUT_DIR"
