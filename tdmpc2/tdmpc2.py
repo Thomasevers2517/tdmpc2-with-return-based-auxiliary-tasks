@@ -401,7 +401,10 @@ class TDMPC2(torch.nn.Module):
 				if self.cfg.episodic:
 					termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
 			action, _ = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
-			return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg')
+			if self.cfg.ema_value_planning:
+				return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg', target=True)
+			else:
+				return G + discount * (1-termination) * self.model.Q(z, action, task, return_type='avg', target=False)
 
 	@torch.no_grad()
 	def _plan(self, obs, task=None):

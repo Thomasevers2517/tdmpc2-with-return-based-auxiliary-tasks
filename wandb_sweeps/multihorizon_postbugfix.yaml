@@ -27,15 +27,19 @@ metric:
 parameters:
   task:
     values:
-      - acrobot-swingup
-      # - reacher-hard
-      - quadruped-walk
+      # - acrobot-swingup
+      - reacher-hard
+      # - quadruped-walk
       # - humanoid-run
+  
+
+  ema_value_planning:
+    values: [true, false]
 
   detach_imagine_value:
-    values: [false, true]
+    values: [false]
   imagination_horizon:
-    values: [1, 3]
+    values: [1]
   pred_from: 
     values: ["rollout"] # rollout, true_state or both
   split_batch: 
@@ -43,7 +47,7 @@ parameters:
   ac_source:
     values: ["imagine"] # replay_rollout | imagine (controls critic/actor source)
   actor_source:
-    values: ["replay_rollout", "replay_true"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+    values: ["replay_true"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
   aux_value_source:
     values: ["replay_true"] # replay_true | replay_rollout | imagine
 
@@ -61,7 +65,7 @@ parameters:
   imagine_value_loss_coef_mult:
     values: [1] #[0.1, 0.01, 0] # 0 to disable
   num_rollouts:
-    values: [4]
+    values: [4, 16]
 
 
   eval_mpc:
@@ -72,7 +76,7 @@ parameters:
   utd_ratio:
     values: [1]
   ac_utd_multiplier:
-    values: [1,2]
+    values: [1,4]
 
   lr:
     values: [3e-4]
@@ -100,8 +104,8 @@ parameters:
   multi_gamma_gammas:
     values:
       # - [0.97]
-      - [0.95]
-      # - [0.8, 0.95]
+      # - [0.95]
+      - [0.8, 0.95]
       # - [0.9, 0.95]
 
 
@@ -120,15 +124,14 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 60000
+    value: 100000
   eval_freq:
     value: 10000
-  eval_episodes: 
-    value: 5
+
   batch_size:
     value: 256
   model_size:
-    value: 5
+    values: [1, 5]
   obs:
     values:
       # - rgb
