@@ -1116,6 +1116,19 @@ class TDMPC2(torch.nn.Module):
 		info.update(wm_info, non_blocking=True)
 		info.update(value_info, non_blocking=True)
 		info.update(aux_info, non_blocking=True)
+  
+		critic_weighted = self.cfg.value_coef * value_loss
+		critic_weighted =  critic_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_weighted
+		aux_weighted =  self.cfg.multi_gamma_loss_weight * aux_loss
+		aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.aux_value_source == 'imagine' else aux_weighted
+
+		total_loss = wm_loss + critic_weighted + aux_weighted
+		info.update({
+			'total_loss': total_loss,
+			'wm_loss': wm_loss,
+			'value_loss_weighted': critic_weighted,
+			'aux_loss_mean_weighted': aux_weighted
+		}, non_blocking=True)
 
 		return {
 			'wm_loss': wm_loss,
@@ -1148,18 +1161,7 @@ class TDMPC2(torch.nn.Module):
 			z_rollout = components['z_rollout']
 			value_inputs = components['value_inputs']
       
-			critic_weighted = self.cfg.value_coef * value_loss
-			critic_weighted =  critic_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_weighted
-			aux_weighted =  self.cfg.multi_gamma_loss_weight * aux_loss
-			aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.aux_value_source == 'imagine' else aux_weighted
-   
-			total_loss = wm_loss + critic_weighted + aux_weighted
-			info.update({
-				'total_loss': total_loss,
-				'wm_loss': wm_loss,
-				'value_loss_weighted': critic_weighted,
-				'aux_loss_mean_weighted': aux_weighted
-			}, non_blocking=True)
+			total_loss = info['total_loss']		
    
 			if log_grads:
 				info = self.probe_wm_gradients(info)
@@ -1190,30 +1192,35 @@ class TDMPC2(torch.nn.Module):
 			else:
 				self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
+   
+			info = self.update_end(info, grad_norm, pi_grad_norm, total_loss, pi_info)
+		return info
 
-			info.update({
+
+
+	def update_end(self, info, grad_norm, pi_grad_norm, total_loss, pi_info):
+		"""Function called at the end of each update iteration."""
+		info.update({
 				'grad_norm': grad_norm,
 				'pi_grad_norm': pi_grad_norm,
-				'total_loss': total_loss.detach(),
-				'critic_total_loss': critic_weighted.detach(),
+				'total_loss': total_loss.detach()
 			}, non_blocking=True)
-			info.update(pi_info, non_blocking=True)
+		info.update(pi_info, non_blocking=True)
+		self.model.soft_update_target_Q()
+		self.model.soft_update_policy_encoder_targets()
+		if self.cfg.encoder_ema_enabled:
+			info.update({
+				'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device)
+			}, non_blocking=True)
+		if self.cfg.policy_ema_enabled:
+			info.update({
+				'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device)
+			}, non_blocking=True)
 
-			self.model.soft_update_target_Q()
-			self.model.soft_update_policy_encoder_targets()
-			if self.cfg.encoder_ema_enabled:
-				info.update({
-					'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device)
-				}, non_blocking=True)
-			if self.cfg.policy_ema_enabled:
-				info.update({
-					'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device)
-				}, non_blocking=True)
-
-			self.model.eval()
-			#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
-			return info.detach().mean()
-
+		self.model.eval()
+		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
+		return info.detach().mean()
+  
 	def update(self, buffer, step=0, ac_only=False):
 		"""
 		Main update function. Corresponds to one iteration of model learning.

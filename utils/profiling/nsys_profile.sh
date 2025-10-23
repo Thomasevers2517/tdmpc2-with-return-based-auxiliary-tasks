@@ -36,8 +36,8 @@ CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \
 		obs=state \
-		compile=false \
-		compile_type=default \
+		compile=True \
+		compile_type=reduce-overhead \
 		nvtx_profiler=true \
 		enable_wandb=true \
 		steps=2000000 \
