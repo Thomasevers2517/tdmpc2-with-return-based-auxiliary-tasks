@@ -17,10 +17,10 @@ best_eval: false
 
 # training
 utd_ratio: 1
-ac_utd_multiplier: 1
+ac_utd_multiplier: 2
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
 
-num_rollouts: 1 # number of parallel rollouts to do in imagination for each starting state
+num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout, true_state, both (controls reward/termination prediction source)
 split_batch: true # If pred_from == both, split batch evenly between true and rollout predictions
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)

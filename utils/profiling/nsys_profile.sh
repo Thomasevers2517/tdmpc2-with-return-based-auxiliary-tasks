@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 		nvtx_profiler=true \
 		enable_wandb=true \
 		steps=2000000 \
-		model_size=1\
+		model_size=5\
 	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
 
 echo "Nsight profiling started. Reports: $OUT_DIR"

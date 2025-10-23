@@ -1148,7 +1148,6 @@ class TDMPC2(torch.nn.Module):
 	def _update(self, obs, action, reward, terminated, ac_only, task=None):
 		"""Single gradient update step over world model, critic, and policy."""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
-		log.info(f"Update step started. AC only: {ac_only}. Log grads: {log_grads}") if ac_only else None
 
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
