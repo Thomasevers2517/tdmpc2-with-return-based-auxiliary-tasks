@@ -1,3 +1,5 @@
+import threading
+
 import torch
 from tensordict.tensordict import TensorDict
 from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage, TensorDictReplayBuffer
@@ -27,11 +29,14 @@ class Buffer():
 		)
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
-  
-		  # --- GPU prefetch machinery ---
+
+		# --- GPU prefetch machinery ---
 		self._copy_stream = torch.cuda.Stream()
 		self._prefetched_td_gpu = None
+		self._prefetch_thread = None
+		self._prefetch_error = None
 		self._primed = False
+		self._buffer = None
 
 	@property
 	def capacity(self):
@@ -95,48 +100,95 @@ class Buffer():
 		td = td.reshape(td.shape[0]*td.shape[1])
 		self._buffer.extend(td)
 		self._num_eps += num_new_eps
-		self._primed = False; self._prefetched_td_gpu = None
+		self._primed = False
+		self._prefetched_td_gpu = None
+		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+			self._prefetch_thread.join()
+		self._prefetch_thread = None
+		self._prefetch_error = None
 
 		return self._num_eps
 
-	def add(self, td):
+	def add(self, td, end_episode):
 		"""Add an episode to the buffer."""
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
 		if self._num_eps == 0:
 			self._buffer = self._init(td)
 		self._buffer.extend(td)
-		self._num_eps += 1
-		self._primed = False; self._prefetched_td_gpu = None
+		if end_episode:
+			self._num_eps += 1
+		self._primed = False
+		self._prefetched_td_gpu = None
+		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+			self._prefetch_thread.join()
+		self._prefetch_thread = None
+		self._prefetch_error = None
 		return self._num_eps
 
 
 
 	def sample(self):
 		"""Sample a batch of subsequences from the buffer."""
-		if not self._primed:
-			self._preload_gpu()
-			torch.cuda.current_stream().wait_stream(self._copy_stream)  # first batch only
-			self._primed = True
-		torch.cuda.current_stream().wait_stream(self._copy_stream)
-		obs, action, reward, terminated, task = self.from_td(self._prefetched_td_gpu)
-		self._preload_gpu()  # overlap next copy with your compute on 'ready'
 
+		if self._buffer is None:
+			raise RuntimeError('Replay buffer not initialized before sampling.')
+		if not self._primed:
+			self._launch_prefetch_thread()
+			self._await_prefetch()
+			self._primed = True
+		else:
+			self._await_prefetch()
+		if self._prefetched_td_gpu is None:
+			raise RuntimeError('Prefetch worker completed without producing a batch.')
+		obs, action, reward, terminated, task = self._prefetched_td_gpu
+		self._prefetched_td_gpu = None
+		self._launch_prefetch_thread()
 		return obs, action, reward, terminated, task
 
+	def _launch_prefetch_thread(self):
+		if self._buffer is None:
+			raise RuntimeError('Replay buffer not initialized before prefetch start.')
+		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+			raise RuntimeError('Prefetch requested while previous worker is still running.')
+		self._prefetch_error = None
+		self._prefetch_thread = threading.Thread(
+			target=self._preload_gpu,
+			name='ReplayPrefetchWorker',
+			daemon=True,
+		)
+		self._prefetch_thread.start()
+
+	def _await_prefetch(self):
+		if self._prefetch_thread is None:
+			raise RuntimeError('Prefetch thread missing before await.')
+		self._prefetch_thread.join()
+		self._prefetch_thread = None
+		if self._prefetch_error is not None:
+			error = self._prefetch_error
+			self._prefetch_error = None
+			raise RuntimeError('Prefetch worker failed while sampling.') from error
+		torch.cuda.current_stream().wait_stream(self._copy_stream)
 
 	def _preload_gpu(self):
-		td_cpu = self._buffer.sample()  # CPU, pinned, already sliced/reshaped
-
-		with torch.cuda.stream(self._copy_stream):
-
-			# one async H2D per tensor; pinned + non_blocking allows overlap
-			self._prefetched_td_gpu = td_cpu.to(self._device, non_blocking=True)
+		try:
+			td_cpu = self._buffer.sample()
+			obs_cpu, action_cpu, reward_cpu, terminated_cpu, task_cpu = self.from_td(td_cpu)
+			with torch.cuda.stream(self._copy_stream):
+				obs = obs_cpu.to(self._device, non_blocking=True)
+				action = action_cpu.to(self._device, non_blocking=True)
+				reward = reward_cpu.to(self._device, non_blocking=True)
+				terminated = terminated_cpu.to(self._device, non_blocking=True)
+				task = task_cpu.to(self._device, non_blocking=True) if task_cpu is not None else None
+			self._prefetched_td_gpu = (obs, action, reward, terminated, task)
+		except Exception as exc:  # pylint: disable=broad-except
+			self._prefetch_error = exc
+			self._prefetched_td_gpu = None
 
     
 
 	# @torch.compile(mode='reduce-overhead')
 	def from_td(self, td):
-
+       
 		obs = td.get('obs').contiguous()
 		action = td.get('action')[1:].contiguous()
 		reward = td.get('reward')[1:].unsqueeze(-1).contiguous()
@@ -152,6 +204,10 @@ class Buffer():
 
 	def empty(self):
 		"""Empty the buffer."""
+		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+			self._prefetch_thread.join()
+		self._prefetch_thread = None
+		self._prefetch_error = None
 		self._num_eps = 0
 		self._primed = False
 		self._prefetched_td_gpu = None

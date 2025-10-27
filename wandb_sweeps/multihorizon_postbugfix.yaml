@@ -27,31 +27,65 @@ metric:
 parameters:
   task:
     values:
-      - acrobot-swingup
+      # - acrobot-swingup
       # - reacher-hard
-      # - quadruped-walk
+      - quadruped-walk
       # - humanoid-run
+  
+  buffer_update_interval:
+    values: [100, 50]
+  tau:
+    values: [0.01] # originally 0.01
+  aux_value_tau:
+    values: [0.01] # 0.01
+  policy_coef:
+    values: [1] #seems it shouldnt increase
 
-  value_coef: 
-    values: [0]
+  ema_value_planning:
+    values: [false] # false seems better, quicker model fixing
 
-  imagination_horizon: 
-    values: [1, 3]
-  imagine_num_starts: 
-    values: [-1]
-  imagine_value_loss_coef: 
-    values: [0.1, 0.4] #[0.1, 0.01, 0] # 0 to disable
-  num_rollouts:
-    values: [1, 4, 12]
   detach_imagine_value:
     values: [false]
+  imagination_horizon:
+    values: [1]
+  pred_from: 
+    values: ["rollout"] # rollout, true_state or both
+  split_batch: 
+    values: [true] 
+  ac_source:
+    values: ["imagine"] # replay_rollout | imagine (controls critic/actor source)
+  actor_source:
+    values: ["replay_rollout"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+  aux_value_source:
+    values: ["replay_true"] # replay_true | replay_rollout | imagine
+
+  log_std_max:
+    values: [2]
+  reward_dim_div:
+    values: [1]
+  # num_enc_layers:
+  #   values: [2] # originally 2
+  entropy_coef:
+    values: [1e-4] #originally 1e-4
+  hinge_coef:
+    values: [0.01]
+
+  imagine_value_loss_coef_mult:
+    values: [1] #[0.1, 0.01, 0] # 0 to disable
+  num_rollouts:
+    values: [4]
+
 
   eval_mpc:
     values: [true]
   train_mpc:
     values: [true]
+
   utd_ratio:
-    values: [1]
+    values: [1, 2]
+  ac_utd_multiplier:
+    values: [1, 2]
+
   lr:
     values: [3e-4]
   enc_lr_scale:
@@ -60,12 +94,7 @@ parameters:
     values: [3]
   rho:
     values: [0.5]
-  pred_from:
-    values: ["rollout"] # rollout, true_state or both
-  split_batch: 
-    values: [true]
-  rollout_fraction:
-    values: [0.5] # for when both
+
 
   encoder_consistency_coef:
     values: [1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
@@ -103,15 +132,14 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 60000
+    value: 100000
   eval_freq:
     value: 10000
-  eval_episodes: 
-    value: 5
+
   batch_size:
     value: 256
   model_size:
-    value: 5
+    values: [5]
   obs:
     values:
       # - rgb

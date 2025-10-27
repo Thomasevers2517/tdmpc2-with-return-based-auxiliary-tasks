@@ -7,7 +7,7 @@ if [[ ! -x "$PYTHON" ]]; then
 	PYTHON="python"
 fi
 
-RUN_NAME="reacher-easy-state"
+RUN_NAME="ac2rollout4m5"
 
 # Resolve repository root from this script location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,10 +29,12 @@ mkdir -p "$OUT_DIR"
 
 CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 	--trace=cuda,nvtx,cudnn,cublas,cudla \
-	--delay=900 \
+	--delay=1100 \
 	--duration=20 \
 	--sample=none \
-	--force-overwrite=true	-o "$OUT_DIR/profile" \
+	--force-overwrite=true\
+	--capture-child-processes=all \
+	--cuda-graph-trace=nodes \ -o "$OUT_DIR/profile" \
 	"$PYTHON" -u tdmpc2/train.py \
 		task=reacher-easy \
 		obs=state \
@@ -41,6 +43,7 @@ CUDA_VISIBLE_DEVICES=0 nohup nsys profile \
 		nvtx_profiler=true \
 		enable_wandb=true \
 		steps=2000000 \
+		model_size=5\
 	> "$OUT_DIR/profile_$RUN_NAME.log" 2>&1 &
 
 echo "Nsight profiling started. Reports: $OUT_DIR"

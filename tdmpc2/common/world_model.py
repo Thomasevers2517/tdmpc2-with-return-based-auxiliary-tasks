@@ -35,7 +35,8 @@ class WorldModel(nn.Module):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
 		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
-		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1))
+		
+		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
@@ -212,7 +213,7 @@ class WorldModel(nn.Module):
 				with torch.no_grad():
 					online = parameters_to_vector(self._aux_joint_Qs.parameters()).detach()
 					prev = self.aux_joint_target_vec.detach().clone()
-					self.aux_joint_target_vec.lerp_(online, self.cfg.tau)
+					self.aux_joint_target_vec.lerp_(online, self.cfg.aux_value_tau)
 					vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
 					# Detach mirrors online snapshot
 					self.aux_joint_detach_vec.copy_(online)
@@ -224,7 +225,7 @@ class WorldModel(nn.Module):
 					vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
 					online = torch.cat(vecs, dim=0)
 					prev = self.aux_separate_target_vec.detach().clone()
-					self.aux_separate_target_vec.lerp_(online, self.cfg.tau)
+					self.aux_separate_target_vec.lerp_(online, self.cfg.aux_value_tau)
 					# Assign to target heads
 					offset = 0
 					for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):
@@ -376,9 +377,11 @@ class WorldModel(nn.Module):
 			size = eps.shape[-1] if action_dims is None else action_dims
 			scaled_log_prob = log_prob * size
 			action = mean + eps * log_std.exp()
+			presquash_mean = mean
 			mean, action, log_prob = math.squash(mean, action, log_prob)
 			entropy_scale = scaled_log_prob / (log_prob + 1e-8)
 			info = TensorDict({
+				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,

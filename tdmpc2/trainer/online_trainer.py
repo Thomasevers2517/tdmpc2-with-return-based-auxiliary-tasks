@@ -63,8 +63,8 @@ class OnlineTrainer(Trainer):
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 
-			self.validation_buffer.add(torch.cat(self.val_tds))
-			self.recent_validation_buffer.add(torch.cat(self.val_tds))
+			self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
+			self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
    
 		val_info_rand, val_info_recent = self.validate()
 		val_info_rand.update(self.common_metrics())
@@ -129,11 +129,14 @@ class OnlineTrainer(Trainer):
 						episode_terminated=info['terminated'])
 					train_metrics.update(self.common_metrics())
 					self.logger.log(train_metrics, 'train')
-					self._ep_idx = self.buffer.add(torch.cat(self._tds))
+					self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=True)
 
 				obs = self.env.reset()
 				self._tds = [self.to_td(obs)]
 				self.agent.reset_planner_state()
+			elif (self._step % self.cfg.buffer_update_interval == 0 and self._step > 0) and self.cfg.buffer_update_interval !=-1:
+				self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=False)
+				self._tds = []
 
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
@@ -153,7 +156,11 @@ class OnlineTrainer(Trainer):
 				else:
 					num_updates = self.cfg.utd_ratio
 				for _ in range(num_updates):
-					_train_metrics = self.agent.update(self.buffer, step = self._step)
+
+					for _ in range(self.cfg.ac_utd_multiplier-1):
+						_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=True)
+						train_metrics.update(_train_metrics)
+					_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=False)
 					train_metrics.update(_train_metrics)
 
 
