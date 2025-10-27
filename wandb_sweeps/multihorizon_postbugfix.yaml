@@ -82,9 +82,9 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1]
+    values: [1, 2]
   ac_utd_multiplier:
-    values: [1, 4]
+    values: [1, 2]
 
   lr:
     values: [3e-4]
