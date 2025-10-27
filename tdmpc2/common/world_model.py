@@ -213,7 +213,7 @@ class WorldModel(nn.Module):
 				with torch.no_grad():
 					online = parameters_to_vector(self._aux_joint_Qs.parameters()).detach()
 					prev = self.aux_joint_target_vec.detach().clone()
-					self.aux_joint_target_vec.lerp_(online, self.cfg.tau)
+					self.aux_joint_target_vec.lerp_(online, self.cfg.aux_value_tau)
 					vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
 					# Detach mirrors online snapshot
 					self.aux_joint_detach_vec.copy_(online)
@@ -225,7 +225,7 @@ class WorldModel(nn.Module):
 					vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
 					online = torch.cat(vecs, dim=0)
 					prev = self.aux_separate_target_vec.detach().clone()
-					self.aux_separate_target_vec.lerp_(online, self.cfg.tau)
+					self.aux_separate_target_vec.lerp_(online, self.cfg.aux_value_tau)
 					# Assign to target heads
 					offset = 0
 					for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):

@@ -9,15 +9,20 @@ episodic: false
 
 # evaluation
 checkpoint: ???
-eval_episodes: 15
-eval_freq: 50000
+eval_episodes: 5
+eval_freq: 20000
 best_eval: false
 
 
 
 # training
+buffer_update_interval: -1  # number of env steps between buffer additions when not at episode end
+
+# per_alpha: 0 # 0 means uniform sampling, >0 means prioritized experience replay
+# per_priority: recency # recency | consistency
+
 utd_ratio: 1
-ac_utd_multiplier: 2
+ac_utd_multiplier: 1
 reset_agent_freq: 400_000_000   # number of ac updates between resets of actor and critic networks so steps / (utd_ratio * ac_utd_multiplier) is number of env steps between resets
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
@@ -48,6 +53,7 @@ lr: 3e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
+aux_value_tau: 0.01
 policy_ema_enabled: false
 policy_ema_tau: 0.05
 encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB

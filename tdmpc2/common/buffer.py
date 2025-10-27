@@ -109,13 +109,14 @@ class Buffer():
 
 		return self._num_eps
 
-	def add(self, td):
+	def add(self, td, end_episode):
 		"""Add an episode to the buffer."""
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
 		if self._num_eps == 0:
 			self._buffer = self._init(td)
 		self._buffer.extend(td)
-		self._num_eps += 1
+		if end_episode:
+			self._num_eps += 1
 		self._primed = False
 		self._prefetched_td_gpu = None
 		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():

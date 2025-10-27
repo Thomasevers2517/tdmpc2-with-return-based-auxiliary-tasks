@@ -146,8 +146,8 @@ class TDMPC2(torch.nn.Module):
 		)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
-			self._update_eager = self._update
-			self._update = torch.compile(self._update, mode=self.cfg.compile_type)
+			# self._update_eager = self._update
+			# self._update = torch.compile(self._update, mode=self.cfg.compile_type)
 
 			self._compute_loss_components_eager = self._compute_loss_components
 			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=self.cfg.compile_type, fullgraph=True)
@@ -1199,8 +1199,13 @@ class TDMPC2(torch.nn.Module):
 				self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
 
-			info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
-		return info
+			self.model.soft_update_target_Q()
+			self.model.soft_update_policy_encoder_targets()
+			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
+				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
+			else:
+				info = TensorDict({}, device=self.device).detach()
+		return info.to('cpu')
 
 
 	@torch.compile(mode='reduce-overhead')
@@ -1212,8 +1217,7 @@ class TDMPC2(torch.nn.Module):
 				'total_loss': total_loss.detach()
 			}, non_blocking=True)
 		info.update(pi_info, non_blocking=True)
-		self.model.soft_update_target_Q()
-		self.model.soft_update_policy_encoder_targets()
+
 		if self.cfg.encoder_ema_enabled:
 			info.update({
 				'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device)
@@ -1251,11 +1255,14 @@ class TDMPC2(torch.nn.Module):
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
+  
+		return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
 
-		if log_grads:
-			return self._update_eager(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
-		else:
-			return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
+		# if log_grads:
+			
+		# 	return self._update_eager(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
+		# else:
+		# 	return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
 
 
 	@torch._dynamo.disable()
