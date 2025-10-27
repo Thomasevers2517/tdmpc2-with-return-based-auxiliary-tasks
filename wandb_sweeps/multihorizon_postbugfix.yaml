@@ -33,7 +33,7 @@ parameters:
       # - humanoid-run
   
   buffer_update_interval:
-    values: [100]
+    values: [100, 50]
   tau:
     values: [0.01] # originally 0.01
   aux_value_tau:
@@ -84,7 +84,7 @@ parameters:
   utd_ratio:
     values: [1]
   ac_utd_multiplier:
-    values: [1]
+    values: [1, 4]
 
   lr:
     values: [3e-4]
