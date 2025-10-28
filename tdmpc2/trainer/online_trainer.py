@@ -16,6 +16,8 @@ class OnlineTrainer(Trainer):
 		super().__init__(*args, **kwargs)
 		self._step = 0
 		self._ep_idx = 0
+		self._ep_rew = torch.tensor(0.0)
+		self._ep_len = 0
 		self._start_time = time()
 
 		self.validation_buffer = Buffer(cfg=self.cfg)
@@ -122,20 +124,25 @@ class OnlineTrainer(Trainer):
 					if info['terminated'] and not self.cfg.episodic:
 						raise ValueError('Termination detected but you are not in episodic mode. ' \
 						'Set `episodic=true` to enable support for terminations.')
+					self._ep_rew += torch.tensor([td['reward'] for td in self._tds[1:]]).sum()
+					self._ep_len += len(self._tds)
 					train_metrics.update(
-						episode_reward=torch.tensor([td['reward'] for td in self._tds[1:]]).sum(),
+						episode_reward=self._ep_rew,
 						episode_success=info['success'],
-						episode_length=len(self._tds),
+						episode_length=self._ep_len,
 						episode_terminated=info['terminated'])
 					train_metrics.update(self.common_metrics())
 					self.logger.log(train_metrics, 'train')
 					self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=True)
-
+				self._ep_rew = torch.tensor(0.0)
+				self._ep_len = 0
 				obs = self.env.reset()
 				self._tds = [self.to_td(obs)]
 				self.agent.reset_planner_state()
 			elif (self._step % self.cfg.buffer_update_interval == 0 and self._step > 0) and self.cfg.buffer_update_interval !=-1:
 				self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=False)
+				self._ep_rew += torch.tensor([td['reward'] for td in self._tds[1:]]).sum()
+				self._ep_len += len(self._tds)
 				self._tds = []
 
 			# Collect experience

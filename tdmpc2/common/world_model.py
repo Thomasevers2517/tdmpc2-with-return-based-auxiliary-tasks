@@ -344,7 +344,7 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(logits)
 		
 
-	def pi(self, z, task, use_ema=False):
+	def pi(self, z, task, use_ema=False, search_noise=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
@@ -376,6 +376,8 @@ class WorldModel(nn.Module):
 			log_prob = math.gaussian_logprob(eps, log_std)
 			size = eps.shape[-1] if action_dims is None else action_dims
 			scaled_log_prob = log_prob * size
+			if search_noise:
+				eps = eps * self.cfg.search_pi_std_mult
 			action = mean + eps * log_std.exp()
 			presquash_mean = mean
 			mean, action, log_prob = math.squash(mean, action, log_prob)
