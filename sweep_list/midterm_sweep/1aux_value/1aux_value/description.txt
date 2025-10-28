@@ -1,0 +1,16 @@
+Auxiliary value (multi-gamma) — leaf sweep folder
+
+- ac_source=replay_rollout, actor_source=ac, aux_value_source=replay_rollout
+- pred_from=rollout, buffer_update_interval=-1
+- tasks: acrobot-swingup, reacher-hard, quadruped-walk, walker-run
+- obs: state, rgb
+- seeds: 102, 203
+- steps: 100000, eval_freq: 10000, model_size: 5
+
+Ablations
+- multi_gamma_head: separate
+- multi_gamma_gammas: [0.97], [0.95], [0.8, 0.95], [0.9, 0.95]
+- multi_gamma_loss_weight: 0.1
+
+Use utils/sweeps/create_or_update_sweeps.sh to create the sweep and write id.txt.
+Use utils/sweeps/run_sweeps.sh to launch agents.
