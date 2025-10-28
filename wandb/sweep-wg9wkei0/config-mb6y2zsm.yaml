@@ -1,0 +1,39 @@
+wandb_version: 1
+
+ac_source:
+  value: replay_rollout
+actor_source:
+  value: ac
+aux_value_source:
+  value: replay_rollout
+buffer_update_interval:
+  value: -1
+enable_wandb:
+  value: true
+eval_freq:
+  value: 10000
+model_size:
+  value: 5
+multi_gamma_gammas:
+  value:
+  - 0.97
+multi_gamma_head:
+  value: separate
+multi_gamma_loss_weight:
+  value: 0.1
+obs:
+  value: state
+pred_from:
+  value: rollout
+save_video:
+  value: false
+seed:
+  value: 102
+steps:
+  value: 100000
+task:
+  value: acrobot-swingup
+wandb_entity:
+  value: thomasevers9
+wandb_project:
+  value: tdmpc2-tdmpc2
