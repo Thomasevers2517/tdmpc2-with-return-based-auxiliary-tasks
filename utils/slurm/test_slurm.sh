@@ -23,12 +23,18 @@
 
 set -eo pipefail
 
-export WANDB_API_KEY=3cfa8ad4071af79aa5f7a00bb091ba6b46ac71e1      # from https://wandb.ai/authorize
-export WANDB_ENTITY=thomasevers9              # your W&B username or team
-export WANDB_PROJECT=snellius-test            # exact project name you own
+# Load W&B API key from gitignored file in repo root and fail if missing/empty
+KEY_FILE="${PWD}/wandbapikey/key.txt"
+if [[ ! -s "${KEY_FILE}" ]]; then
+  echo "Missing or empty W&B API key file: ${KEY_FILE}" >&2
+  exit 1
+fi
+echo "Loaded W&B API key from ${KEY_FILE}"
+export WANDB_API_KEY="$(<"${KEY_FILE}")"       # from https://wandb.ai/authorize
+export WANDB_ENTITY=thomasevers9                # your W&B username or team
+export WANDB_PROJECT=snellius-test              # exact project name you own
 # optional:
 export WANDB_MODE=online                      # or "offline" to disable network
-wandb login $WANDB_API_KEY
 ############################### USER KNOBS ####################################
 # Repo paths
 PROJECT_DIR="$PWD"                  # repo root
@@ -73,6 +79,9 @@ echo "Conda environment activated."
 # Activate your conda env
 python -V
 which python
+
+# Login to Weights & Biases without echoing the key
+wandb login --relogin "${WANDB_API_KEY}" >/dev/null
 
 ############################### STAGING #######################################
 mkdir -p "$TMPDIR" "$WANDB_DIR"
