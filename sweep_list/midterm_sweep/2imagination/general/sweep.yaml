@@ -55,8 +55,6 @@ parameters:
   buffer_update_interval:
     values: [100]
 
-    values: [100]
-
   policy_coef:
     values: [1] #seems it shouldnt increase
 
@@ -86,6 +84,7 @@ parameters:
   #   values: [2] # originally 2
   entropy_coef:
     values: [1e-4, 3e-5, 1e-5] #originally 1e-4
+    values: [1e-4, 3e-5, 1e-5] #originally 1e-4
   hinge_coef:
     values: [0.01, 0] #[0.01]
 
@@ -102,8 +101,8 @@ parameters:
 
   utd_ratio:
     values: [1,2]
+    values: [1,2]
   ac_utd_multiplier:
-    values: [1]
     values: [1]
 
   lr:

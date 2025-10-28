@@ -14,12 +14,14 @@ eval_freq: 10000
 
 best_eval: false
 
+best_eval: false
+
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 # training
-buffer_update_interval: 30  # number of env steps between buffer additions when not at episode end
+buffer_update_interval: -1  # number of env steps between buffer additions when not at episode end
 
 # per_alpha: 0 # 0 means uniform sampling, >0 means prioritized experience replay
 # per_priority: recency # recency | consistency
@@ -64,6 +66,7 @@ encoder_ema_tau: 0.05
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
+buffer_size: 1000_000
 buffer_size: 1000_000
 
 pin_memory: true
