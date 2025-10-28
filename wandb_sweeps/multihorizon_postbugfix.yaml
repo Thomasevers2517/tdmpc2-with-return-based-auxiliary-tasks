@@ -27,17 +27,24 @@ metric:
 parameters:
   task:
     values:
-      # - acrobot-swingup
+      - acrobot-swingup
       # - reacher-hard
       - quadruped-walk
+      # - quadruped-run
+      # - hopper-hop
+      # - walker-run
+      - finger-turn-easy
+      # - finger-turn-hard
+      - cartpole-swingup-sparse
+
+
       # - humanoid-run
-  
+  search_pi_std_mult:
+    values: [1, 3, 10]
+
   buffer_update_interval:
-    values: [100, 50]
-  tau:
-    values: [0.01] # originally 0.01
-  aux_value_tau:
-    values: [0.01] # 0.01
+    values: [100]
+
   policy_coef:
     values: [1] #seems it shouldnt increase
 
@@ -66,9 +73,9 @@ parameters:
   # num_enc_layers:
   #   values: [2] # originally 2
   entropy_coef:
-    values: [1e-4] #originally 1e-4
+    values: [1e-5] #originally 1e-4
   hinge_coef:
-    values: [0.01]
+    values: [0.01, 0] #[0.01]
 
   imagine_value_loss_coef_mult:
     values: [1] #[0.1, 0.01, 0] # 0 to disable
@@ -82,9 +89,9 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1, 2]
+    values: [2]
   ac_utd_multiplier:
-    values: [1, 2]
+    values: [1]
 
   lr:
     values: [3e-4]

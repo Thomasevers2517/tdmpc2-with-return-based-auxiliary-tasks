@@ -409,16 +409,7 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def _plan(self, obs, task=None):
 		"""
-		Plan a sequence of actions using the learned world model.
 
-		Args:
-			z (torch.Tensor): Latent state from which to plan.
-			t0 (bool): Whether this is the first observation in the episode.
-			eval_mode (bool): Whether to use the mean of the action distribution.
-			task (Torch.Tensor): Task index (only used for multi-task experiments).
-
-		Returns:
-			torch.Tensor: Action to take in the environment.
 		"""
 		# Sample policy trajectories: roll forward policy prior to seed action set
 		with maybe_range('Agent/plan', self.cfg):
@@ -427,9 +418,9 @@ class TDMPC2(torch.nn.Module):
 				pi_actions = torch.empty(self.cfg.horizon, self.cfg.num_pi_trajs, self.cfg.action_dim, device=self.device)
 				_z = z.repeat(self.cfg.num_pi_trajs, 1)
 				for t in range(self.cfg.horizon-1):
-					pi_actions[t], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled)
+					pi_actions[t], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled, search_noise=True)
 					_z = self.model.next(_z, pi_actions[t], task)
-				pi_actions[-1], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled)
+				pi_actions[-1], _ = self.model.pi(_z, task, use_ema=self.cfg.policy_ema_enabled, search_noise=True)
 
 			# Initialize state and parameters
 			z = z.repeat(self.cfg.num_samples, 1)
