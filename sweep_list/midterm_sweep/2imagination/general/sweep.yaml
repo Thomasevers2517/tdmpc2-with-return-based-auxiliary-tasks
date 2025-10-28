@@ -55,6 +55,8 @@ parameters:
   buffer_update_interval:
     values: [100]
 
+    values: [100]
+
   policy_coef:
     values: [1] #seems it shouldnt increase
 
@@ -103,6 +105,7 @@ parameters:
     values: [1,2]
     values: [1,2]
   ac_utd_multiplier:
+    values: [1]
     values: [1]
 
   lr:
