@@ -169,7 +169,7 @@ class TDMPC2(torch.nn.Module):
 
 			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=True)
 		else:
-			self._calculate_loss_components_eager = self._compute_loss_components
+			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
@@ -575,10 +575,14 @@ class TDMPC2(torch.nn.Module):
 				torch.arange(z.shape[0], device=self.device)
 			)
 			# Loss is a weighted sum of Q-values
-			if self.cfg.ac_source == "imagine" or self.cfg.ac_source == "replay_rollout":
+			if self.cfg.actor_source == "ac":
+				if self.cfg.ac_source == "imagine" or self.cfg.ac_source == "replay_rollout":
+					pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
+				else:
+					raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
+			elif self.cfg.actor_source == "imagine" or self.cfg.actor_source == "replay_rollout":
 				pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
-			else:
-				raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
+			elif self.cfg.actor_source == "replay_true":
 				pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
     
 
@@ -598,6 +602,10 @@ class TDMPC2(torch.nn.Module):
 			"pi_abs_mean": info["mean"].abs().mean(),
 			"pi_presquash_mean": info["presquash_mean"].mean(),
 			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
+
+			"pi_presquash_abs_std": info["presquash_mean"].abs().std(),
+			"pi_presquash_abs_min": info["presquash_mean"].abs().min(),
+			"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
 			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
 				}, device=self.device)
 
