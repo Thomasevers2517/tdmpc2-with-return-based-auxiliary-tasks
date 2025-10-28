@@ -19,7 +19,7 @@ search_pi_std_mult: 1.0  # multiplier for noise added during seed action samplin
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 # training
-buffer_update_interval: -1  # number of env steps between buffer additions when not at episode end
+buffer_update_interval: 30  # number of env steps between buffer additions when not at episode end
 
 # per_alpha: 0 # 0 means uniform sampling, >0 means prioritized experience replay
 # per_priority: recency # recency | consistency
