@@ -12,6 +12,9 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+eval_episodes: 10
+eval_freq: 10000
+
 best_eval: false
 
 
@@ -31,8 +34,10 @@ pred_from: rollout # rollout, true_state, both (controls reward/termination pred
 split_batch: true # If pred_from == both, split batch evenly between true and rollout predictions
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: replay_true # replay_true | replay_rollout | imagine
+aux_value_source: replay_true # replay_true | replay_rollout | imagine
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
+actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
 ema_value_planning: false # if true, use ema critic for mpc planning
