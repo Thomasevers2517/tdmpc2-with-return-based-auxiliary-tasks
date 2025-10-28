@@ -1,7 +1,7 @@
 #!/bin/bash
 ###############################################################################
 # Snellius MIG job: run python tdmpc2/train.py on an A100 MIG slice
-# Submit: sbatch slurm/train_tdmpc2_mig.sbatch
+# Submit: sbatch utils/slurm/test_slurm.sh
 ###############################################################################
 
 ########################## SLURM DIRECTIVES (edit) ############################
@@ -73,7 +73,8 @@ conda init
 echo "Modules loaded:"
 source activate tdmpc2
 
-conda activate /projects/0/prjs0951/conda_envs/tdmpc2
+# conda activate /projects/0/prjs0951/conda_envs/tdmpc2
+
 echo "Conda environment activated."
 
 # Activate your conda env
