@@ -90,6 +90,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Analysis cache
+analysis/run_cache/
+
 # IPython
 profile_default/
 ipython_config.py
