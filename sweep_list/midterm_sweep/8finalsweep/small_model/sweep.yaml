@@ -13,7 +13,7 @@ parameters:
     values: 
       # - cartpole-balance
       # - cartpole-balance-sparse
-      - cartpole-swingup-sparse
+      # - cartpole-swingup-sparse
       # - cup-catch
       # - finger-spin
       # - reacher-easy
@@ -29,7 +29,7 @@ parameters:
       # - finger-turn-hard
       - quadruped-walk
       # - quadruped-run
-      - walker-run
+      # - walker-run
 
       # - humanoid-run
   search_pi_std_mult:
@@ -73,7 +73,7 @@ parameters:
   imagine_value_loss_coef_mult:
     values: [1] #[0.1, 0.01, 0] # 0 to disable
   num_rollouts:
-    values: [1, 4, 16]
+    values: [4, 16]
 
 
   eval_mpc:
@@ -82,14 +82,14 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1, 2]
+    values: [2, 4]
   ac_utd_multiplier:
     values: [1]
 
   lr:
     values: [3e-4]
   enc_lr_scale:
-    values: [0.1, 0.3]
+    values: [0.3]
   horizon:
     values: [3]
   rho:
@@ -104,7 +104,7 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102, 203, 304]
+    values: [102, 203]
   best_eval: 
     values: [false]
 
@@ -139,7 +139,7 @@ parameters:
   batch_size:
     value: 256
   model_size:
-    values: [5]
+    values: [1]
   obs:
     values:
       # - rgb

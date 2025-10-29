@@ -1,0 +1,5 @@
+Followup sweep.
+Higher utd,
+lower entropy coefficient.
+enc lr scale set at origninal 0.3
+num rollouts at 4 is good tradeoff between compute and performance, especially in low dim action spaces and low entropy coef.

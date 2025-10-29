@@ -11,25 +11,25 @@ metric:
 parameters:
   task:
     values: 
-      # - cartpole_balance
-      # - cartpole_balance_sparse
-      # - cartpole_swingup
-      # - cup_catch
-      - finger_spin
-      - reacher_easy
-      - reacher_hard
-      # - walker_stand
-      - walker_walk
-      # - hopper_stand
-      # - hopper_hop
-      - cheetah_run
-      - acrobot_swingup
-      # - cartpole_swingup_sparse
-      - finger_turn_easy
-      - finger_turn_hard
-      - quadruped_walk
-      # - quadruped_run
-      - walker_run
+      # - cartpole-balance
+      # - cartpole-balance-sparse
+      # - cartpole-swingup
+      # - cup-catch
+      - finger-spin
+      - reacher-easy
+      - reacher-hard
+      # - walker-stand
+      - walker-walk
+      # - hopper-stand
+      # - hopper-hop
+      - cheetah-run
+      - acrobot-swingup
+      # - cartpole-swingup-sparse
+      - finger-turn-easy
+      - finger-turn-hard
+      - quadruped-walk
+      # - quadruped-run
+      - walker-run
   obs:
     values: [rgb]
   seed:
