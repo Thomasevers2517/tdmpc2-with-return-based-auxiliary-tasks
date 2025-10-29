@@ -148,8 +148,9 @@ def conv(in_shape, num_channels, out_dim, act=None):
 	body = nn.Sequential(*feature_layers)
 	with torch.no_grad():
 		flat_dim = body(torch.zeros(1, *in_shape)).shape[-1]
-	projection = nn.Linear(flat_dim, out_dim)
-	modules = [body, projection]
+	# projection = nn.Linear(flat_dim, out_dim)
+	# modules = [body, projection]
+	modules = [body]
 	if act:
 		modules.append(act)
 	return nn.Sequential(*modules)
