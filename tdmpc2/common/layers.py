@@ -133,21 +133,26 @@ def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	return nn.Sequential(*mlp)
 
 
-def conv(in_shape, num_channels, act=None):
+def conv(in_shape, num_channels, out_dim, act=None):
 	"""
 	Basic convolutional encoder for TD-MPC2 with raw image observations.
 	4 layers of convolution with ReLU activations, followed by a linear layer.
 	"""
 	assert in_shape[-1] == 64 # assumes rgb observations to be 64x64
-	layers = [
+	feature_layers = [
 		ShiftAug(), PixelPreprocess(),
 		nn.Conv2d(in_shape[0], num_channels, 7, stride=2), nn.ReLU(inplace=False),
 		nn.Conv2d(num_channels, num_channels, 5, stride=2), nn.ReLU(inplace=False),
 		nn.Conv2d(num_channels, num_channels, 3, stride=2), nn.ReLU(inplace=False),
 		nn.Conv2d(num_channels, num_channels, 3, stride=1), nn.Flatten()]
+	body = nn.Sequential(*feature_layers)
+	with torch.no_grad():
+		flat_dim = body(torch.zeros(1, *in_shape)).shape[-1]
+	projection = nn.Linear(flat_dim, out_dim)
+	modules = [body, projection]
 	if act:
-		layers.append(act)
-	return nn.Sequential(*layers)
+		modules.append(act)
+	return nn.Sequential(*modules)
 
 
 def enc(cfg, out={}):
@@ -158,7 +163,7 @@ def enc(cfg, out={}):
 		if k == 'state':
 			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg))
 		elif k == 'rgb':
-			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, act=SimNorm(cfg))
+			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:
 			raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
 	return nn.ModuleDict(out)
