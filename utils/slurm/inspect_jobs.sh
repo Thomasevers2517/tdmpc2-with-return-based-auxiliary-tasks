@@ -1,41 +1,57 @@
 #!/bin/bash
 ###############################################################################
-# Inspect SLURM jobs for the current user and show corresponding log files.
+# Inspect SLURM jobs for the current user and summarize GPU activity.
 #
-# - Runs squeue to list jobs (optionally filter by job name prefix)
+# - Runs squeue to list active jobs (optionally filter by job name prefix)
 # - Prints job metadata (JOBID, ARRAY_TASK, NAME, STATE, TIME, PARTITION, NODELIST)
-# - Attempts to locate matching log files under slurm_logs/YYYYMMDD/HHMMSS
-#   (and falls back to searching all subfolders under slurm_logs)
-# - Shows the last N lines (tail) of each located log (.out and .err)
+while IFS='|' read -r JOBID STATE NAME TIME PARTITION NODELIST ARRAY_TASK; do || true
 #
 # Usage:
-#   utils/slurm/inspect_jobs.sh [--name-prefix PREFIX] [--tail-lines N]
+#   utils/slurm/inspect_jobs.sh [--name-prefix PREFIX] [--max-jobs N] [--hosts-per-job M]
 #
 # Notes:
-# - This script is read-only: it does not modify or delete logs.
-# - It searches recursively within slurm_logs to handle dated/timestamped folders.
+# - Requires passwordless SSH access to the compute nodes allocated to the job.
+# - GPU stats are fetched with: nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,utilization.memory
+# - When no GPU data can be collected, the script reports the failure reason and continues.
 ###############################################################################
 set -euo pipefail
 
 NAME_PREFIX=""
-TAIL_LINES="50"
+MAX_JOBS=3
+HOSTS_PER_JOB=1
+ACTIVE_STATES=(RUNNING COMPLETING)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name-prefix) NAME_PREFIX="$2"; shift 2;;
-    --tail-lines) TAIL_LINES="$2"; shift 2;;
+    --max-jobs) MAX_JOBS="$2"; shift 2;;
+    --hosts-per-job) HOSTS_PER_JOB="$2"; shift 2;;
     -h|--help)
-      echo "Usage: $0 [--name-prefix PREFIX] [--tail-lines N]"; exit 0;;
+      echo "Usage: $0 [--name-prefix PREFIX] [--max-jobs N] [--hosts-per-job M]"; exit 0;;
     *) echo "Unknown argument: $1" >&2; exit 2;;
   esac
 done
 
+if ! [[ "$MAX_JOBS" =~ ^[0-9]+$ ]] || [[ "$MAX_JOBS" -le 0 ]]; then
+  echo "ERROR: --max-jobs must be a positive integer" >&2
+  exit 2
+fi
+
+if ! [[ "$HOSTS_PER_JOB" =~ ^[0-9]+$ ]] || [[ "$HOSTS_PER_JOB" -le 0 ]]; then
+  echo "ERROR: --hosts-per-job must be a positive integer" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-LOG_ROOT="${REPO_ROOT}/slurm_logs"
 
 if ! command -v squeue >/dev/null 2>&1; then
   echo "ERROR: squeue not found in PATH" >&2
+  exit 2
+fi
+
+if ! command -v scontrol >/dev/null 2>&1; then
+  echo "ERROR: scontrol not found in PATH" >&2
   exit 2
 fi
 
@@ -47,13 +63,33 @@ if [[ -z "$SQUEUE_OUT" ]]; then
   exit 0
 fi
 
-echo "Found jobs for $USER (filtered by name prefix: '${NAME_PREFIX}')"
+echo "Scanning active jobs for $USER (name prefix filter: '${NAME_PREFIX}')"
 echo
+
+JOB_COUNTER=0
+ACTIVE_FOUND=0
 
 while IFS='|' read -r JOBID STATE NAME TIME PARTITION NODELIST ARRAY_TASK; do
   # Optional filter by job name prefix
   if [[ -n "$NAME_PREFIX" ]] && [[ "$NAME" != ${NAME_PREFIX}* ]]; then
     continue
+  fi
+
+  IS_ACTIVE=false
+  for ACTIVE_STATE in "${ACTIVE_STATES[@]}"; do
+    if [[ "$STATE" == "$ACTIVE_STATE" ]]; then
+      IS_ACTIVE=true
+      break
+    fi
+  done
+  if [[ "$IS_ACTIVE" == false ]]; then
+    continue
+  fi
+
+  ((ACTIVE_FOUND++))
+  ((JOB_COUNTER++))
+  if (( JOB_COUNTER > MAX_JOBS )); then
+    break
   fi
 
   # Derive array index from JOBID suffix if present (e.g., 12345_7)
@@ -69,32 +105,50 @@ while IFS='|' read -r JOBID STATE NAME TIME PARTITION NODELIST ARRAY_TASK; do
 
   echo "JOB: ${JOBID_BASE}${ARRAY_IDX:+[$ARRAY_IDX]}  NAME: $NAME  STATE: $STATE  TIME: $TIME  PART: $PARTITION  NODE: $NODELIST"
 
-  # Build patterns to find logs. We search recursively under slurm_logs.
-  # Filenames from run_sweep.sh: %x_%A_%a.out/.err (jobname_jobid_arrayidx)
-  if [[ -n "$ARRAY_IDX" ]]; then
-    OUT_GLOB="${LOG_ROOT}/**/${NAME}_${JOBID_BASE}_${ARRAY_IDX}.out"
-    ERR_GLOB="${LOG_ROOT}/**/${NAME}_${JOBID_BASE}_${ARRAY_IDX}.err"
-  else
-    OUT_GLOB="${LOG_ROOT}/**/${NAME}_${JOBID_BASE}.out"
-    ERR_GLOB="${LOG_ROOT}/**/${NAME}_${JOBID_BASE}.err"
-  fi
-
-  shopt -s nullglob globstar
-  OUT_MATCH=( $OUT_GLOB )
-  ERR_MATCH=( $ERR_GLOB )
-  shopt -u globstar
-
-  if (( ${#OUT_MATCH[@]} == 0 && ${#ERR_MATCH[@]} == 0 )); then
-    echo "  Logs: not found under ${LOG_ROOT}"
+  if [[ -z "$NODELIST" || "$NODELIST" == "(null)" ]]; then
+    echo "  GPU: no nodes assigned yet"
     echo
     continue
   fi
 
-  for f in "${OUT_MATCH[@]}" "${ERR_MATCH[@]}"; do
-    [[ -e "$f" ]] || continue
-    echo "  Log: $f"
-    echo "  --- tail -n ${TAIL_LINES} ${f} ---"
-    tail -n "$TAIL_LINES" "$f" || true
+  mapfile -t HOST_CANDIDATES < <(scontrol show hostnames "$NODELIST" 2>/dev/null)
+
+  if (( ${#HOST_CANDIDATES[@]} == 0 )); then
+    echo "  GPU: unable to resolve hostnames for ${NODELIST}"
     echo
+    continue
+  fi
+
+  HOST_COUNT=0
+  for HOST in "${HOST_CANDIDATES[@]}"; do
+    ((HOST_COUNT++))
+    if (( HOST_COUNT > HOSTS_PER_JOB )); then
+      break
+    fi
+
+    echo "  GPU (${HOST}):"
+    GPU_QUERY=(nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,utilization.memory --format=csv,noheader)
+    if GPU_OUTPUT=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" "${GPU_QUERY[@]}" 2>&1); then
+      if [[ -z "$GPU_OUTPUT" ]]; then
+        echo "    No GPU data returned (empty response)"
+      else
+        while IFS= read -r LINE; do
+          echo "    $LINE"
+        done <<< "$GPU_OUTPUT"
+      fi
+    else
+      echo "    Failed to query nvidia-smi: $GPU_OUTPUT"
+    fi
   done
-done <<< "$SQUEUE_OUT"
+
+  if (( ${#HOST_CANDIDATES[@]} > HOSTS_PER_JOB )); then
+    echo "  GPU: remaining hosts skipped (total=${#HOST_CANDIDATES[@]}, shown=${HOSTS_PER_JOB})"
+  fi
+
+  echo
+
+done <<< "$SQUEUE_OUT" || true
+
+if (( ACTIVE_FOUND == 0 )); then
+  echo "No active jobs (states: ${ACTIVE_STATES[*]}) matched the given filters"
+fi
