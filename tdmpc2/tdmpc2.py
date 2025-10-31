@@ -116,6 +116,8 @@ class TDMPC2(torch.nn.Module):
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
+		self.detach_encoder = False
+
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
@@ -1026,6 +1028,8 @@ class TDMPC2(torch.nn.Module):
 		aux_fn = self.calculate_aux_value_loss
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
+			if self.detach_encoder:
+				grad_enabled = False
 			steps, batch = obs_seq.shape[0], obs_seq.shape[1]
 			flat_obs = obs_seq.reshape(steps * batch, *obs_seq.shape[2:])
 			if self.cfg.multitask:
@@ -1171,7 +1175,7 @@ class TDMPC2(torch.nn.Module):
 			if log_grads:
 				info = self.probe_wm_gradients(info)
 
-			self.optim.zero_grad(set_to_none=True)
+			self.optim.zero_grad(set_to_none=False)
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			if log_grads:
@@ -1179,7 +1183,7 @@ class TDMPC2(torch.nn.Module):
 			else:
 				self.optim_step()
     
-			self.optim.zero_grad(set_to_none=True)
+			self.optim.zero_grad(set_to_none=False)
 
 			if self.cfg.actor_source == 'ac':
 				z_for_pi = value_inputs['z_seq'].detach()
@@ -1196,7 +1200,7 @@ class TDMPC2(torch.nn.Module):
 				self.pi_optim.step()
 			else:
 				self.pi_optim_step()
-			self.pi_optim.zero_grad(set_to_none=True)
+			self.pi_optim.zero_grad(set_to_none=False)
 
 			self.model.soft_update_target_Q()
 			self.model.soft_update_policy_encoder_targets()
@@ -1248,6 +1252,9 @@ class TDMPC2(torch.nn.Module):
 			self.log_detailed = True
 		else:
 			self.log_detailed = False
+   
+		if self._step >= (1-self.cfg.detach_encoder_ratio) * self.cfg.steps:
+			self.detach_encoder = True
    
 		kwargs = {}
 		if task is not None:

@@ -25,13 +25,15 @@ parameters:
       # - cheetah-run
       - acrobot-swingup
       # - cartpole-swingup-sparse
-      - finger-turn-easy
+      # - finger-turn-easy
       # - finger-turn-hard
       - quadruped-walk
       # - quadruped-run
-      - walker-run
+      # - walker-run
 
       # - humanoid-run
+  detach_encoder_ratio:
+    values: [0.5, 0.2]  # fraction of training steps after which to detach encoder gradients
   search_pi_std_mult:
     values: [1]
 
@@ -82,7 +84,7 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1,2]
+    values: [1]
   ac_utd_multiplier:
     values: [1]
 
@@ -97,14 +99,14 @@ parameters:
 
 
   encoder_consistency_coef:
-    values: [0, 1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+    values: [1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
   multi_gamma_head: 
     values:
         # - joint 
         - separate
   seed:
-    values: [102, 203]
+    values: [102, 203, 304]
   best_eval: 
     values: [false]
 
@@ -132,9 +134,9 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 300000
+    value: 100000
   eval_freq:
-    value: 25000
+    value: 10000
 
   batch_size:
     value: 256
@@ -142,8 +144,8 @@ parameters:
     values: [5]
   obs:
     values:
-      - rgb
-      # - state
+      # - rgb
+      - state
   compile:
     value: true
   enable_wandb:

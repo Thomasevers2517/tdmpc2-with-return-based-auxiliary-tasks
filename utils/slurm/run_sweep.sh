@@ -11,18 +11,13 @@
 # - The tdmpc2 conda env must be available on the cluster
 #
 # Example:
-#   utils/slurm/run_sweep.sh \
-#     --sweep-dir sweep_list/midterm_sweep/1aux_value/rgb \
-#     --jobs 8 \
-#     --runs-per-job 4 \
-#     --time 02:00:00 \
-#     --partition gpu_a100 \
-#     --gpus 1 \
-#     --cpus 5 \
-#     --mem 8G \
-#     --account tdsei8531 \
-#     --job-name tdmpc2-sweep \
-#     --mail-user you@uni.edu  # optional
+
+  # utils/slurm/run_sweep.sh \
+  #   --sweep-dir sweep_list/midterm_sweep/1aux_value/rgb \
+  #   --jobs 8 \
+  #   --runs-per-job 4 \
+  #   --time 02:00:00 \
+
 ###############################################################################
 set -euo pipefail
 

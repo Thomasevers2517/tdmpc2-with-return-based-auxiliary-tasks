@@ -14,6 +14,7 @@ eval_freq: 10000
 
 best_eval: false
 
+detach_encoder_ratio: 0.0  # fraction of training steps after which to detach encoder gradients
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 # training

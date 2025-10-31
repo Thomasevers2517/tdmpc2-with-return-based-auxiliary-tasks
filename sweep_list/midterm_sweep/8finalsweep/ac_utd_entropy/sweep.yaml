@@ -13,7 +13,7 @@ parameters:
     values: 
       # - cartpole-balance
       # - cartpole-balance-sparse
-      # - cartpole-swingup-sparse
+      - cartpole-swingup-sparse
       # - cup-catch
       # - finger-spin
       # - reacher-easy
@@ -21,17 +21,18 @@ parameters:
       # - walker-stand
       # - walker-walk
       # - hopper-stand
-      # - hopper-hop
+      - hopper-hop
       # - cheetah-run
       - acrobot-swingup
       # - cartpole-swingup-sparse
-      - finger-turn-easy
+      # - finger-turn-easy
       # - finger-turn-hard
       - quadruped-walk
       # - quadruped-run
       - walker-run
 
-      # - humanoid-run
+  detach_encoder_ratio:
+    values: [0.5]  # fraction of training steps after which to detach encoder gradients
   search_pi_std_mult:
     values: [1]
 
@@ -66,7 +67,7 @@ parameters:
   # num_enc_layers:
   #   values: [2] # originally 2
   entropy_coef:
-    values: [1e-5] #originally 1e-4
+    values: [1e-5, 3e-5, 1e-4] #originally 1e-4
   hinge_coef:
     values: [0.01] #[0.01]
 
@@ -82,9 +83,9 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1,2]
-  ac_utd_multiplier:
     values: [1]
+  ac_utd_multiplier:
+    values: [2]
 
   lr:
     values: [3e-4]
@@ -97,14 +98,14 @@ parameters:
 
 
   encoder_consistency_coef:
-    values: [0, 1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+    values: [1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
   multi_gamma_head: 
     values:
         # - joint 
         - separate
   seed:
-    values: [102, 203]
+    values: [102, 203, 304, 405]
   best_eval: 
     values: [false]
 
@@ -132,9 +133,9 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 300000
+    value: 100000
   eval_freq:
-    value: 25000
+    value: 10000
 
   batch_size:
     value: 256
@@ -142,8 +143,8 @@ parameters:
     values: [5]
   obs:
     values:
-      - rgb
-      # - state
+      # - rgb
+      - state
   compile:
     value: true
   enable_wandb:
