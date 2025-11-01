@@ -430,6 +430,7 @@ class TDMPC2(torch.nn.Module):
 			actions = torch.empty(self.cfg.horizon, self.cfg.num_samples, self.cfg.action_dim, device=self.device)
 			if self.cfg.num_pi_trajs > 0:
 				actions[:, :self.cfg.num_pi_trajs] = pi_actions
+				pi_value = self._estimate_value(z[:self.cfg.num_pi_trajs], actions[:, :self.cfg.num_pi_trajs], task).nan_to_num(0)
 
 			# Iterate MPPI optimization loop (update mean/std over elite trajectories)
 			for _ in range(self.cfg.iterations):
@@ -442,7 +443,12 @@ class TDMPC2(torch.nn.Module):
 					actions = actions * self.model._action_masks[task]
 
 				# Compute elite actions
-				value = self._estimate_value(z, actions, task).nan_to_num(0)
+				sampled_value = self._estimate_value(z[self.cfg.num_pi_trajs:], actions[:, self.cfg.num_pi_trajs:], task).nan_to_num(0)
+				if self.cfg.num_pi_trajs > 0:
+					value = torch.cat([pi_value, sampled_value], dim=0)
+				else:
+					value = sampled_value
+     
 				elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
 				elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
 
@@ -460,6 +466,9 @@ class TDMPC2(torch.nn.Module):
 			return score, elite_actions, mean, std
 
 
+
+
+ 
 	def update_planner_mean(self, mean):
 		self._prev_mean.copy_(mean)
 		return 
