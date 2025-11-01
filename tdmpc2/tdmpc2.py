@@ -410,9 +410,7 @@ class TDMPC2(torch.nn.Module):
 
 	@torch.no_grad()
 	def _plan(self, obs, task=None):
-		"""
 
-		"""
 		# Sample policy trajectories: roll forward policy prior to seed action set
 		with maybe_range('Agent/plan', self.cfg):
 			z = self.model.encode(obs, task)
@@ -1043,6 +1041,8 @@ class TDMPC2(torch.nn.Module):
 				task_flat = task
 			with torch.set_grad_enabled(grad_enabled and torch.is_grad_enabled()):
 				latents_flat = self.model.encode(flat_obs, task_flat, use_ema=use_ema)
+			if self.detach_encoder:
+				latents_flat = latents_flat.detach()
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])
 
 		if not ac_only:
