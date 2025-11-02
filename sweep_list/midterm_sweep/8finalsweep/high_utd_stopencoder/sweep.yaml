@@ -21,7 +21,7 @@ parameters:
       # - walker-stand
       # - walker-walk
       # - hopper-stand
-      - hopper-hop
+      # - hopper-hop
       # - cheetah-run
       - acrobot-swingup
       # - cartpole-swingup-sparse
@@ -67,7 +67,7 @@ parameters:
   # num_enc_layers:
   #   values: [2] # originally 2
   entropy_coef:
-    values: [1e-4] #originally 1e-4
+    values: [3e-5] #originally 1e-4
   hinge_coef:
     values: [0.01] #[0.01]
 

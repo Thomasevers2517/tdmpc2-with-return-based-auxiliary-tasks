@@ -393,7 +393,8 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/estimate_value', self.cfg):
 			G, discount = 0, 1
-			termination = torch.zeros(self.cfg.num_samples, 1, dtype=torch.float32, device=z.device)
+
+			termination = torch.zeros( z.shape[0], 1, dtype=torch.float32, device=z.device)
 			for t in range(self.cfg.horizon):
 				reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
 				z = self.model.next(z, actions[t], task)

@@ -72,7 +72,7 @@ class OnlineTrainer(Trainer):
 		val_info_rand.update(self.common_metrics())
 		val_info_recent.update(self.common_metrics())
 		self.logger.log(val_info_rand, 'validation_all')
-		self.logger.log(val_info_recent, 'validation_recent') #TODO need to rename these such that we can log them separately in wandb
+		self.logger.log(val_info_recent, 'validation_recent') 
   
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),

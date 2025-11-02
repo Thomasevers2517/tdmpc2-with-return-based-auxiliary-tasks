@@ -11,9 +11,36 @@ metric:
 parameters:
   task:
     values: 
-      # - humanoid-walk
-      - humanoid-run
-      - dog-run
+      # - cartpole-balance
+      # - cartpole-balance-sparse
+      # - cartpole-swingup-sparse
+      # - cup-catch
+      # - finger-spin
+      # - reacher-easy
+      # - reacher-hard
+      # - walker-stand
+      # - walker-walk
+      # - hopper-stand
+      # - hopper-hop
+      # - cheetah-run
+      - acrobot-swingup
+      # - cartpole-swingup-sparse
+      # - finger-turn-easy
+      # - finger-turn-hard
+      - quadruped-walk
+      # - quadruped-run
+      # - walker-run
+
+  iterations: 
+    values: [6]
+  num_samples: 
+    values: [512]
+
+  num_pi_trajs: 
+    values: [24, 96, 256, 448, 512]
+
+  detach_encoder_ratio:
+    values: [0.5]  # fraction of training steps after which to detach encoder gradients
   search_pi_std_mult:
     values: [1]
 
@@ -64,7 +91,7 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [4]
+    values: [1]
   ac_utd_multiplier:
     values: [1]
 
@@ -114,9 +141,9 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 1000000
+    value: 100000
   eval_freq:
-    value: 50000
+    value: 10000
 
   batch_size:
     value: 256
@@ -135,5 +162,5 @@ parameters:
   wandb_entity:
     value: thomasevers9
   save_video:
-    value: true
+    value: false
 
