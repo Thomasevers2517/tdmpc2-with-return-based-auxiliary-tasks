@@ -102,7 +102,11 @@ temperature: 0.5
 # actor
 log_std_min: -10
 log_std_max: 2
-entropy_coef: 1e-4
+end_entropy_coeff: none
+start_entropy_coeff: 1e-4
+end_dynamic_entropy_ratio: 0.8
+start_dynamic_entropy_ratio: 0.2
+
 hinge_power: 4
 hinge_tau: 2.5
 hinge_coef: 0.01

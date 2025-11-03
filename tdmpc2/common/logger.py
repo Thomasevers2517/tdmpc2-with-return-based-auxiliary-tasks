@@ -28,6 +28,7 @@ CAT_TO_COLOR = {
 	"eval": "green",
 	"validation_all": "magenta",
 	"validation_recent": "cyan",
+	"policy_eval": "red",
 }
 
 

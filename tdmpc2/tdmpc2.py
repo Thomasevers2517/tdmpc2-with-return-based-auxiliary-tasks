@@ -116,8 +116,14 @@ class TDMPC2(torch.nn.Module):
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
-		self.detach_encoder = False
-
+		self.register_buffer(
+			"dynamic_entropy_coeff",
+			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
+		)
+		self.register_buffer(
+			"detach_encoder_flag",
+			torch.tensor(False, device=self.device, dtype=torch.bool),
+		)
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
@@ -393,8 +399,8 @@ class TDMPC2(torch.nn.Module):
 		"""
 		with maybe_range('Agent/estimate_value', self.cfg):
 			G, discount = 0, 1
-
-			termination = torch.zeros( z.shape[0], 1, dtype=torch.float32, device=z.device)
+			N_samples = z.shape[0]
+			termination = torch.zeros(N_samples, 1, dtype=torch.float32, device=z.device)
 			for t in range(self.cfg.horizon):
 				reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
 				z = self.model.next(z, actions[t], task)
@@ -444,11 +450,15 @@ class TDMPC2(torch.nn.Module):
 					actions = actions * self.model._action_masks[task]
 
 				# Compute elite actions
-				sampled_value = self._estimate_value(z[self.cfg.num_pi_trajs:], actions[:, self.cfg.num_pi_trajs:], task).nan_to_num(0)
-				if self.cfg.num_pi_trajs > 0:
-					value = torch.cat([pi_value, sampled_value], dim=0)
+				if self.cfg.num_pi_trajs != self.cfg.num_samples: 
+					sampled_value = self._estimate_value(z[self.cfg.num_pi_trajs:], actions[:, self.cfg.num_pi_trajs:], task).nan_to_num(0)
+					if self.cfg.num_pi_trajs > 0:
+						value = torch.cat([pi_value, sampled_value], dim=0)
+					else:
+						value = sampled_value
 				else:
-					value = sampled_value
+					sampled_value = pi_value
+
      
 				elite_idxs = torch.topk(value.squeeze(1), self.cfg.num_elites, dim=0).indices
 				elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
@@ -463,6 +473,9 @@ class TDMPC2(torch.nn.Module):
 				if self.cfg.multitask:
 					mean = mean * self.model._action_masks[task]
 					std = std * self.model._action_masks[task]
+				if self.cfg.num_pi_trajs == self.cfg.num_samples:
+					# No need to iterate if only using policy trajectories
+					break
 
 			return score, elite_actions, mean, std
 
@@ -582,9 +595,9 @@ class TDMPC2(torch.nn.Module):
 				else:
 					raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
 			elif self.cfg.actor_source == "imagine" or self.cfg.actor_source == "replay_rollout":
-				pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
+				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
 			elif self.cfg.actor_source == "replay_true":
-				pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
+				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
     
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -608,6 +621,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_presquash_abs_min": info["presquash_mean"].abs().min(),
 			"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
 			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
+			"entropy_coeff": self.dynamic_entropy_coeff
 				}, device=self.device)
 
 			return pi_loss, info
@@ -1028,7 +1042,7 @@ class TDMPC2(torch.nn.Module):
 
 		return loss_mean, info
 
-	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads):
+	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads, detach_encoder_active):
 		device = self.device
 
 		wm_fn = self.world_model_losses
@@ -1036,7 +1050,7 @@ class TDMPC2(torch.nn.Module):
 		aux_fn = self.calculate_aux_value_loss
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
-			if self.detach_encoder:
+			if detach_encoder_active:
 				grad_enabled = False
 			steps, batch = obs_seq.shape[0], obs_seq.shape[1]
 			flat_obs = obs_seq.reshape(steps * batch, *obs_seq.shape[2:])
@@ -1051,7 +1065,7 @@ class TDMPC2(torch.nn.Module):
 				task_flat = task
 			with torch.set_grad_enabled(grad_enabled and torch.is_grad_enabled()):
 				latents_flat = self.model.encode(flat_obs, task_flat, use_ema=use_ema)
-			if self.detach_encoder:
+			if detach_encoder_active:
 				latents_flat = latents_flat.detach()
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])
 
@@ -1168,9 +1182,9 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
 			if log_grads:
-				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads)
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag.item())
 			else:
-				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads)
+				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag.item())
     
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
@@ -1185,15 +1199,15 @@ class TDMPC2(torch.nn.Module):
 			if log_grads:
 				info = self.probe_wm_gradients(info)
 
-			self.optim.zero_grad(set_to_none=False)
+			self.optim.zero_grad(set_to_none=True)
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			if log_grads:
 				self.optim.step()
 			else:
 				self.optim_step()
-    
-			self.optim.zero_grad(set_to_none=False)
+
+			self.optim.zero_grad(set_to_none=True)
 
 			if self.cfg.actor_source == 'ac':
 				z_for_pi = value_inputs['z_seq'].detach()
@@ -1210,7 +1224,7 @@ class TDMPC2(torch.nn.Module):
 				self.pi_optim.step()
 			else:
 				self.pi_optim_step()
-			self.pi_optim.zero_grad(set_to_none=False)
+			self.pi_optim.zero_grad(set_to_none=True)
 
 			self.model.soft_update_target_Q()
 			self.model.soft_update_policy_encoder_targets()
@@ -1263,9 +1277,12 @@ class TDMPC2(torch.nn.Module):
 		else:
 			self.log_detailed = False
    
-		if self._step >= (1-self.cfg.detach_encoder_ratio) * self.cfg.steps:
-			self.detach_encoder = True
-   
+		detach_cutoff = (1 - self.cfg.detach_encoder_ratio) * self.cfg.steps
+		if self._step >= detach_cutoff:
+			self.detach_encoder_flag.fill_(True)
+		else:
+			self.detach_encoder_flag.fill_(False)
+		self.dynamic_entropy_coeff.fill_(self.get_entropy_coeff(self._step))
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
@@ -1298,8 +1315,8 @@ class TDMPC2(torch.nn.Module):
 			loss_parts['aux_value_mean'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_mean']
 
 
-		# don’t destroy graph grads; keep buffers allocated for CUDA-graph stability
-		self.optim.zero_grad(set_to_none=False)
+		# Drop existing grad buffers so cudagraph outputs are not mutated in-place
+		self.optim.zero_grad(set_to_none=True)
 
 		# Flatten all params once for grad calls and remember mapping
 		flat_params = []
@@ -1354,7 +1371,7 @@ class TDMPC2(torch.nn.Module):
 				obs, action, reward, terminated, task = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
-					components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only=False, log_grads=False)
+					components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only=False, log_grads=False, detach_encoder_active=False)
 					val_info = components['info']
 
 					
@@ -1376,3 +1393,32 @@ class TDMPC2(torch.nn.Module):
 			for key in infos[0].keys():
 				avg_info[key] = torch.stack([info[key] for info in infos], dim=0).mean(dim=0)
 		return avg_info.detach()
+
+
+	def get_entropy_coeff(self, step):
+		"""
+		Get the current entropy coefficient based on the training step.
+
+		Args:
+			step (int): Current training step.
+
+		Returns:
+			float: Current entropy coefficient.
+		"""
+		if self.cfg.end_entropy_coeff is None:
+			return float(self.cfg.start_entropy_coeff)
+		start_dynamic = int(self.cfg.start_dynamic_entropy_ratio * self.cfg.steps)
+		if self.cfg.end_dynamic_entropy_ratio == -1:
+			end_dynamic = start_dynamic
+		else:
+			end_dynamic = int(self.cfg.end_dynamic_entropy_ratio * self.cfg.steps)
+
+		if step < start_dynamic:
+			return float(self.cfg.start_entropy_coeff)
+		elif step > end_dynamic:
+			return float(self.cfg.end_entropy_coeff)
+		else:
+			lin_step = (step - start_dynamic) 
+			duration_dynamic = end_dynamic - start_dynamic
+			coeff = self.cfg.start_entropy_coeff + (self.cfg.end_entropy_coeff - self.cfg.start_entropy_coeff) * (lin_step / duration_dynamic)
+		return float(coeff)

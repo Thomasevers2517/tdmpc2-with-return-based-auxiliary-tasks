@@ -33,7 +33,7 @@ class OnlineTrainer(Trainer):
 			steps_per_second=self._step / elapsed_time
 		)
 
-	def eval(self):
+	def eval(self, mpc=True):
 		"""Evaluate a TD-MPC2 agent."""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
@@ -47,13 +47,14 @@ class OnlineTrainer(Trainer):
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, act_info = self.agent.act(obs, eval_mode=True, mpc=self.cfg.eval_mpc)
+				action, act_info = self.agent.act(obs, eval_mode=True, mpc=mpc)
 				action = action.cpu()
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
 				t += 1
 				if self.cfg.save_video:
 					self.logger.video.record(self.env)
+
 				val_td = self.to_td(obs, action, reward, info['terminated'])
 				self.val_tds.append(val_td)
      
@@ -64,16 +65,16 @@ class OnlineTrainer(Trainer):
 			ep_elite_mean.append(act_info.get('mean', torch.tensor(float('nan'))).abs().mean().cpu())
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
-
-			self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
-			self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
-   
-		val_info_rand, val_info_recent = self.validate()
-		val_info_rand.update(self.common_metrics())
-		val_info_recent.update(self.common_metrics())
-		self.logger.log(val_info_rand, 'validation_all')
-		self.logger.log(val_info_recent, 'validation_recent') 
-  
+			if mpc:
+				self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
+				self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
+		if mpc:
+			val_info_rand, val_info_recent = self.validate()
+			val_info_rand.update(self.common_metrics())
+			val_info_recent.update(self.common_metrics())
+			self.logger.log(val_info_rand, 'validation_all')
+			self.logger.log(val_info_recent, 'validation_recent') 
+	
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),
 			episode_success=np.nanmean(ep_successes),
@@ -109,16 +110,21 @@ class OnlineTrainer(Trainer):
 		train_metrics, done, eval_next = {}, True, False
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
-			if self._step % (self.cfg.eval_freq/self.cfg.utd_ratio) == 0:
+			if self._step % (self.cfg.eval_freq) == 0:
 				eval_next = True
 
 			# Reset environment
 			if done:
 				if eval_next:
-					eval_metrics = self.eval()
+					eval_metrics = self.eval(mpc=True)
 					eval_metrics.update(self.common_metrics())
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
+
+					policy_eval_metrics = self.eval(mpc=False)
+					policy_eval_metrics.update(self.common_metrics())
+					self.logger.log(policy_eval_metrics, 'policy_eval')
+     
 
 				if self._step > 0:
 					if info['terminated'] and not self.cfg.episodic:
@@ -148,7 +154,7 @@ class OnlineTrainer(Trainer):
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, info = self.agent.act(obs, mpc= self.cfg.train_mpc)
+				action, info = self.agent.act(obs, mpc=self.cfg.train_mpc)
 				action = action.cpu()
 			else:
 				action = self.env.rand_act()
