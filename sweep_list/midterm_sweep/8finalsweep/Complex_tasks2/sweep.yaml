@@ -10,41 +10,26 @@ metric:
   goal: maximize
 parameters:
   task:
-    values: 
-      # - cartpole-balance
-      # - cartpole-balance-sparse
-      # - cartpole-swingup-sparse
-      # - cup-catch
-      # - finger-spin
-      # - reacher-easy
-      # - reacher-hard
-      # - walker-stand
-      # - walker-walk
-      # - hopper-stand
-      # - hopper-hop
-      # - cheetah-run
-      - acrobot-swingup
-      # - cartpole-swingup-sparse
-      # - finger-turn-easy
-      # - finger-turn-hard
-      - quadruped-walk
-      # - quadruped-run
-      # - walker-run
+    values:
+      - dog-run
+      # - humanoid-walk
+      # - humanoid-run
+
 
   end_dynamic_entropy_ratio: 
     values: [1]
   start_dynamic_entropy_ratio: 
-    values: [0.5]
+    values: [0.8]
 
   start_entropy_coeff:
-    values: [1e-5]
+    values: [1e-4, 1e-5]
   end_entropy_coeff:
-    values: [1e-6, 1e-7]
+    values: [1e-7]
   dynamic_entropy_schedule:
     values: ["exponential"] # linear | exponential
 
   num_q:
-    values: [2]
+    values: [5, 2]
 
   iterations: 
     values: [6]
@@ -56,6 +41,8 @@ parameters:
 
   detach_encoder_ratio:
     values: [0.5]  # fraction of training steps after which to detach encoder gradients
+
+
   search_pi_std_mult:
     values: [1]
 
@@ -105,7 +92,7 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [2]
+    values: [4]
   ac_utd_multiplier:
     values: [1]
 
@@ -127,7 +114,7 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102, 203, 304]
+    values: [102, 203]
   best_eval: 
     values: [false]
 
@@ -155,14 +142,14 @@ parameters:
   # encoder_ema_tau:
   #   values: [0.05, 0.01]
   steps:
-    value: 100000
+    value: 1000000
   eval_freq:
-    value: 10000
+    value: 50000
 
   batch_size:
     value: 256
-  # model_size:
-  #   values: [5]
+  model_size:
+    values: [5]
   obs:
     values:
       # - rgb
@@ -176,5 +163,5 @@ parameters:
   wandb_entity:
     value: thomasevers9
   save_video:
-    value: false
+    value: true
 

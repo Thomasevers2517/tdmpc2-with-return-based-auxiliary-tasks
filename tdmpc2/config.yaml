@@ -104,8 +104,9 @@ log_std_min: -10
 log_std_max: 2
 end_entropy_coeff: none
 start_entropy_coeff: 1e-4
-end_dynamic_entropy_ratio: 0.8
-start_dynamic_entropy_ratio: 0.2
+end_dynamic_entropy_ratio: 1
+start_dynamic_entropy_ratio: 1
+dynamic_entropy_schedule : exponential  # linear | exponential
 
 hinge_power: 4
 hinge_tau: 2.5

@@ -1420,5 +1420,9 @@ class TDMPC2(torch.nn.Module):
 		else:
 			lin_step = (step - start_dynamic) 
 			duration_dynamic = end_dynamic - start_dynamic
-			coeff = self.cfg.start_entropy_coeff + (self.cfg.end_entropy_coeff - self.cfg.start_entropy_coeff) * (lin_step / duration_dynamic)
+			if self.cfg.dynamic_entropy_schedule == 'linear':
+				coeff = self.cfg.start_entropy_coeff + (self.cfg.end_entropy_coeff - self.cfg.start_entropy_coeff) * (lin_step / duration_dynamic)
+			elif self.cfg.dynamic_entropy_schedule == 'exponential':
+				ratio = lin_step / duration_dynamic
+				coeff = self.cfg.start_entropy_coeff * ( (self.cfg.end_entropy_coeff / self.cfg.start_entropy_coeff) ** ratio )
 		return float(coeff)
