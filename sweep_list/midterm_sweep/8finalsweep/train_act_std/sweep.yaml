@@ -31,13 +31,31 @@ parameters:
       # - quadruped-run
       # - walker-run
 
+  train_act_std_coeff:
+    values: [0, 0.1, 1]
+
+  end_dynamic_entropy_ratio: 
+    values: [1]
+  start_dynamic_entropy_ratio: 
+    values: [0.5]
+
+  start_entropy_coeff:
+    values: [1e-5]
+  end_entropy_coeff:
+    values: [1e-5]
+  dynamic_entropy_schedule:
+    values: ["exponential"] # linear | exponential
+
+  num_q:
+    values: [2]
+
   iterations: 
     values: [6]
   num_samples: 
     values: [512]
 
   num_pi_trajs: 
-    values: [24, 448]
+    values: [24]
 
   detach_encoder_ratio:
     values: [0.5]  # fraction of training steps after which to detach encoder gradients
@@ -45,7 +63,7 @@ parameters:
     values: [1]
 
   buffer_update_interval:
-    values: [100]
+    values: [30]
 
   policy_coef:
     values: [1] #seems it shouldnt increase
@@ -74,8 +92,7 @@ parameters:
     values: [1]
   # num_enc_layers:
   #   values: [2] # originally 2
-  entropy_coef:
-    values: [1e-5] #originally 1e-4
+
   hinge_coef:
     values: [0.01] #[0.01]
 
@@ -147,8 +164,8 @@ parameters:
 
   batch_size:
     value: 256
-  model_size:
-    values: [5]
+  # model_size:
+  #   values: [5]
   obs:
     values:
       # - rgb

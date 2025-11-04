@@ -12,9 +12,12 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+train_act_std_coeff: 1
+
+
 best_eval: false
 
-detach_encoder_ratio: 0.0  # fraction of training steps after which to detach encoder gradients
+detach_encoder_ratio: 0.5  # fraction of training steps after which to detach encoder gradients
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 # training
@@ -102,7 +105,7 @@ temperature: 0.5
 # actor
 log_std_min: -10
 log_std_max: 2
-end_entropy_coeff: none
+end_entropy_coeff: 1e-7
 start_entropy_coeff: 1e-4
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 1

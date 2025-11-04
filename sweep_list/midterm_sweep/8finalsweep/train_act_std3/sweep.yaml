@@ -1,0 +1,187 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  task:
+    values: 
+      # - cartpole-balance
+      # - cartpole-balance-sparse
+      # - cartpole-swingup-sparse
+      # - cup-catch
+      # - finger-spin
+      # - reacher-easy
+      # - reacher-hard
+      # - walker-stand
+      # - walker-walk
+      # - hopper-stand
+      # - hopper-hop
+      # # - cheetah-run
+      - acrobot-swingup
+      # - cartpole-swingup-sparse
+      # - finger-turn-easy
+      # - finger-turn-hard
+      - quadruped-walk
+      # - quadruped-run
+      # - walker-run
+
+
+  temperature:
+    values: [0.5, 0.1]
+    
+  train_act_std_coeff:
+    values: [0, 0.1]
+
+  end_dynamic_entropy_ratio: 
+    values: [1]
+  start_dynamic_entropy_ratio: 
+    values: [0.5]
+
+  start_entropy_coeff:
+    values: [1e-5]
+  end_entropy_coeff:
+    values: [1e-5]
+  dynamic_entropy_schedule:
+    values: ["exponential"] # linear | exponential
+
+  num_q:
+    values: [2]
+
+  iterations: 
+    values: [6]
+  num_samples: 
+    values: [512]
+
+  num_pi_trajs: 
+    values: [24]
+
+  detach_encoder_ratio:
+    values: [0.5]  # fraction of training steps after which to detach encoder gradients
+  search_pi_std_mult:
+    values: [1]
+
+  buffer_update_interval:
+    values: [30]
+
+  policy_coef:
+    values: [1] #seems it shouldnt increase
+
+  ema_value_planning:
+    values: [false] # false seems better, quicker model fixing
+
+  detach_imagine_value:
+    values: [false]
+  imagination_horizon:
+    values: [1]
+  pred_from: 
+    values: ["rollout"] # rollout, true_state or both
+  split_batch: 
+    values: [true] 
+  ac_source:
+    values: ["imagine"] # replay_rollout | imagine (controls critic/actor source)
+  actor_source:
+    values: ["replay_rollout"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+  aux_value_source:
+    values: ["replay_true"] # replay_true | replay_rollout | imagine
+
+  log_std_max:
+    values: [2]
+  reward_dim_div:
+    values: [1]
+  # num_enc_layers:
+  #   values: [2] # originally 2
+
+  hinge_coef:
+    values: [0.01] #[0.01]
+
+  imagine_value_loss_coef_mult:
+    values: [1] #[0.1, 0.01, 0] # 0 to disable
+  num_rollouts:
+    values: [4]
+
+
+  eval_mpc:
+    values: [true]
+  train_mpc:
+    values: [true]
+
+  utd_ratio:
+    values: [2]
+  ac_utd_multiplier:
+    values: [1]
+
+  lr:
+    values: [3e-4]
+  enc_lr_scale:
+    values: [0.3]
+  horizon:
+    values: [3]
+  rho:
+    values: [0.5]
+
+
+  encoder_consistency_coef:
+    values: [1]  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+
+  multi_gamma_head: 
+    values:
+        # - joint 
+        - separate
+  seed:
+    values: [102, 203, 304, 405]
+  best_eval: 
+    values: [false]
+
+  # Multi-gamma auxiliary value experiments (mirroring earlier setup)
+  multi_gamma_gammas:
+    values:
+      # - [0.97]
+      - [0.95]
+      # - [0.8, 0.95]
+      # - [0.9, 0.95]
+
+
+
+
+  joint_aux_dim_mult:
+    values: [1]
+  multi_gamma_loss_weight:
+    values: [0.1]
+  # policy_ema_enabled:
+  #   values: [false]
+  # policy_ema_tau:
+  #   values: [0.05] # 0.99 is half life of ~70 updates at tau=0.01. 0.05 is half life of ~14 updates.
+  # encoder_ema_enabled:
+  #   values: [false]
+  # encoder_ema_tau:
+  #   values: [0.05, 0.01]
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  batch_size:
+    value: 256
+  # model_size:
+  #   values: [5]
+  obs:
+    values:
+      # - rgb
+      - state
+  compile:
+    value: true
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
