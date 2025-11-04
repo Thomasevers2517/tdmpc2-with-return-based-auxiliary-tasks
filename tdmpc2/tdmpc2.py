@@ -379,7 +379,7 @@ class TDMPC2(torch.nn.Module):
 
 					return a, plan_info # TODO not bad idea to perhaps take mean of elites here instead. (this is argmax, used to be a sample)
 				else:
-					return (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1), plan_info
+					return (a + self.cfg.train_act_std_coeff*std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1), plan_info
 			z = self.model.encode(obs, task)
 			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:

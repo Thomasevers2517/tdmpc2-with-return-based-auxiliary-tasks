@@ -23,7 +23,7 @@ parameters:
       # - hopper-stand
       # - hopper-hop
       # # - cheetah-run
-      - acrobot-swingup
+      # - acrobot-swingup
       # - cartpole-swingup-sparse
       # - finger-turn-easy
       # - finger-turn-hard
@@ -34,9 +34,8 @@ parameters:
 
   temperature:
     values: [0.5, 0.1]
-    
   train_act_std_coeff:
-    values: [0, 0.1]
+    values: [1]
 
   end_dynamic_entropy_ratio: 
     values: [1]
@@ -46,7 +45,7 @@ parameters:
   start_entropy_coeff:
     values: [1e-5]
   end_entropy_coeff:
-    values: [1e-5]
+    values: [1e-7]
   dynamic_entropy_schedule:
     values: ["exponential"] # linear | exponential
 
@@ -112,7 +111,7 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [2]
+    values: [4]
   ac_utd_multiplier:
     values: [1]
 
@@ -134,9 +133,9 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102, 203, 304, 405]
+    values: [102, 203, 304]
   best_eval: 
-    values: [false]
+    values: [false, true]
 
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:

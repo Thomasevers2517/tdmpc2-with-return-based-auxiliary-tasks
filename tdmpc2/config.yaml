@@ -15,7 +15,7 @@ eval_freq: 10000
 train_act_std_coeff: 1
 
 
-best_eval: false
+best_eval: true
 
 detach_encoder_ratio: 0.5  # fraction of training steps after which to detach encoder gradients
 
