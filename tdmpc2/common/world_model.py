@@ -47,6 +47,7 @@ class WorldModel(nn.Module):
 		self._target_Vs = None
 		self.encoder_target_max_delta = 0.0
 		self.policy_target_max_delta = 0.0
+		self.v_target_max_delta = 0.0
 		if cfg.encoder_ema_enabled:
 			self._target_encoder = deepcopy(self._encoder)
 			for param in self._target_encoder.parameters():
@@ -293,6 +294,10 @@ class WorldModel(nn.Module):
 			# Also update state-value ensemble targets
 			if hasattr(self, '_target_Vs_params'):
 				self._target_Vs_params.lerp_(self._detach_Vs_params, self.cfg.tau)
+				# Track max delta between online and target V for debugging
+				online_v = parameters_to_vector(self._detach_Vs.parameters()).detach()
+				target_v = parameters_to_vector(self._target_Vs.parameters()).detach()
+				self.v_target_max_delta = torch.max(torch.abs(online_v - target_v)).item()
 			# Vectorized EMA for aux heads; emit debug checks if enabled
 			if getattr(self, '_aux_joint_Qs', None) is not None:
 				with torch.no_grad():

@@ -1304,6 +1304,10 @@ class TDMPC2(torch.nn.Module):
 			info.update({
 				'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device)
 			}, non_blocking=True)
+		# Always log V EMA drift to debug target stability
+		info.update({
+			'v_ema_max_delta': torch.tensor(self.model.v_target_max_delta, device=self.device)
+		}, non_blocking=True)
 
 		self.model.eval()
 		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
@@ -1359,6 +1363,7 @@ class TDMPC2(torch.nn.Module):
 			'encoder_consistency': self.cfg.encoder_consistency_coef * info['encoder_consistency_loss'],
 			'reward': self.cfg.reward_coef * info['reward_loss'],
 			'value': self.cfg.q_value_coef * info['value_loss'],
+			'v_value': self.cfg.v_value_coef * info['v_value_loss'],
 		}
 		if self.cfg.episodic:
 			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']
