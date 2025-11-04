@@ -99,6 +99,7 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Qs.parameters()},
+			{'params': self.model._Vs.parameters()},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
 		]
 		if getattr(self.cfg, 'multi_gamma_gammas', None) and len(self.cfg.multi_gamma_gammas) > 0:
@@ -107,6 +108,12 @@ class TDMPC2(torch.nn.Module):
 				param_groups.append({'params': self.model._aux_joint_Qs.parameters()})
 			elif self.model._aux_separate_Qs is not None:
 				for head in self.model._aux_separate_Qs:
+					param_groups.append({'params': head.parameters()})
+			# Add V-aux heads
+			if getattr(self.model, '_aux_joint_Vs', None) is not None:
+				param_groups.append({'params': self.model._aux_joint_Vs.parameters()})
+			elif getattr(self.model, '_aux_separate_Vs', None) is not None:
+				for head in self.model._aux_separate_Vs:
 					param_groups.append({'params': head.parameters()})
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
@@ -240,19 +247,31 @@ class TDMPC2(torch.nn.Module):
 		if actor_type == 'full':
 			policy_params.extend(hard_reset_module(self.model._pi, actor_layers, module_name='model._pi', logger=log))
 			critic_params.extend(hard_reset_module(self.model._Qs, actor_layers, module_name='model._Qs', logger=log))
+			critic_params.extend(hard_reset_module(self.model._Vs, actor_layers, module_name='model._Vs', logger=log))
 			if self.model._aux_joint_Qs is not None:
 				critic_params.extend(hard_reset_module(self.model._aux_joint_Qs, actor_layers, module_name='model._aux_joint_Qs', logger=log))
 			elif self.model._aux_separate_Qs is not None:
 				for idx, head in enumerate(self.model._aux_separate_Qs):
 					critic_params.extend(hard_reset_module(head, actor_layers, module_name=f'model._aux_separate_Qs[{idx}]', logger=log))
+			if getattr(self.model, '_aux_joint_Vs', None) is not None:
+				critic_params.extend(hard_reset_module(self.model._aux_joint_Vs, actor_layers, module_name='model._aux_joint_Vs', logger=log))
+			elif getattr(self.model, '_aux_separate_Vs', None) is not None:
+				for idx, head in enumerate(self.model._aux_separate_Vs):
+					critic_params.extend(hard_reset_module(head, actor_layers, module_name=f'model._aux_separate_Vs[{idx}]', logger=log))
 		elif actor_type == 'shrink_perturb':
 			policy_params.extend(shrink_perturb_module(self.model._pi, actor_layers, actor_alpha, actor_noise, module_name='model._pi', logger=log))
 			critic_params.extend(shrink_perturb_module(self.model._Qs, actor_layers, actor_alpha, actor_noise, module_name='model._Qs', logger=log))
+			critic_params.extend(shrink_perturb_module(self.model._Vs, actor_layers, actor_alpha, actor_noise, module_name='model._Vs', logger=log))
 			if self.model._aux_joint_Qs is not None:
 				critic_params.extend(shrink_perturb_module(self.model._aux_joint_Qs, actor_layers, actor_alpha, actor_noise, module_name='model._aux_joint_Qs', logger=log))
 			elif self.model._aux_separate_Qs is not None:
 				for idx, head in enumerate(self.model._aux_separate_Qs):
 					critic_params.extend(shrink_perturb_module(head, actor_layers, actor_alpha, actor_noise, module_name=f'model._aux_separate_Qs[{idx}]', logger=log))
+			if getattr(self.model, '_aux_joint_Vs', None) is not None:
+				critic_params.extend(shrink_perturb_module(self.model._aux_joint_Vs, actor_layers, actor_alpha, actor_noise, module_name='model._aux_joint_Vs', logger=log))
+			elif getattr(self.model, '_aux_separate_Vs', None) is not None:
+				for idx, head in enumerate(self.model._aux_separate_Vs):
+					critic_params.extend(shrink_perturb_module(head, actor_layers, actor_alpha, actor_noise, module_name=f'model._aux_separate_Vs[{idx}]', logger=log))
 		else:
 			log.info('Actor-critic reset skipped (type=%s)', actor_type)
 
@@ -660,12 +679,12 @@ class TDMPC2(torch.nn.Module):
 		"""
 		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		# Primary TD target distribution (still stored as distributional bins via CE loss)
-		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)  # (T,B,K)
+		# Bootstrap from state-value ensemble (min over two subsampled heads)
+		return reward + discount * (1-terminated) * self.model.V(next_z, task, return_type='min', target=True)
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
-		"""Compute auxiliary TD targets per gamma using Q_aux(min) bootstrap.
+		"""Compute auxiliary TD targets per gamma using V_aux bootstrap.
 
 		Uses a conservative (min over two sampled ensemble members) per-gamma
 		bootstrap produced internally by `Q_aux(return_type='min')`.
@@ -685,8 +704,8 @@ class TDMPC2(torch.nn.Module):
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
 			return None
-		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema)  # (G_aux,T,B,K) scalar per gamma (single head)
+		# State-only auxiliary values
+		bootstrap = self.model.V_aux(next_z, task, return_type='avg', target=self.cfg.auxiliary_value_ema)
 		if bootstrap is None:
 			return None
 		aux_targets = []
@@ -926,7 +945,12 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
-		"""Compute primary critic loss on arbitrary latent sequences."""
+		"""Compute primary critic losses (Q and V) on arbitrary latent sequences.
+
+		Returns:
+			(q_loss, v_loss, info)
+		Where info only contains the legacy Q-logging keys (value_*), per request.
+		"""
 		if z_td is None:
 			assert self.cfg.ac_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
 		T, B, _ = actions.shape
@@ -941,6 +965,7 @@ class TDMPC2(torch.nn.Module):
 		terminated = terminated.detach()
 
 		qs = self.model.Q(z_seq[:-1], actions, task, return_type='all')
+		v_logits = self.model.V(z_seq[:-1], task, return_type='all')
 		with torch.no_grad():
 			if z_td is not None:
 				td_targets = self._td_target(z_td, rewards, terminated, task)
@@ -948,21 +973,33 @@ class TDMPC2(torch.nn.Module):
 				td_targets = self._td_target(z_seq[1:], rewards, terminated, task)
 
 		Qe = qs.shape[0]
-		val_ce = math.soft_ce(
+		# Q loss
+		q_ce = math.soft_ce(
 			qs.reshape(Qe * T * B, K),
 			td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe * T * B, 1),
 			self.cfg,
 		).view(Qe, T, B, 1).mean(dim=(0, 2)).squeeze(-1)
+		q_weighted = q_ce * rho_pows
+		q_loss = q_weighted.mean()
 
-		weighted = val_ce * rho_pows
-		loss = weighted.mean()
+		# V loss (state-only)
+		v_ce = math.soft_ce(
+			v_logits.reshape(Qe * T * B, K),
+			td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe * T * B, 1),
+			self.cfg,
+		).view(Qe, T, B, 1).mean(dim=(0, 2)).squeeze(-1)
+		v_weighted = v_ce * rho_pows
+		v_loss = v_weighted.mean()
 
+		# Logging: keep legacy Q-only keys as 'value_*'
 		info = TensorDict({
-			'value_loss': loss
+			'value_loss': q_loss,
+			'v_value_loss': v_loss,
 		}, device=device, non_blocking=True)
 
 		for t in range(T):
-			info.update({f'value_loss/step{t}': val_ce[t]}, non_blocking=True)
+			info.update({f'value_loss/step{t}': q_ce[t]}, non_blocking=True)
+			info.update({f'v_value_loss/step{t}': v_ce[t]}, non_blocking=True)
 		value_pred = math.two_hot_inv(qs.reshape(Qe, T, B, K), self.cfg) # (Qe,T,B,1)
 		if self.log_detailed:
 			info.update({
@@ -979,14 +1016,22 @@ class TDMPC2(torch.nn.Module):
 		value_error = (value_pred - td_targets.unsqueeze(0).expand(Qe,-1, -1, -1).reshape(Qe, T, B, 1))
 		for i in range(T):
 			info.update({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
-						f"value_error_std/step{i}": value_error[:,i].std(),
-						f"value_error_max/step{i}": value_error[:,i].abs().max()}, non_blocking=True)
+					f"value_error_std/step{i}": value_error[:,i].std(),
+					f"value_error_max/step{i}": value_error[:,i].abs().max()}, non_blocking=True)
+
+		# V-value error logging (mirrors Q-value error metrics)
+		v_value_pred = math.two_hot_inv(v_logits.reshape(Qe, T, B, K), self.cfg)  # (Qe,T,B,1)
+		v_value_error = (v_value_pred - td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe, T, B, 1))
+		for i in range(T):
+			info.update({f"v_value_error_abs_mean/step{i}": v_value_error[:, i].abs().mean(),
+					f"v_value_error_std/step{i}": v_value_error[:, i].std(),
+					f"v_value_error_max/step{i}": v_value_error[:, i].abs().max()}, non_blocking=True)
 
 
-		return loss, info
+		return q_loss, v_loss, info
 
 	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
-		"""Compute auxiliary multi-gamma critic losses."""
+		"""Compute auxiliary multi-gamma state-value losses (V_aux)."""
 		if z_td is None:
 			assert self.cfg.aux_value_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
 		if self.model._num_aux_gamma == 0:
@@ -1002,7 +1047,7 @@ class TDMPC2(torch.nn.Module):
 		rewards = rewards.detach()
 		terminated = terminated.detach()
 
-		q_aux_logits = self.model.Q_aux(z_seq[:-1], actions, task, return_type='all')
+		q_aux_logits = self.model.V_aux(z_seq[:-1], task, return_type='all')
 		if q_aux_logits is None:
 			return torch.zeros((), device=device), TensorDict({}, device=device)
 
@@ -1042,12 +1087,14 @@ class TDMPC2(torch.nn.Module):
 
 		return loss_mean, info
 
+
 	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads, detach_encoder_active):
 		device = self.device
 
 		wm_fn = self.world_model_losses
-		value_fn = self.calculate_value_loss
+		q_value_fn = self.calculate_value_loss
 		aux_fn = self.calculate_aux_value_loss
+		# V primary loss is computed inside calculate_value_loss
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
 			if detach_encoder_active:
@@ -1121,7 +1168,7 @@ class TDMPC2(torch.nn.Module):
 		value_inputs = fetch_source(self.cfg.ac_source)
 		
 
-		value_loss, value_info = value_fn(
+		q_value_loss, v_value_loss, q_value_info = q_value_fn(
 			value_inputs['z_seq'],
 			value_inputs['actions'],
 			value_inputs['rewards'],
@@ -1148,25 +1195,30 @@ class TDMPC2(torch.nn.Module):
 
 		info = TensorDict({}, device=device)
 		info.update(wm_info, non_blocking=True)
-		info.update(value_info, non_blocking=True)
+		info.update(q_value_info, non_blocking=True)
 		info.update(aux_info, non_blocking=True)
   
-		critic_weighted = self.cfg.value_coef * value_loss
-		critic_weighted =  critic_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_weighted
+		critic_q_weighted = self.cfg.q_value_coef * q_value_loss
+		critic_q_weighted =  critic_q_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_q_weighted
+		critic_v_weighted = self.cfg.v_value_coef * v_value_loss
+		critic_v_weighted =  critic_v_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_v_weighted
 		aux_weighted =  self.cfg.multi_gamma_loss_weight * aux_loss
 		aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.aux_value_source == 'imagine' else aux_weighted
 
-		total_loss = wm_loss + critic_weighted + aux_weighted
+		total_loss = wm_loss + critic_q_weighted + critic_v_weighted + aux_weighted
 		info.update({
 			'total_loss': total_loss,
 			'wm_loss': wm_loss,
-			'value_loss_weighted': critic_weighted,
+			'value_loss_weighted': critic_q_weighted,
+			'v_value_loss_weighted': critic_v_weighted,
 			'aux_loss_mean_weighted': aux_weighted
 		}, non_blocking=True)
 
 		return {
 			'wm_loss': wm_loss,
-			'value_loss': value_loss,
+			'value_loss': q_value_loss,  # legacy key for Q
+			'q_value_loss': q_value_loss,
+			'v_value_loss': v_value_loss,
 			'aux_loss': aux_loss,
 			'info': info,
 			'z_true': z_true,
@@ -1187,7 +1239,6 @@ class TDMPC2(torch.nn.Module):
 				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag.item())
     
 			wm_loss = components['wm_loss']
-			value_loss = components['value_loss']
 			aux_loss = components['aux_loss']
 			info = components['info']
 			z_true = components['z_true']
@@ -1302,12 +1353,12 @@ class TDMPC2(torch.nn.Module):
 	def probe_wm_gradients(self, info):
 		groups = self._grad_param_groups()
 
-		# Build loss parts as you already do
+		# Build loss parts (log Q only, legacy key names)
 		loss_parts = {
 			'consistency': self.cfg.consistency_coef * info['consistency_loss'],
 			'encoder_consistency': self.cfg.encoder_consistency_coef * info['encoder_consistency_loss'],
 			'reward': self.cfg.reward_coef * info['reward_loss'],
-			'value': self.cfg.value_coef * info['value_loss'],
+			'value': self.cfg.q_value_coef * info['value_loss'],
 		}
 		if self.cfg.episodic:
 			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']

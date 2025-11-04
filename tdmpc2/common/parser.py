@@ -120,6 +120,8 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		assert len(gammas) <= 6, f'multi_gamma supports at most 6 auxiliary gammas (got {len(gammas)}).'
 		assert cfg.multi_gamma_head in {'joint', 'separate'}, f"Invalid multi_gamma_head {cfg.multi_gamma_head}."
 
-	assert (cfg.value_coef > 0 )
+	# Require explicit coefficients for Q and V losses; no fallbacks
+	assert hasattr(cfg, 'q_value_coef') and (cfg.q_value_coef > 0), 'Missing or non-positive q_value_coef in config.'
+	assert hasattr(cfg, 'v_value_coef') and (cfg.v_value_coef > 0), 'Missing or non-positive v_value_coef in config.'
  
 	return cfg_to_dataclass(cfg)
