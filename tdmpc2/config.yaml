@@ -12,6 +12,8 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+fix_value_est: true
+
 train_act_std_coeff: 1
 
 
