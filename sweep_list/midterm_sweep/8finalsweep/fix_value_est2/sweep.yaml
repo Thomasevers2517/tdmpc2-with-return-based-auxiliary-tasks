@@ -42,7 +42,7 @@ parameters:
     values: [0.5]
 
   start_entropy_coeff:
-    values: [1e-4]
+    values: [1e-5]
   end_entropy_coeff:
     values: [1e-6]
   dynamic_entropy_schedule:

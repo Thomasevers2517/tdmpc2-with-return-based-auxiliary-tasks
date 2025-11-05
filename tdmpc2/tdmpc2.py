@@ -401,7 +401,9 @@ class TDMPC2(torch.nn.Module):
 			G, discount = 0, 1
 			N_samples = z.shape[0]
 			termination = torch.zeros(N_samples, 1, dtype=torch.float32, device=z.device)
-			for t in range(self.cfg.horizon-1):
+			for t in range(self.cfg.horizon):
+				if self.cfg.fix_value_est and t == self.cfg.horizon - 1:
+					break
 				reward = math.two_hot_inv(self.model.reward(z, actions[t], task), self.cfg)
 				z = self.model.next(z, actions[t], task)
 				G = G + discount * (1-termination) * reward
@@ -409,6 +411,7 @@ class TDMPC2(torch.nn.Module):
 				discount = discount * discount_update
 				if self.cfg.episodic:
 					termination = torch.clip(termination + (self.model.termination(z, task) > 0.5).float(), max=1.)
+     
 			if self.cfg.fix_value_est:
 				action = actions[-1]
 			else:

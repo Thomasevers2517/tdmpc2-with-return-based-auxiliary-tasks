@@ -177,6 +177,20 @@ echo "Conda environment activated."
 python -V
 which python
 
+# Ensure user site-packages do not shadow the conda env (prevents ~/.local installs from overriding)
+export PYTHONNOUSERSITE=1
+
+# Helpful diagnostics: print TorchRL / TensorDict versions actually in use
+python - <<'PYVERS'
+try:
+  import torchrl, tensordict
+  print(f"TorchRL version: {getattr(torchrl, '__version__', 'unknown')}")
+  print(f"TensorDict version: {getattr(tensordict, '__version__', 'unknown')}")
+except Exception as e:
+  print(f"Version check failed: {e}")
+PYVERS
+
+
 mkdir -p "${TMPDIR:-/tmp}/wandb"
 export WANDB_DIR="${TMPDIR:-/tmp}/wandb"
 
