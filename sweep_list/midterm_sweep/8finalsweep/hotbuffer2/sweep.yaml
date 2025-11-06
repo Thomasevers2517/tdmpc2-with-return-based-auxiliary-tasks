@@ -30,10 +30,13 @@ parameters:
       - quadruped-walk
       # - quadruped-run
       # - walker-run
-  sampler:
-    values: 
-      - recency_prioritized
-      # - uniform
+  
+  hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
+    values: [true]
+  hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
+    values: [0.03, 0.01]
+  hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+    values: [30, 100]
   
   fix_value_est:
     values: [false]
@@ -70,7 +73,7 @@ parameters:
     values: [1]
 
   buffer_update_interval:
-    values: [30]
+    values: [5,30]
 
   policy_coef:
     values: [1] #seems it shouldnt increase
@@ -137,7 +140,7 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102, 203, 304, 405]
+    values: [102, 203, 304]
   best_eval: 
     values: [true]
 
