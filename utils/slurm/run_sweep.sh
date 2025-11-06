@@ -159,8 +159,9 @@ echo "Partition: ${SLURM_JOB_PARTITION:-?} | GPUs: ${SLURM_GPUS:-?}"
 echo "Submit dir: ${SLURM_SUBMIT_DIR:-?}"
 echo "TMPDIR: ${TMPDIR:-/tmp}"
 
-module purge
-module load 2025
+# module purge
+module load 2024
+module load CUDA/12.6.0
 
 echo "Modules loaded"
 
@@ -179,6 +180,8 @@ which python
 
 # Ensure user site-packages do not shadow the conda env (prevents ~/.local installs from overriding)
 export PYTHONNOUSERSITE=1
+export MUJOCO_GL=egl
+
 
 # Helpful diagnostics: print TorchRL / TensorDict versions actually in use
 python - <<'PYVERS'

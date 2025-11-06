@@ -1,0 +1,38 @@
+name: tdmpc2
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip=24.0
+  - gymnasium=0.29.1
+  - imageio=2.34.1
+  - h5py=3.11.0
+  - hydra-core=1.3.2
+  - hydra-submitit-launcher=1.2.0
+  - submitit=1.5.1
+  - omegaconf=2.3.0
+  - absl-py
+  - moviepy=1.0.3
+  - numpy=1.24.4
+  - kornia
+  - termcolor=2.4.0
+  - tqdm=4.66.4
+  - pandas=2.0.3
+  - wandb
+
+  # leave out: glew, ffmpeg, imageio-ffmpeg
+  - pip:
+      - tensordict==0.7.0
+      - torchrl==0.7.0
+      - glfw==2.7.0
+      - ffmpeg==1.4
+      - imageio-ffmpeg==0.4.9
+      - dm-control
+      - mujoco==3.1.2
+
+# afterwards
+# afterwards install torch pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.6.0
+

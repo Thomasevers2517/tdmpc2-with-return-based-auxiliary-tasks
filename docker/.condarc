@@ -1,7 +1,7 @@
-channels:
-  - pytorch-nightly
-  - nvidia
-  - conda-forge
-  - defaults
-channel_priority: flexible
-solver: libmamba
+# channels:
+#   - pytorch-nightly
+#   - nvidia
+#   - conda-forge
+#   - defaults
+# channel_priority: flexible
+# solver: libmamba

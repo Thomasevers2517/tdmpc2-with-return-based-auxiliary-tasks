@@ -61,8 +61,8 @@ class OnlineTrainer(Trainer):
 			ep_rewards.append(ep_reward)
 			ep_successes.append(info['success'])
 			ep_lengths.append(t)
-			ep_elite_std.append(act_info.get('std', torch.tensor(float('nan'))).mean().cpu())
-			ep_elite_mean.append(act_info.get('mean', torch.tensor(float('nan'))).abs().mean().cpu())
+			ep_elite_std.append(act_info['std'].mean().cpu())
+			ep_elite_mean.append(act_info['mean'].abs().mean().cpu())
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 			if mpc:

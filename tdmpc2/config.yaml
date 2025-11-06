@@ -12,7 +12,14 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
-fix_value_est: true
+
+prioritized_alpha: 1
+prioritized_beta: 0
+prioritized_eps: 1e-8
+
+sampler: uniform
+
+fix_value_est: false
 
 train_act_std_coeff: 1
 
