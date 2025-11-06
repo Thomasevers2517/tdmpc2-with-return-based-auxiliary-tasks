@@ -367,12 +367,12 @@ class TDMPC2(torch.nn.Module):
 				actions = torch.index_select(elite_actions, 1, idx).squeeze(1)
 				a, std = actions[0], std[0]
 				
-				plan_info = TensorDict({
+				plan_info = dict({
 						'score': score,
 						'elite_actions': elite_actions,
 						'mean': mean,
 						'std': std
-					}, device=std.device, non_blocking=True)
+					})
     
 				self.update_planner_mean(mean)
 				if eval_mode:
@@ -384,7 +384,7 @@ class TDMPC2(torch.nn.Module):
 			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:
 				action = info["mean"]
-			return action[0], TensorDict({}, device=action.device, non_blocking=True)
+			return action[0], dict({})
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
