@@ -13,11 +13,6 @@ eval_episodes: 10
 eval_freq: 10000
 
 
-prioritized_alpha: 1
-prioritized_beta: 0
-prioritized_eps: 1e-8
-
-sampler: uniform # recency_prioritized | uniform
 
 fix_value_est: false
 

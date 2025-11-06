@@ -19,12 +19,10 @@ class Buffer():
 		self.cfg = cfg
 		self._device = torch.device('cuda:0')
 		self._capacity = min(cfg.buffer_size, cfg.steps)
-		# Track global transition index and ring-buffer metadata to set priorities for new items
-		self._global_step = 0  # monotonically increasing transition counter (used for recency priority)
-		self._write_index = 0  # next write position in storage (ring buffer)
+
 		self._size = 0         # number of valid items currently in storage (<= capacity)
-		if self.cfg.sampler == 'uniform':
-			self._sampler = SliceSampler(
+
+		self._sampler = SliceSampler(
 				num_slices=self.cfg.batch_size,
 				end_key=None,
 				traj_key='episode',
@@ -32,24 +30,7 @@ class Buffer():
 				strict_length=True,
 				cache_values=cfg.multitask,
 			)
-		elif self.cfg.sampler == 'recency_prioritized':
-			from torchrl.data.replay_buffers.samplers import PrioritizedSliceSampler
-			self._sampler = PrioritizedSliceSampler(
-				max_capacity=self._capacity,
-				num_slices=self.cfg.batch_size,
-				alpha=self.cfg.prioritized_alpha,
-				beta=self.cfg.prioritized_beta,
-				eps=self.cfg.prioritized_eps,
-				reduction='max',
-				end_key=None,
-				traj_key='episode',
-				truncated_key=None,
-				strict_length=True,
-				cache_values=cfg.multitask,
-				max_priority_within_buffer=True,
-			)
-			log.info('Initialized recency_prioritized sampler: alpha=%s, beta=%s, reduction=max, capacity=%s', cfg.prioritized_alpha, cfg.prioritized_beta, self._capacity)
-   
+		
 		self._batch_size = cfg.batch_size * (cfg.horizon+1)
 		self._num_eps = 0
 
@@ -121,31 +102,11 @@ class Buffer():
 		num_new_eps = len(td)
 		episode_idx = torch.arange(self._num_eps, self._num_eps+num_new_eps, dtype=torch.int64)
 		td['episode'] = episode_idx.unsqueeze(-1).expand(-1, td['reward'].shape[1])
-		# Stamp chunk-level recency priority if using prioritized sampling
-		if self.cfg.sampler == 'recency_prioritized':
-			steps_shape = td['reward'].shape
-			n_elems = steps_shape[0] * steps_shape[1]
-			chunk_priority = self._global_step + n_elems
-			self._global_step += n_elems
-			td['steps'] = torch.full(steps_shape, chunk_priority, dtype=torch.long)
-		if self._num_eps == 0:
-			self._buffer = self._init(td[0])
+
+		self._buffer = self._init(td[0])
 		td = td.reshape(td.shape[0]*td.shape[1])
-		# If prioritized, update priorities for new range based on recency (use steps as float)
-		if self.cfg.sampler == 'recency_prioritized':
-			priorities = td.get('steps').to(torch.float32)
-			# Compute ring indices where data will be written
-			n = priorities.shape[0]
-			idx = (torch.arange(n, dtype=torch.long) + self._write_index) % self._capacity
-			self._buffer.extend(td)
-			# Update internal sampler priorities
-			self._buffer.update_priority(index=idx, priority=priorities)
-			# Advance ring pointers
-			self._write_index = int((self._write_index + n) % self._capacity)
-			self._size = min(self._size + n, self._capacity)
-			log.info('Buffer.load: added=%s, chunk_priority=%.0f, write_idx=[%s..%s], size=%s, num_eps=%s', n, priorities[0].item(), (int(self._write_index - n) % self._capacity), (int(self._write_index - 1) % self._capacity), self._size, self._num_eps + num_new_eps)
-		else:
-			self._buffer.extend(td)
+
+		self._buffer.extend(td)
 		self._num_eps += num_new_eps
 		self._primed = False
 		self._prefetched_td_gpu = None
@@ -159,28 +120,11 @@ class Buffer():
 	def add(self, td, end_episode):
 		"""Add an episode to the buffer."""
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
-		# Stamp chunk-level recency priority if using prioritized sampling
-		if self.cfg.sampler == 'recency_prioritized':
-			steps_shape = td['reward'].shape
-			n_elems = steps_shape[0] * steps_shape[1]
-			chunk_priority = self._global_step + n_elems
-			self._global_step += n_elems
-			td['steps'] = torch.full(steps_shape, chunk_priority, dtype=torch.long)
+
 		if self._num_eps == 0:
 			self._buffer = self._init(td)
-		if self.cfg.sampler == 'recency_prioritized':
-			# Flatten view to compute contiguous indices and priorities
-			td_flat = td.reshape(td.shape[0]*td.shape[1])
-			priorities = td_flat.get('steps').to(torch.float32)
-			n = priorities.shape[0]
-			idx = (torch.arange(n, dtype=torch.long) + self._write_index) % self._capacity
-			self._buffer.extend(td_flat)
-			self._buffer.update_priority(index=idx, priority=priorities)
-			self._write_index = int((self._write_index + n) % self._capacity)
-			self._size = min(self._size + n, self._capacity)
-			log.info('Buffer.add: added=%s, chunk_priority=%.0f, write_idx=[%s..%s], size=%s, ep=%s, end_ep=%s', n, priorities[0].item(), (int(self._write_index - n) % self._capacity), (int(self._write_index - 1) % self._capacity), self._size, self._num_eps, end_episode)
-		else:
-			self._buffer.extend(td)
+
+		self._buffer.extend(td)
 		if end_episode:
 			self._num_eps += 1
 		self._primed = False
