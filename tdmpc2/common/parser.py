@@ -123,5 +123,10 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# Require explicit coefficients for Q and V losses; no fallbacks
 	assert hasattr(cfg, 'q_value_coef') and (cfg.q_value_coef > 0), 'Missing or non-positive q_value_coef in config.'
 	assert hasattr(cfg, 'v_value_coef') and (cfg.v_value_coef > 0), 'Missing or non-positive v_value_coef in config.'
+
+	# Mode compatibility: using soft state-value targets requires imagined source, since replay
+	# does not carry per-step policy entropy terms.
+	if hasattr(cfg, 'state_value_targets') and cfg.state_value_targets:
+		assert cfg.ac_source == 'imagine', 'state_value_targets=True requires ac_source=="imagine" (replay lacks entropy terms).'
  
 	return cfg_to_dataclass(cfg)

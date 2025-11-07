@@ -159,7 +159,7 @@ echo "Partition: ${SLURM_JOB_PARTITION:-?} | GPUs: ${SLURM_GPUS:-?}"
 echo "Submit dir: ${SLURM_SUBMIT_DIR:-?}"
 echo "TMPDIR: ${TMPDIR:-/tmp}"
 
-module purge
+# module purge
 module load 2025
 
 echo "Modules loaded"
@@ -179,6 +179,7 @@ which python
 
 mkdir -p "${TMPDIR:-/tmp}/wandb"
 export WANDB_DIR="${TMPDIR:-/tmp}/wandb"
+export PYTHONNOUSERSITE=1
 
 # Read and login to W&B
 if [[ ! -s "${KEY_FILE}" ]]; then

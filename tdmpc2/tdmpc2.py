@@ -386,12 +386,12 @@ class TDMPC2(torch.nn.Module):
 				actions = torch.index_select(elite_actions, 1, idx).squeeze(1)
 				a, std = actions[0], std[0]
 				
-				plan_info = TensorDict({
+				plan_info = dict({
 						'score': score,
 						'elite_actions': elite_actions,
 						'mean': mean,
 						'std': std
-					}, device=std.device, non_blocking=True)
+					})
     
 				self.update_planner_mean(mean)
 				if eval_mode:
@@ -403,7 +403,7 @@ class TDMPC2(torch.nn.Module):
 			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:
 				action = info["mean"]
-			return action[0], TensorDict({}, device=action.device, non_blocking=True)
+			return action[0], dict({})
 
 	@torch.no_grad()
 	def _estimate_value(self, z, actions, task):
@@ -607,16 +607,20 @@ class TDMPC2(torch.nn.Module):
 			rho_pows = torch.pow(self.cfg.rho,
 				torch.arange(z.shape[0], device=self.device)
 			)
-			# Loss is a weighted sum of Q-values
+			# Policy objective design (per user intent):
+			# Actor optimizes: (Q_raw / S) + α * H.
+			# We intentionally DO NOT rescale H by S here; exploration pressure increases as S grows.
+			# Scaling adjustments for matching critic targets are handled only in V-target construction.
+			entropy_term = info["scaled_entropy"]  # raw (already action-dimension scaled)
 			if self.cfg.actor_source == "ac":
 				if self.cfg.ac_source == "imagine" or self.cfg.ac_source == "replay_rollout":
-					pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
+					pi_loss = (-(self.cfg.entropy_coef * entropy_term + qs).mean(dim=(1,2)) * rho_pows).mean()
 				else:
 					raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
 			elif self.cfg.actor_source == "imagine" or self.cfg.actor_source == "replay_rollout":
-				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
+				pi_loss = (-(self.dynamic_entropy_coeff * entropy_term + qs).mean(dim=(1,2)) * rho_pows).mean()
 			elif self.cfg.actor_source == "replay_true":
-				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
+				pi_loss = (-(self.dynamic_entropy_coeff * entropy_term + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
     
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -909,6 +913,7 @@ class TDMPC2(torch.nn.Module):
 		z_seq = []
 		actions = torch.zeros(rollout_len, total, A, device=device, dtype=dtype)
 		rewards = torch.zeros(rollout_len, total, 1, device=device, dtype=dtype)
+		entropies = torch.zeros(rollout_len, total, 1, device=device, dtype=dtype)
 		term_logits = torch.zeros(rollout_len, total, 1, device=device, dtype=dtype)
 
 		z_seq.append(start_rep)
@@ -918,8 +923,14 @@ class TDMPC2(torch.nn.Module):
 			with torch.no_grad():
 				for t in range(rollout_len):
 					current_latents = latents
-					action_t, _ = self.model.pi(current_latents, task, use_ema=self.cfg.policy_ema_enabled)
+					action_t, pi_info = self.model.pi(current_latents, task, use_ema=self.cfg.policy_ema_enabled)
 					actions[t] = action_t
+					# Store the exact per-step policy entropy used during rollout (scaled form to match policy loss)
+					# Ensure shape (total, 1)
+					step_entropy = pi_info["scaled_entropy"].detach()
+					if step_entropy.ndim == 1:
+						step_entropy = step_entropy.unsqueeze(-1)
+					entropies[t] = step_entropy
 					reward_logits = self.model.reward(current_latents, action_t, task)
 					rewards[t] = math.two_hot_inv(reward_logits, self.cfg)
 					next_latents = self.model.next(current_latents, action_t, task)
@@ -938,13 +949,14 @@ class TDMPC2(torch.nn.Module):
 			'z_seq': z_seq, # the first latent comes from the encoder and not imagination, this is not detached when not ac_only.
 			'actions': actions.detach(),
 			'rewards': rewards.detach(),
+			'entropies': entropies.detach(),
 			'terminated': terminated.detach(),
 			'termination_logits': term_logits.detach(),
 		}
 
 
 
-	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
+	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None, entropies: torch.Tensor | None = None):
 		"""Compute primary critic losses (Q and V) on arbitrary latent sequences.
 
 		Returns:
@@ -972,6 +984,16 @@ class TDMPC2(torch.nn.Module):
 			else:
 				td_targets = self._td_target(z_seq[1:], rewards, terminated, task)
 
+		# Runtime alignment checks when using soft V targets with entropies
+		if getattr(self.cfg, 'state_value_targets', False) and entropies is not None:
+			# Expect shapes: entropies (T,B,1), rewards (T,B,1), td_targets (T,B,1), z_seq[:-1] (T,B,*)
+			if entropies.ndim == 2:
+				entropies = entropies.unsqueeze(-1)
+			if entropies.shape[0] != z_seq.shape[0]-1 or entropies.shape[0] != td_targets.shape[0]:
+				raise RuntimeError(f"Entropy/TD time mismatch: entropies T={entropies.shape[0]}, td_targets T={td_targets.shape[0]}, z_seq T={z_seq.shape[0]-1}")
+			if entropies.shape[1] != td_targets.shape[1] or entropies.shape[-1] != 1:
+				raise RuntimeError(f"Entropy/TD batch or last-dim mismatch: entropies {tuple(entropies.shape)}, td_targets {tuple(td_targets.shape)}")
+
 		Qe = qs.shape[0]
 		# Q loss
 		q_ce = math.soft_ce(
@@ -983,9 +1005,27 @@ class TDMPC2(torch.nn.Module):
 		q_loss = q_weighted.mean()
 
 		# V loss (state-only)
+		# SAC v1-style: train V(s_t) to match E_{a_t~pi}[ Q(s_t,a_t) + α (-log π(a_t|s_t)) ] directly (no bootstrap).
+		# Use the actions and entropies from the selected value source (imagine), no recomputation.
+		if getattr(self.cfg, 'state_value_targets', False):
+			if entropies is None:
+				raise RuntimeError('state_value_targets=True requires entropies from imagined rollout.')
+			# Q under the same actions used in the sequence; detach to avoid updating Q with V loss
+			q_pi_current = self.model.Q(z_seq[:-1], actions, task, return_type='min', target=True)
+			coeff = self.dynamic_entropy_coeff.to(q_pi_current)
+			if coeff.ndim == 0:
+				coeff = coeff.view(1, 1, 1)
+			# V-target scaling per user intent:
+			# Actor sees (Q_raw / S) + α * H. To preserve the same Q:entropy ratio in value space,
+			# construct V target in raw units as Q_raw + α * S * H (since (Q_raw/S):(α H) == Q_raw:(α S H)).
+			S = self.scale.value.to(q_pi_current)  # Running scale (scalar tensor)
+			v_td_targets = q_pi_current + coeff * (entropies.detach() * S)
+		else:
+			# Fallback (not expected when state_value_targets=True): bootstrap-style target
+			v_td_targets = td_targets
 		v_ce = math.soft_ce(
 			v_logits.reshape(Qe * T * B, K),
-			td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe * T * B, 1),
+			v_td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe * T * B, 1),
 			self.cfg,
 		).view(Qe, T, B, 1).mean(dim=(0, 2)).squeeze(-1)
 		v_weighted = v_ce * rho_pows
@@ -1021,7 +1061,7 @@ class TDMPC2(torch.nn.Module):
 
 		# V-value error logging (mirrors Q-value error metrics)
 		v_value_pred = math.two_hot_inv(v_logits.reshape(Qe, T, B, K), self.cfg)  # (Qe,T,B,1)
-		v_value_error = (v_value_pred - td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe, T, B, 1))
+		v_value_error = (v_value_pred - v_td_targets.unsqueeze(0).expand(Qe, -1, -1, -1).reshape(Qe, T, B, 1))
 		for i in range(T):
 			info.update({f"v_value_error_abs_mean/step{i}": v_value_error[:, i].abs().mean(),
 					f"v_value_error_std/step{i}": v_value_error[:, i].std(),
@@ -1136,6 +1176,7 @@ class TDMPC2(torch.nn.Module):
 					'z_seq': z_true,
 					'actions': action,
 					'rewards': reward,
+					'entropies': None,
 					'terminated': terminated,
 					'full_detach': False,
 					'z_td': None,
@@ -1145,6 +1186,7 @@ class TDMPC2(torch.nn.Module):
 					'z_seq': z_rollout,
 					'actions': action,
 					'rewards': reward,
+					'entropies': None,
 					'terminated': terminated,
 					'full_detach': False,
 					'z_td': z_true[1:],
@@ -1156,6 +1198,7 @@ class TDMPC2(torch.nn.Module):
 					'z_seq': imagined['z_seq'], # rollout_length+1, S*B*n_rollouts, L
 					'actions': imagined['actions'],
 					'rewards': imagined['rewards'],
+					'entropies': imagined['entropies'],
 					'terminated': imagined['terminated'],
 					'full_detach': ac_only or self.cfg.detach_imagine_value,
 					'z_td': None,
@@ -1176,6 +1219,7 @@ class TDMPC2(torch.nn.Module):
 			value_inputs['full_detach'],
 			z_td=value_inputs['z_td'],
 			task=task,
+			entropies=value_inputs.get('entropies', None),
 		)
 
 		aux_loss = torch.zeros((), device=device)
@@ -1277,8 +1321,12 @@ class TDMPC2(torch.nn.Module):
 				self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
 
-			self.model.soft_update_target_Q()
+			# Soft update all value-related targets (Q, V, auxiliary heads) and collect EMA delta stats
+			ema_stats = self.model.soft_update_target_values()
 			self.model.soft_update_policy_encoder_targets()
+			# Attach EMA stats to info for periodic logging
+			for k, v in ema_stats.items():
+				info.update({k: v.to(self.device) if torch.is_tensor(v) else torch.tensor(v, device=self.device)}, non_blocking=True)
 			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
 				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
 			else:
@@ -1288,30 +1336,132 @@ class TDMPC2(torch.nn.Module):
 
 	@torch.compile(mode='reduce-overhead')
 	def update_end(self, info, grad_norm, pi_grad_norm, total_loss, pi_info):
-		"""Function called at the end of each update iteration."""
-		info.update({
-				'grad_norm': grad_norm,
-				'pi_grad_norm': pi_grad_norm,
-				'total_loss': total_loss.detach()
-			}, non_blocking=True)
+		"""Finalize logging info dict for this update.
+
+		Adds gradient norms, EMA drift stats, and parameter L2 norms for online & target modules.
+		Returns full TensorDict (no scalar reduction) so external logger can record per-key metrics.
+		"""
+		info.update({'grad_norm': grad_norm,
+					'pi_grad_norm': pi_grad_norm,
+					'total_loss': total_loss.detach()}, non_blocking=True)
 		info.update(pi_info, non_blocking=True)
 
-		if self.cfg.encoder_ema_enabled:
-			info.update({
-				'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device)
-			}, non_blocking=True)
-		if self.cfg.policy_ema_enabled:
-			info.update({
-				'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device)
-			}, non_blocking=True)
-		# Always log V EMA drift to debug target stability
-		info.update({
-			'v_ema_max_delta': torch.tensor(self.model.v_target_max_delta, device=self.device)
-		}, non_blocking=True)
+		# Small helpers to safely flatten params; avoid cat([]) under torch.compile
+		def _flatten_params_iter(params_iter):
+			lst = [p.detach().flatten() for p in params_iter]
+			if len(lst) == 0:
+				return None
+			return torch.cat(lst)
+
+		def _flatten_tensordict_params(td_params):
+			# td_params is expected to be a TensorDictParams with a `.data` TensorDict.
+			# We must recurse to collect only leaf torch.Tensors (ignore nested TensorDicts).
+			if td_params is None or not hasattr(td_params, 'data'):
+				return None
+			def _collect_leaves(x):
+				if torch.is_tensor(x):
+					return [x]
+				# TensorDict nodes expose `.values()`; guard by type to avoid accidental recursion into tensors
+				if isinstance(x, TensorDict):
+					leaves = []
+					for v in x.values():
+						leaves.extend(_collect_leaves(v))
+					return leaves
+				return []
+			leaf_tensors = _collect_leaves(td_params.data)
+			if not leaf_tensors:
+				return None
+			return torch.cat([t.detach().flatten() for t in leaf_tensors])
+
+		# Encoder / policy EMA drift (max + L2) when enabled
+		if self.cfg.encoder_ema_enabled and getattr(self.model, '_target_encoder', None) is not None:
+			enc_online = _flatten_params_iter(self.model._encoder.parameters())
+			enc_target = _flatten_params_iter(self.model._target_encoder.parameters())
+			if enc_online is not None and enc_target is not None:
+				delta_enc = enc_online - enc_target
+				self.model.encoder_target_max_delta = float(torch.max(torch.abs(delta_enc)))
+				info.update({
+					'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device),
+					'encoder_ema_l2_delta': torch.sqrt((delta_enc.float()**2).sum()).to(self.device)
+				}, non_blocking=True)
+		if self.cfg.policy_ema_enabled and getattr(self.model, '_target_pi', None) is not None:
+			pi_online = _flatten_params_iter(self.model._pi.parameters())
+			pi_target = _flatten_params_iter(self.model._target_pi.parameters())
+			if pi_online is not None and pi_target is not None:
+				delta_pi = pi_online - pi_target
+				self.model.policy_target_max_delta = float(torch.max(torch.abs(delta_pi)))
+				info.update({
+					'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device),
+					'policy_ema_l2_delta': torch.sqrt((delta_pi.float()**2).sum()).to(self.device)
+				}, non_blocking=True)
+		# Primary V drift already tracked; add L2
+		if hasattr(self.model, '_target_Vs') and self.model._target_Vs is not None:
+			# Use underlying TensorDictParams to avoid empty parameter lists
+			v_online = _flatten_tensordict_params(getattr(self.model, '_detach_Vs_params', None))
+			v_target = _flatten_tensordict_params(getattr(self.model, '_target_Vs_params', None))
+			if v_online is not None and v_target is not None:
+				v_delta = v_online - v_target
+				info.update({
+					'v_ema_max_delta': torch.tensor(self.model.v_target_max_delta, device=self.device),
+					'v_ema_l2_delta': torch.sqrt((v_delta.float()**2).sum()).to(self.device)
+				}, non_blocking=True)
+
+		# ---------------- Parameter norms (online & targets) ----------------
+		def _param_l2(mod, td_params=None):
+			if mod is None and td_params is None:
+				return torch.tensor(0., device=self.device)
+			# First try the module's nn.Parameter list
+			if mod is not None:
+				params = list(mod.parameters())
+				if len(params) > 0:
+					ss = sum([(p.detach().float()**2).sum() for p in params])
+					return torch.sqrt(ss)
+			# Fallback to TensorDictParams container if provided
+			if td_params is not None and hasattr(td_params, 'data'):
+				def _collect_leaves(x):
+					if torch.is_tensor(x):
+						return [x]
+					if isinstance(x, TensorDict):
+						leaves = []
+						for v in x.values():
+							leaves.extend(_collect_leaves(v))
+						return leaves
+					return []
+				leaves = _collect_leaves(td_params.data)
+				if leaves:
+					ss = sum([(t.detach().float()**2).sum() for t in leaves])
+					return torch.sqrt(ss)
+			return torch.tensor(0., device=self.device)
+
+		# Aggregate encoder params as single module
+		enc_modules = list(self.model._encoder.values()) if isinstance(self.model._encoder, dict) else [self.model._encoder]
+		enc_online_norm = torch.sqrt(sum([(p.detach().float()**2).sum() for m in enc_modules for p in m.parameters()]))
+		info.update({'param_norm/encoder': enc_online_norm.to(self.device)}, non_blocking=True)
+		if getattr(self.model, '_target_encoder', None) is not None:
+			enc_target_norm = torch.sqrt(sum([(p.detach().float()**2).sum() for p in self.model._target_encoder.parameters()]))
+			info.update({'param_norm_target/encoder': enc_target_norm.to(self.device)}, non_blocking=True)
+
+		pairs = [
+			('dynamics', self.model._dynamics, None, None, None),
+			('reward', self.model._reward, None, None, None),
+			('termination', self.model._termination if self.cfg.episodic else None, None, None, None),
+			# For Qs/Vs, provide TensorDictParams for accurate norms even if module.parameters() is empty
+			('Qs', self.model._Qs, self.model._target_Qs if hasattr(self.model, '_target_Qs') else None, getattr(self.model, '_Qs').params if hasattr(getattr(self.model, '_Qs'), 'params') else None, getattr(self.model, '_target_Qs_params', None)),
+			('Vs', self.model._Vs, self.model._target_Vs if hasattr(self.model, '_target_Vs') else None, getattr(self.model, '_Vs').params if hasattr(getattr(self.model, '_Vs'), 'params') else None, getattr(self.model, '_target_Vs_params', None)),
+			('pi', self.model._pi, self.model._target_pi if getattr(self.model, '_target_pi', None) is not None else None, None, None),
+			('task_emb', self.model._task_emb if self.cfg.multitask else None, None, None, None),
+			('aux_Qs', self.model._aux_joint_Qs or (self.model._aux_separate_Qs if getattr(self.model, '_aux_separate_Qs', None) else None), self.model._target_aux_joint_Qs or (self.model._target_aux_separate_Qs if getattr(self.model, '_target_aux_separate_Qs', None) else None), None, None),
+			('aux_Vs', self.model._aux_joint_Vs or (self.model._aux_separate_Vs if getattr(self.model, '_aux_separate_Vs', None) else None), self.model._target_aux_joint_Vs or (self.model._target_aux_separate_Vs if getattr(self.model, '_target_aux_separate_Vs', None) else None), None, None),
+		]
+		for name, online_mod, target_mod, online_tdparams, target_tdparams in pairs:
+			if online_mod is None:
+				continue
+			info.update({f'param_norm/{name}': _param_l2(online_mod, online_tdparams).to(self.device)}, non_blocking=True)
+			if target_mod is not None:
+				info.update({f'param_norm_target/{name}': _param_l2(target_mod, target_tdparams).to(self.device)}, non_blocking=True)
 
 		self.model.eval()
-		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
-		return info.detach().mean()
+		return info.detach()
   
 	def update(self, buffer, step=0, ac_only=False):
 		"""

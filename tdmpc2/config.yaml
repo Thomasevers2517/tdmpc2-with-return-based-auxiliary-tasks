@@ -12,6 +12,10 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+state_value_targets: true
+
+fix_value_est: true
+
 train_act_std_coeff: 1
 
 
@@ -44,8 +48,9 @@ ema_value_planning: false # if true, use ema critic for mpc planning
 steps: 4_000_000
 batch_size: 256
 reward_coef: 0.1
-q_value_coef: 0.1
-v_value_coef: 0.1
+# Explicit loss weights (required by parser; no silent defaults)
+q_value_coef: 0.1   # weight for Q-value (action-value) loss
+v_value_coef: 0.1   # weight for V-value (state-value) loss
 termination_coef: 1
 consistency_coef: 20
 policy_coef: 1
