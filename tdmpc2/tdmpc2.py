@@ -1072,8 +1072,18 @@ class TDMPC2(torch.nn.Module):
 
 		return q_loss, v_loss, info
 
-	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
-		"""Compute auxiliary multi-gamma state-value losses (V_aux)."""
+	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None, entropies: torch.Tensor | None = None):
+		"""Compute auxiliary multi-gamma state-value losses (V_aux) with optional SAC-style soft targets.
+
+		When state_value_targets is enabled, we mirror the primary V-loss semantics:
+		For each auxiliary discount γ_g we build a per-step target:
+			V_aux_target_g(s_t) = Q_aux_g_target(s_t, a_t) + α * S * H_t
+		where S is the running scale (actor normalization), H_t is the (scaled) policy entropy
+		collected during the rollout source, and α is the dynamic entropy coefficient.
+
+		Otherwise (state_value_targets disabled), we default to multi-gamma TD bootstrap:
+			V_aux_target_g(t) = r_t + γ_g (1 - done_t) * V_aux_g_target(s_{t+1}).
+		"""
 		if z_td is None:
 			assert self.cfg.aux_value_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
 		if self.model._num_aux_gamma == 0:
@@ -1089,43 +1099,106 @@ class TDMPC2(torch.nn.Module):
 		rewards = rewards.detach()
 		terminated = terminated.detach()
 
-		q_aux_logits = self.model.V_aux(z_seq[:-1], task, return_type='all')
-		if q_aux_logits is None:
+		# Distributional logits for auxiliary V values (used for loss)
+		v_aux_logits = self.model.V_aux(z_seq[:-1], task, return_type='all')
+		# Distributional logits for auxiliary Q values (used for aux-Q loss)
+		q_aux_logits_cur = self.model.Q_aux(z_seq[:-1], actions, task, return_type='all')
+		if v_aux_logits is None and q_aux_logits_cur is None:
 			return torch.zeros((), device=device), TensorDict({}, device=device)
+		# Prefer using shared gamma count from whichever head exists
+		G_aux = (v_aux_logits.shape[0] if v_aux_logits is not None else q_aux_logits_cur.shape[0])
 
-		with torch.no_grad():
-			if z_td is not None:
-				aux_td_targets = self._td_target_aux(z_td, rewards, terminated, task)
-			else:
-				aux_td_targets = self._td_target_aux(z_seq[1:], rewards, terminated, task) # bootstrap using rolledout
+		# Build targets
+		if getattr(self.cfg, 'state_value_targets', False):
+			if entropies is None:
+				raise RuntimeError('state_value_targets=True requires entropies for auxiliary value loss.')
+			if entropies.ndim == 2:
+				entropies = entropies.unsqueeze(-1)  # (T,B,1)
+			if entropies.shape[0] != z_seq.shape[0]-1 or entropies.shape[1] != B or entropies.shape[-1] != 1:
+				raise RuntimeError(f"Aux entropy shape mismatch: got {tuple(entropies.shape)}, expected (T={z_seq.shape[0]-1}, B={B}, 1)")
+			# Target Q_aux(s_t,a_t) per gamma using EMA (avg over heads)
+			q_aux_logits_target = self.model.Q_aux(z_seq[:-1], actions, task, return_type='all', target=True)
+			if q_aux_logits_target is None or q_aux_logits_target.shape[0] != G_aux:
+				raise RuntimeError('Q_aux target logits missing or gamma count mismatch.')
+			# Convert distributional Q_aux logits to scalar per gamma
+			q_aux_values_target = math.two_hot_inv(q_aux_logits_target, self.cfg)  # (G_aux,T,B,1)
+			coeff = self.dynamic_entropy_coeff.to(q_aux_values_target)
+			if coeff.ndim == 0:
+				coeff = coeff.view(1,1,1)
+			S = self.scale.value.to(q_aux_values_target)  # scalar running scale
+			# Broadcast entropy to (G_aux,T,B,1)
+			v_aux_td_targets = q_aux_values_target + coeff * (entropies.detach() * S)
+		else:
+			# TD bootstrap per gamma (legacy path)
+			with torch.no_grad():
+				if z_td is not None:
+					aux_td_targets = self._td_target_aux(z_td, rewards, terminated, task)
+				else:
+					aux_td_targets = self._td_target_aux(z_seq[1:], rewards, terminated, task)
+				if aux_td_targets is None:
+					return torch.zeros((), device=device), TensorDict({}, device=device)
+			v_aux_td_targets = aux_td_targets  # (G_aux,T,B,1)
 
-		G_aux = q_aux_logits.shape[0]
-		aux_ce = math.soft_ce(
-			q_aux_logits.reshape(G_aux * T * B, self.cfg.num_bins),
-			aux_td_targets.reshape(G_aux * T * B, 1),
-			self.cfg,
-		).view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)
+		# Distributional cross-entropy per gamma for V_aux
+		v_aux_losses = None
+		if v_aux_logits is not None:
+			v_ce = math.soft_ce(
+				v_aux_logits.reshape(G_aux * T * B, self.cfg.num_bins),
+				v_aux_td_targets.reshape(G_aux * T * B, 1),
+				self.cfg,
+			).view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)
+			v_weighted = v_ce * rho_pows.unsqueeze(0)
+			v_aux_losses = v_weighted.mean(dim=1)  # (G_aux,)
 
-		weighted = aux_ce * rho_pows.unsqueeze(0)
-		losses = weighted.mean(dim=1)  # (G_aux,)
+		# Auxiliary Q path: standard TD with V_aux bootstrap per gamma
+		q_aux_losses = None
+		if q_aux_logits_cur is not None:
+			with torch.no_grad():
+				if z_td is not None:
+					aux_q_td = self._td_target_aux(z_td, rewards, terminated, task)
+				else:
+					aux_q_td = self._td_target_aux(z_seq[1:], rewards, terminated, task)
+				if aux_q_td is None:
+					raise RuntimeError('Aux TD targets returned None while Q_aux logits exist.')
+			q_ce = math.soft_ce(
+				q_aux_logits_cur.reshape(G_aux * T * B, self.cfg.num_bins),
+				aux_q_td.reshape(G_aux * T * B, 1),
+				self.cfg,
+			).view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)
+			q_weighted = q_ce * rho_pows.unsqueeze(0)
+			q_aux_losses = q_weighted.mean(dim=1)  # (G_aux,)
+
+		# Combine present components: average to keep magnitude comparable
+		components = []
+		if v_aux_losses is not None:
+			components.append(v_aux_losses)
+		if q_aux_losses is not None:
+			components.append(q_aux_losses)
+		if len(components) == 1:
+			losses = components[0]
+		else:
+			losses = torch.stack(components, dim=0).mean(dim=0)
 		loss_mean = losses.mean()
 
-		info = TensorDict({
-			'aux_value_loss_mean': loss_mean
-		}, device=device, non_blocking=True)
-
+		info = TensorDict({'aux_value_loss_mean': loss_mean}, device=device, non_blocking=True)
+		# Per-gamma logs and breakdown if available
 		for g, gamma in enumerate(self.cfg.multi_gamma_gammas):
-			info.update({
-				f'aux_value_loss/gamma{gamma:.4f}': losses[g],
-				f'aux_value_loss_weighted/gamma{gamma:.4f}': losses[g] * self.cfg.multi_gamma_loss_weight,
-			}, non_blocking=True)
+			info.update({f'aux_value_loss/gamma{gamma:.4f}': losses[g],
+						f'aux_value_loss_weighted/gamma{gamma:.4f}': losses[g] * self.cfg.multi_gamma_loss_weight}, non_blocking=True)
+			if v_aux_losses is not None:
+				info.update({f'aux_v_value_loss/gamma{gamma:.4f}': v_aux_losses[g]}, non_blocking=True)
+			if q_aux_losses is not None:
+				info.update({f'aux_q_value_loss/gamma{gamma:.4f}': q_aux_losses[g]}, non_blocking=True)
 
 		if self.log_detailed:
-			for g, gamma in enumerate(self.cfg.multi_gamma_gammas):
-				info.update({
-					f'aux_td_target_mean/gamma{gamma:.4f}': aux_td_targets[g].mean(),
-					f'aux_td_target_std/gamma{gamma:.4f}': aux_td_targets[g].std(),
-				}, non_blocking=True)
+			if getattr(self.cfg, 'state_value_targets', False):
+				info.update({'aux_soft_target_mean': v_aux_td_targets.mean(), 'aux_soft_target_std': v_aux_td_targets.std()}, non_blocking=True)
+			else:
+				for g, gamma in enumerate(self.cfg.multi_gamma_gammas):
+					info.update({
+						f'aux_td_target_mean/gamma{gamma:.4f}': v_aux_td_targets[g].mean(),
+						f'aux_td_target_std/gamma{gamma:.4f}': v_aux_td_targets[g].std(),
+					}, non_blocking=True)
 
 		return loss_mean, info
 
@@ -1228,7 +1301,6 @@ class TDMPC2(torch.nn.Module):
 		aux_info = TensorDict({}, device=device)
 		if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
 			aux_inputs = fetch_source(self.cfg.aux_value_source)
-
 			aux_loss, aux_info = aux_fn(
 				aux_inputs['z_seq'],
 				aux_inputs['actions'],
@@ -1237,6 +1309,7 @@ class TDMPC2(torch.nn.Module):
 				aux_inputs['full_detach'],
 				z_td=aux_inputs['z_td'],
 				task=task,
+				entropies=aux_inputs.get('entropies', None),
 			)
 
 		info = TensorDict({}, device=device)
