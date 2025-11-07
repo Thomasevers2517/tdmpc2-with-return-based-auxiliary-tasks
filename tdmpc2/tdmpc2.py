@@ -1082,7 +1082,7 @@ class TDMPC2(torch.nn.Module):
 			wm_loss, wm_info, z_rollout = wm_fn(z_true, z_target, action, reward, terminated, task)
 		else:
 			z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
-			z_rollout = self.rollout_dynamics(z_start=z_true[0], action=action, task=task)
+			z_rollout = self.rollout_dynamics(z_start=z_true[0], action=action, task=task).detach()
 			wm_loss = torch.zeros((), device=device)
 			wm_info = TensorDict({}, device=device)
 
