@@ -34,9 +34,9 @@ parameters:
   state_value_targets: 
     values: [true]
   tau:
-    values: [0.002]
+    values: [0.01]
   aux_value_tau:
-    values: [0.002]
+    values: [0.01]
 
   train_act_std_coeff:
     values: [1]

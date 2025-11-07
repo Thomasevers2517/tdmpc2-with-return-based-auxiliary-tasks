@@ -293,41 +293,49 @@ class WorldModel(nn.Module):
 		"""
 		stats = {}
 		with maybe_range('WM/soft_update_target_values', self.cfg):
-			# Helper to safely convert parameter iterables to a parameter vector.
-			def _safe_parameters_to_vector(param_iter):
-				params = list(param_iter)
-				if len(params) == 0:
+			# Helper: flatten all leaf tensors from a TensorDictParams into a single vector
+			def _tdparams_to_vector(tdparams) -> torch.Tensor | None:
+				def _collect_leaves(d):
+					leaves = []
+					for v in d.values():
+						if isinstance(v, torch.Tensor):
+							leaves.append(v.reshape(-1))
+						elif hasattr(v, 'values'):
+							# nested tensordict
+							for vv in v.values():
+								if isinstance(vv, torch.Tensor):
+									leaves.append(vv.reshape(-1))
+					return leaves
+				if tdparams is None:
 					return None
-				return parameters_to_vector(params)
+				leaves = _collect_leaves(tdparams.data)
+				if len(leaves) == 0:
+					return None
+				return torch.cat(leaves, dim=0)
 			# ---------------- Primary Q ensemble ----------------
 			self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
 			with torch.no_grad():
-				q_online_vec = _safe_parameters_to_vector(self._detach_Qs.parameters())
-				q_target_vec = _safe_parameters_to_vector(self._target_Qs.parameters())
+				q_online_vec = _tdparams_to_vector(self._detach_Qs_params)
+				q_target_vec = _tdparams_to_vector(self._target_Qs_params)
 				if q_online_vec is None or q_target_vec is None:
-					# Fall back to zero metrics when param lists are empty to avoid runtime errors.
-					stats['ema_delta_max/Qs'] = torch.tensor(0.0)
-					stats['ema_delta_l2/Qs'] = torch.tensor(0.0)
+					stats['ema_delta_max/Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+					stats['ema_delta_l2/Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
 				else:
-					q_online_vec = q_online_vec.detach()
-					q_target_vec = q_target_vec.detach()
-					q_delta = q_online_vec - q_target_vec
+					q_delta = (q_online_vec - q_target_vec).detach()
 					stats['ema_delta_max/Qs'] = torch.max(torch.abs(q_delta)).detach()
 					stats['ema_delta_l2/Qs'] = torch.sqrt((q_delta.float()**2).sum()).detach()
 			# ---------------- Primary V ensemble ----------------
 			if hasattr(self, '_target_Vs_params'):
 				self._target_Vs_params.lerp_(self._detach_Vs_params, self.cfg.tau)
 				with torch.no_grad():
-					v_online_vec = _safe_parameters_to_vector(self._detach_Vs.parameters())
-					v_target_vec = _safe_parameters_to_vector(self._target_Vs.parameters())
+					v_online_vec = _tdparams_to_vector(self._detach_Vs_params)
+					v_target_vec = _tdparams_to_vector(self._target_Vs_params)
 					if v_online_vec is None or v_target_vec is None:
 						self.v_target_max_delta = 0.0
-						stats['ema_delta_max/Vs'] = torch.tensor(0.0)
-						stats['ema_delta_l2/Vs'] = torch.tensor(0.0)
+						stats['ema_delta_max/Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+						stats['ema_delta_l2/Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
 					else:
-						v_online_vec = v_online_vec.detach()
-						v_target_vec = v_target_vec.detach()
-						v_delta = v_online_vec - v_target_vec
+						v_delta = (v_online_vec - v_target_vec).detach()
 						self.v_target_max_delta = torch.max(torch.abs(v_delta)).item()
 						stats['ema_delta_max/Vs'] = torch.max(torch.abs(v_delta)).detach()
 						stats['ema_delta_l2/Vs'] = torch.sqrt((v_delta.float()**2).sum()).detach()
@@ -344,6 +352,7 @@ class WorldModel(nn.Module):
 					delta_q_aux = online - prev_target
 					stats['ema_delta_max/aux_Qs'] = torch.max(torch.abs(delta_q_aux)).detach()
 					stats['ema_delta_l2/aux_Qs'] = torch.sqrt((delta_q_aux.float()**2).sum()).detach()
+					stats['ema_delta_rms/aux_Qs'] = torch.sqrt((delta_q_aux.float()**2).mean()).detach()
 					# Mirror for V aux (joint)
 					if getattr(self, '_aux_joint_Vs', None) is not None:
 						online_v = parameters_to_vector(self._aux_joint_Vs.parameters()).detach()
@@ -355,10 +364,11 @@ class WorldModel(nn.Module):
 						delta_v_aux = online_v - prev_v_target
 						stats['ema_delta_max/aux_Vs'] = torch.max(torch.abs(delta_v_aux)).detach()
 						stats['ema_delta_l2/aux_Vs'] = torch.sqrt((delta_v_aux.float()**2).sum()).detach()
+						stats['ema_delta_rms/aux_Vs'] = torch.sqrt((delta_v_aux.float()**2).mean()).detach()
 			elif getattr(self, '_aux_separate_Qs', None) is not None:
 				with torch.no_grad():
 					vecs_online = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
-					online_full = torch.cat(vecs_online, dim=0)
+					online_full = torch.cat(vecs_online, dim=0) if len(vecs_online) > 0 else torch.zeros(0, device=self.log_std_min.device)
 					prev_target_full = self.aux_separate_target_vec.detach().clone()
 					self.aux_separate_target_vec.lerp_(online_full, self.cfg.aux_value_tau)
 					# Assign to target heads
@@ -373,12 +383,18 @@ class WorldModel(nn.Module):
 						vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
 						offset += sz
 					delta_aux_q = online_full - prev_target_full
-					stats['ema_delta_max/aux_Qs'] = torch.max(torch.abs(delta_aux_q)).detach()
-					stats['ema_delta_l2/aux_Qs'] = torch.sqrt((delta_aux_q.float()**2).sum()).detach()
+					if delta_aux_q.numel() == 0:
+						stats['ema_delta_max/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+						stats['ema_delta_l2/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+						stats['ema_delta_rms/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+					else:
+						stats['ema_delta_max/aux_Qs'] = torch.max(torch.abs(delta_aux_q)).detach()
+						stats['ema_delta_l2/aux_Qs'] = torch.sqrt((delta_aux_q.float()**2).sum()).detach()
+						stats['ema_delta_rms/aux_Qs'] = torch.sqrt((delta_aux_q.float()**2).mean()).detach()
 					# Mirror for V aux (separate)
 					if getattr(self, '_aux_separate_Vs', None) is not None:
 						vecs_v_online = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Vs]
-						online_v_full = torch.cat(vecs_v_online, dim=0)
+						online_v_full = torch.cat(vecs_v_online, dim=0) if len(vecs_v_online) > 0 else torch.zeros(0, device=self.log_std_min.device)
 						prev_v_target_full = self.aux_v_separate_target_vec.detach().clone()
 						self.aux_v_separate_target_vec.lerp_(online_v_full, self.cfg.aux_value_tau)
 						offset = 0
@@ -391,8 +407,22 @@ class WorldModel(nn.Module):
 							vector_to_parameters(self.aux_v_separate_detach_vec[offset:offset+sz], h.parameters())
 							offset += sz
 						delta_aux_v = online_v_full - prev_v_target_full
-						stats['ema_delta_max/aux_Vs'] = torch.max(torch.abs(delta_aux_v)).detach()
-						stats['ema_delta_l2/aux_Vs'] = torch.sqrt((delta_aux_v.float()**2).sum()).detach()
+						if delta_aux_v.numel() == 0:
+							stats['ema_delta_max/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+							stats['ema_delta_l2/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+							stats['ema_delta_rms/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+						else:
+							stats['ema_delta_max/aux_Vs'] = torch.max(torch.abs(delta_aux_v)).detach()
+							stats['ema_delta_l2/aux_Vs'] = torch.sqrt((delta_aux_v.float()**2).sum()).detach()
+							stats['ema_delta_rms/aux_Vs'] = torch.sqrt((delta_aux_v.float()**2).mean()).detach()
+			else:
+				# No auxiliary heads present; make this explicit so logger can distinguish absence from zero drift
+				stats['ema_delta_max/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+				stats['ema_delta_l2/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+				stats['ema_delta_rms/aux_Qs'] = torch.tensor(0.0, device=self.log_std_min.device)
+				stats['ema_delta_max/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+				stats['ema_delta_l2/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
+				stats['ema_delta_rms/aux_Vs'] = torch.tensor(0.0, device=self.log_std_min.device)
 		return stats
 
 	def _soft_update_module(self, target_module, source_module, tau):

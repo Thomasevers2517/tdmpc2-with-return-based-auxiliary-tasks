@@ -844,9 +844,9 @@ class TDMPC2(torch.nn.Module):
 		info = TensorDict({
 			'consistency_losses': consistency_losses,
 			'consistency_loss': consistency_loss,
-			'consistency_loss_weighted': consistency_losses * self.cfg.consistency_coef,
+			'consistency_loss_weighted': consistency_loss * self.cfg.consistency_coef,
 			'encoder_consistency_loss': encoder_consistency_loss,
-			'encoder_consistency_loss_weighted': encoder_consistency_losses * self.cfg.encoder_consistency_coef,
+			'encoder_consistency_loss_weighted': encoder_consistency_loss * self.cfg.encoder_consistency_coef,
 			'reward_loss': reward_loss,
 			'reward_loss_weighted': reward_loss * self.cfg.reward_coef,
 			'termination_loss': termination_loss,
@@ -857,7 +857,9 @@ class TDMPC2(torch.nn.Module):
 		for t in range(T):
 			info.update({
 				f'consistency_loss/step{t}': consistency_losses[t],
+				f'consistency_loss_weighted/step{t}': consistency_losses[t] * self.cfg.consistency_coef,
 				f'encoder_consistency_loss/step{t}': encoder_consistency_losses[t],
+				f'encoder_consistency_loss_weighted/step{t}': encoder_consistency_losses[t] * self.cfg.encoder_consistency_coef,
 				f'reward_loss/step{t}': rew_ce_mean[t],
 			}, non_blocking=True)
    
