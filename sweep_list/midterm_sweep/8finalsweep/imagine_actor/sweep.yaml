@@ -34,7 +34,7 @@ parameters:
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
     values: [true]
   hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-    values: [0.005, 0.01, 0.03]  # int(256*0.01)=3 
+    values: [0.01]  # int(256*0.01)=3 
   hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
     values: [5]
   
@@ -92,7 +92,7 @@ parameters:
   ac_source:
     values: ["imagine"] # replay_rollout | imagine (controls critic/actor source)
   actor_source:
-    values: ["replay_rollout"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
+    values: ["replay_rollout", "ac"] # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
   aux_value_source:
     values: ["replay_true"] # replay_true | replay_rollout | imagine
 

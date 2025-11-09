@@ -30,16 +30,21 @@ parameters:
       - quadruped-walk
       # - quadruped-run
       # - walker-run
+  sac_style_td:
+    values: [true]
   
+  n_mc_samples_target:
+    values: [1]
+
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
     values: [true]
   hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-    values: [0.005, 0.01, 0.03]  # int(256*0.01)=3 
+    values: [0.01]  # int(256*0.01)=3 
   hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
     values: [5]
   
   fix_value_est:
-    values: [true]
+    values: [false]
 
   train_act_std_coeff:
     values: [1]

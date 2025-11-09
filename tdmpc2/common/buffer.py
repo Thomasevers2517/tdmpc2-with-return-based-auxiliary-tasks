@@ -25,8 +25,12 @@ class Buffer():
 		# --- Hot buffer configuration ---
 		self._hot_enabled = bool(cfg.hot_buffer_enabled)
 		self._hot_ratio = float(cfg.hot_buffer_ratio) if self._hot_enabled else 0.0
-		self._hot_size = int(cfg.hot_buffer_size) if self._hot_enabled else 0
 		self._hot_slices = int(round(self._hot_ratio * self.cfg.batch_size)) if self._hot_enabled else 0
+		# assert cfg.hot_buffer_size > 2*(cfg.horizon + 1 + self._hot_slices) if self._hot_enabled else True, \
+		# 	"hot_buffer_size must be > 2*(horizon + 1 + hot_slices) to avoid overflow"
+   
+		self._hot_size = int(cfg.hot_buffer_size+2*(cfg.horizon+ 1 + self._hot_slices)) if self._hot_enabled else 0
+
 		self._main_slices = self.cfg.batch_size - self._hot_slices if self._hot_enabled else self.cfg.batch_size
 		# Pre-compute flattened batch sizes per buffer (num_slices * (H+1))
 		self._slice_len = (self.cfg.horizon + 1)
@@ -130,7 +134,7 @@ class Buffer():
 		# Optional hot buffer
 		if self._hot_enabled and self._sampler_hot is not None:
 			self._hot_buffer = self._reserve_buffer(
-				LazyTensorStorage(self._hot_size, device=self._storage_device),
+				LazyTensorStorage(self._hot_size+self.cfg.horizon, device=self._storage_device),
 				self._sampler_hot,
 				self._hot_batch_flat,
 			)

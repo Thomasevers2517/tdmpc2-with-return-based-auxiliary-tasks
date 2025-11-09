@@ -598,7 +598,7 @@ class TDMPC2(torch.nn.Module):
 			# Loss is a weighted sum of Q-values
 			if self.cfg.actor_source == "ac":
 				if self.cfg.ac_source == "imagine" or self.cfg.ac_source == "replay_rollout":
-					pi_loss = (-(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
+					pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
 				else:
 					raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
 			elif self.cfg.actor_source == "imagine" or self.cfg.actor_source == "replay_rollout":
@@ -665,43 +665,64 @@ class TDMPC2(torch.nn.Module):
 		Returns:
 			torch.Tensor: TD-target.
 		"""
-		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
+		# Monte Carlo bootstrap over policy actions.
+		# Shapes:
+		#   next_z: (T, B, L)
+		#   N = self.cfg.n_mc_samples_target
+		# We create a contiguous repeated latent tensor along the time axis:
+		#   expanded_seq = next_z.repeat(N, 1, 1) -> (N*T, B, L)
+		# Make N explicit (N, T, B, L), then flatten only the leading (N*T*B) dims
+		# into a single batch to call policy/critic once:
+		#   flat_expanded = expanded_seq.view(N, T, B, L).reshape(N*T*B, L)
+		T, B, L = next_z.shape
+		N = int(self.cfg.n_mc_samples_target)
+		expanded_seq = next_z.contiguous().repeat(N, 1, 1)  # (N*T, B, L) contiguous (no stride-0 dims)
+		expanded_seq = expanded_seq.view(N, T, B, L)       # (N, T, B, L) — explicit MC dim
+		flat_expanded = expanded_seq.reshape(N * T * B, L)  # (N*T*B, L) — single batch for model calls
+		action, info = self.model.pi(flat_expanded, task, use_ema=self.cfg.policy_ema_enabled)
+		# Evaluate critic on all (N*T*B) latent-action pairs, returns logits over K bins per pair.
+		q_values = self.model.Q(flat_expanded, action, task, return_type='min', target=True)  # (N*T*B, 1)
+		# Reshape back to (N, T, B, K), average across MC sample
+		q_value = q_values.view(N, T, B, -1).mean(dim=0)  #  (T, B, K)
+		if self.cfg.sac_style_td:
+			scaled_entropy = info["scaled_entropy"].view(N, T, B).mean(dim=0)  # (T, B)
+			scale = self.scale.value
+			q_value = q_value - self.dynamic_entropy_coeff * scaled_entropy.unsqueeze(-1) * scale
+  
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		# Primary TD target distribution (still stored as distributional bins via CE loss)
-		return reward + discount * (1-terminated) * self.model.Q(next_z, action, task, return_type='min', target=True)  # (T,B,K)
+		return reward + discount * (1 - terminated) * q_value  # 
+  
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
-		"""Compute auxiliary TD targets per gamma using Q_aux(min) bootstrap.
 
-		Uses a conservative (min over two sampled ensemble members) per-gamma
-		bootstrap produced internally by `Q_aux(return_type='min')`.
-
-		TODO: Potential enhancement: use full distributional auxiliary logits
-		as targets (would require adapting loss to compare distributions). Also do this in normal td target comp
-
-		Args:
-			next_z (torch.Tensor): Latent states at t+1. Shape (T,B,L).
-			reward (torch.Tensor): Immediate rewards at t. Shape (T,B,1).
-			terminated (torch.Tensor): Termination flags (T,B,1).
-			task: Task index tensor or None.
-
-		Returns:
-			(torch.Tensor | None): (G_aux,T,B,1) scalar TD targets or None if no auxiliaries.
-		"""
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
 			return None
-		action, _ = self.model.pi(next_z, task, use_ema=self.cfg.policy_ema_enabled)
-		bootstrap = self.model.Q_aux(next_z, action, task, return_type='avg', target=self.cfg.auxiliary_value_ema)  # (G_aux,T,B,K) scalar per gamma (single head)
-		if bootstrap is None:
-			return None
-		aux_targets = []
+
+		N = int(self.cfg.n_mc_samples_target)
+		# MC-average over N policy samples for auxiliary discounts.
+		# Shapes mirror _td_target:
+		#   next_z: (T, B, L)
+		#   expanded_seq = next_z.repeat(N, 1, 1) -> (N*T, B, L)
+		# IMPORTANT: Q_aux expects inputs with explicit (T, B, ...) leading dims (see world_model.Q_aux).
+		# Therefore, we keep the (N*T, B, L) shape (fold N into T) and DO NOT flatten B for Q_aux.
+		T, B, L = next_z.shape
+		expanded_seq = next_z.contiguous().repeat(N, 1, 1)  # (N*T, B, L)
+		# Sample actions on the same (N*T, B, L) grid; policy supports arbitrary leading dims.
+		action, _ = self.model.pi(expanded_seq, task, use_ema=self.cfg.policy_ema_enabled)
+		# Evaluate auxiliary critics; with return_type!='all' this returns values with shape (G_aux, N*T, B, 1).
+		q_values = self.model.Q_aux(expanded_seq, action, task, return_type='min', target=True)  # (G_aux, N*T, B, 1)
+		# Reshape (fold N out of T) and average across MC samples -> (G_aux, T, B, 1)
+		q_values = q_values.view(G_aux, N, T, B, -1).mean(dim=1)  #  (G_aux, T, B, 1)
+		td_targets_aux = []
+		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		for g in range(G_aux):
-			gamma = self._all_gammas[g+1]
-			boot_g = bootstrap[g, ...]  # (T,B,1)
-			aux_targets.append(reward + gamma * (1 - terminated) * boot_g)
-		return torch.stack(aux_targets, dim=0).detach() # (G_aux,T,B,1)
+			gamma_aux = self._all_gammas[g + 1]
+			td_target_aux_g = reward + gamma_aux * discount * (1 - terminated) * q_values[g]  # (T, B, 1)
+			td_targets_aux.append(td_target_aux_g)
+		return torch.stack(td_targets_aux, dim=0)  # (G_aux, T, B, 1)
 
 
 	def world_model_losses(self, z_true, z_target, action, reward, terminated, task=None):

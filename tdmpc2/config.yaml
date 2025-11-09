@@ -12,7 +12,9 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+sac_style_td: false
 
+n_mc_samples_target: 1
 
 fix_value_est: false
 
