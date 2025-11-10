@@ -1,5 +1,6 @@
 from copy import deepcopy
 from contextlib import nullcontext
+from typing import Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -34,7 +35,11 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		if int(cfg.dynamics_heads) < 1:
+			raise ValueError('cfg.dynamics_heads must be at least 1')
+		dynamics_in_dim = cfg.latent_dim + cfg.action_dim + cfg.task_dim
+		dynamics_factory = lambda: layers.mlp(dynamics_in_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		self._dynamics = nn.ModuleList([dynamics_factory() for _ in range(int(cfg.dynamics_heads))])
 		
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
@@ -305,17 +310,65 @@ class WorldModel(nn.Module):
 				out = encoder[self.cfg.obs](obs)
 			return out.float()
 
-	def next(self, z, a, task):
-		"""
-		Predicts the next latent state given the current latent state and action.
+	def next(
+		self,
+		z: torch.Tensor,
+		a: torch.Tensor,
+		task: Optional[torch.Tensor],
+		head_indices: Union[None, int, Sequence[int], torch.Tensor, str] = None,
+	) -> torch.Tensor:
+		"""Predict one-step latent transitions with optional dynamics head selection.
+
+		Args:
+			z: Latent tensor with shape ``(..., latent_dim)`` where leading dims encode batch/time.
+			a: Action tensor broadcastable with ``z`` and final dim ``action_dim``.
+			task: Optional task index tensor for multi-task setups (unused when ``cfg.multitask`` is False).
+			head_indices: ``None`` (default head 0), an ``int`` index, a sequence / 1D tensor of indices,
+				or the string ``'all'`` (use every head). Selecting multiple heads returns a tensor with
+				an additional leading dimension for the head axis.
+
+		Returns:
+			torch.Tensor: Next latent(s). Shape matches ``z`` when a single head is requested.
+			When multiple heads are selected the result has shape ``(H, *z.shape)`` with ``H`` equal to
+			the number of requested heads.
 		"""
 		with maybe_range('WM/dynamics', self.cfg):
 			if self.cfg.multitask:
+				if task is None:
+					raise ValueError('task indices required when cfg.multitask is True')
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
+
+			if head_indices is None:
+				resolved = [0]
+			elif isinstance(head_indices, str):
+				if head_indices != 'all':
+					raise ValueError(f"Unsupported head_indices string '{head_indices}'")
+				resolved = list(range(len(self._dynamics)))
+			elif isinstance(head_indices, torch.Tensor):
+				if head_indices.ndim != 1:
+					raise ValueError('head_indices tensor must be 1D')
+				resolved = head_indices.tolist()
+			elif isinstance(head_indices, int):
+				resolved = [head_indices]
+			else:
+				resolved = list(head_indices)
+
+			if not resolved:
+				raise ValueError('head_indices selection cannot be empty')
+
+			num_heads = len(self._dynamics)
+			for idx in resolved:
+				if idx < 0 or idx >= num_heads:
+					raise IndexError(f'dynamics head index {idx} out of range [0, {num_heads - 1}]')
+
 			with self._autocast_context():
-				out = self._dynamics(za)
-			return out.float()
+				preds = [self._dynamics[idx](za) for idx in resolved]
+
+			if len(preds) == 1:
+				return preds[0].float()
+			stacked = torch.stack([pred.float() for pred in preds], dim=0)
+			return stacked
 
 	def reward(self, z, a, task):
 		"""

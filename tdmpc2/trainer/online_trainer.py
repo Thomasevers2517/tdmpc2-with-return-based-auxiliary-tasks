@@ -22,6 +22,7 @@ class OnlineTrainer(Trainer):
 
 		self.validation_buffer = Buffer(cfg=self.cfg)
 		self.recent_validation_buffer = Buffer(cfg=self.cfg)
+		log.info('Initialized OnlineTrainer')
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -38,8 +39,8 @@ class OnlineTrainer(Trainer):
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
 		# self.validation_buffer.empty()
-  
 		for i in range(self.cfg.eval_episodes):
+			self.model.reset_planner_state()
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
 			self.val_tds = [self.to_td(obs)]
 			if self.cfg.save_video:
@@ -110,7 +111,7 @@ class OnlineTrainer(Trainer):
 		train_metrics, done, eval_next = {}, True, False
 		while self._step <= self.cfg.steps:
 			# Evaluate agent periodically
-			if self._step % (self.cfg.eval_freq) == 0:
+			if self._step % (self.cfg.eval_freq) == 0 and self._step > 0:
 				eval_next = True
 
 			# Reset environment
@@ -155,6 +156,8 @@ class OnlineTrainer(Trainer):
 			if self._step > self.cfg.seed_steps:
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
 				action, info = self.agent.act(obs, mpc=self.cfg.train_mpc)
+				if isinstance(info, dict) and 'planner/type' in info:
+					self.logger.log_planner(info, self._step)
 				action = action.cpu()
 			else:
 				action = self.env.rand_act()

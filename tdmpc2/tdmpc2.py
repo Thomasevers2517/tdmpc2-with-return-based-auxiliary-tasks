@@ -1,3 +1,4 @@
+import math as py_math
 import torch
 import torch.nn.functional as F
 
@@ -152,6 +153,9 @@ class TDMPC2(torch.nn.Module):
 			torch.zeros(self.cfg.horizon, self.cfg.action_dim, device=self.device),
 			persistent=False,   # don’t save to checkpoints unless you want to
 		)
+		if self.cfg.enable_train_planner:
+			self._validate_train_planner_cfg()
+			self._init_train_planner_state()
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
 			# self._update_eager = self._update
@@ -186,6 +190,12 @@ class TDMPC2(torch.nn.Module):
 
 	def reset_planner_state(self):
 		self._prev_mean.zero_() 
+		train_actions = getattr(self, 'previous_train_parents_actions', None)
+		train_std = getattr(self, 'previous_train_parents_std', None)
+		if isinstance(train_actions, torch.Tensor):
+			train_actions.zero_()
+		if isinstance(train_std, torch.Tensor):
+			train_std.fill_(float(self.cfg.particle_init_gaussian_std))
 
 	def reset_agent(self):
 		log.info('===== Agent reset start =====')
@@ -355,31 +365,50 @@ class TDMPC2(torch.nn.Module):
 			if task is not None:
 				task = torch.tensor([task], device=self.device)
 			if mpc:
-				# if not eval_mode:
-				# a = (a + std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1)
-				score, elite_actions, mean, std = self.plan(obs, task=task)
+				if self.cfg.enable_train_planner and not eval_mode:
+					score, candidate_actions, candidate_std, plan_info = self.plan_train(obs, task=task)
+				else:
+					score, candidate_actions, mean, std = self.plan(obs, task=task)
+					plan_info = {
+						'score': score,
+						'elite_actions': candidate_actions,
+						'mean': mean,
+						'std': std,
+					}
+					candidate_std = std
+					self.update_planner_mean(mean)
 							# Select first action from sampled distribution; add exploration noise if training
 				if self.cfg.best_eval and eval_mode:
-					# Take best action sequence
 					idx = torch.argmax(score)
 				else:
 					idx = math.gumbel_softmax_sample(score.squeeze(1))
-				actions = torch.index_select(elite_actions, 1, idx).squeeze(1)
-				a, std = actions[0], std[0]
-				
-				plan_info = dict({
-						'score': score,
-						'elite_actions': elite_actions,
-						'mean': mean,
-						'std': std
-					})
-    
-				self.update_planner_mean(mean)
-				if eval_mode:
-
-					return a, plan_info # TODO not bad idea to perhaps take mean of elites here instead. (this is argmax, used to be a sample)
+				actions = torch.index_select(candidate_actions, 1, idx).squeeze(1)
+				std_selected = torch.index_select(candidate_std, 1, idx).squeeze(1)
+				a = actions[0]
+				chosen_index = int(idx.item()) if isinstance(idx, torch.Tensor) else int(idx)
+				if self.cfg.enable_train_planner and not eval_mode:
+					plan_info['chosen_parent_index'] = chosen_index
+					parent_values = plan_info['parents/value_max']
+					parent_disagreement = plan_info['parents/disagreement']
+					parent_heads = plan_info['parents/value_max_head']
+					parent_weights = plan_info['parents/softmax']
+					plan_info['chosen_value_max'] = parent_values[chosen_index].item()
+					plan_info['chosen_disagreement'] = parent_disagreement[chosen_index].item()
+					plan_info['chosen_parent_weight'] = parent_weights[chosen_index].item()
+					plan_info['chosen_value_max_head'] = int(parent_heads[chosen_index].item())
+					plan_info['chosen_parent_action'] = actions.detach()
+					plan_info['chosen_parent_std'] = std_selected.detach()
 				else:
-					return (a + self.cfg.train_act_std_coeff*std * torch.randn(self.cfg.action_dim, device=std.device)).clamp(-1, 1), plan_info
+					plan_info['chosen_elite_index'] = chosen_index
+					plan_info['chosen_std'] = std_selected.detach()
+				if eval_mode:
+					return a, plan_info
+				if std_selected.dim() > 1:
+					std_noise = std_selected[0]
+				else:
+					std_noise = std_selected
+				random_noise = torch.randn_like(std_noise)
+				return (a + self.cfg.train_act_std_coeff * std_noise * random_noise).clamp(-1, 1), plan_info
 			z = self.model.encode(obs, task)
 			action, info = self.model.pi(z, task, use_ema=self.cfg.policy_ema_enabled)
 			if eval_mode:
@@ -486,6 +515,144 @@ class TDMPC2(torch.nn.Module):
 
 			return score, elite_actions, mean, std
 
+	@torch.no_grad()
+	def plan_train(self, obs, task=None):
+		if self.cfg.multitask:
+			raise NotImplementedError('Train planner currently supports single-task configuration only')
+		if task is not None:
+			task = torch.tensor([task], device=self.device)
+		parents = int(self.cfg.particle_parents)
+		children = int(self.cfg.particle_children)
+		iterations = int(self.cfg.particle_iterations)
+		policy_children = min(children, int(children * float(self.cfg.particle_use_policy_ratio)))
+		elite_k = self._train_planner_elite_count
+		min_std = float(self.cfg.min_std)
+		init_std = float(self.cfg.particle_init_gaussian_std)
+		temperature = float(self.cfg.temperature)
+		if policy_children > 0 and children - policy_children <= 0:
+			policy_children = children - 1
+		with maybe_range('Agent/plan_train', self.cfg):
+			z0 = self.model.encode(obs, task)
+			if not isinstance(getattr(self, 'previous_train_parents_actions', None), torch.Tensor):
+				raise RuntimeError('Train planner state not initialized')
+			parents_actions = self.previous_train_parents_actions.clone()
+			parents_std = self.previous_train_parents_std.clone()
+			parents_actions = torch.cat([
+				parents_actions[1:],
+				parents_actions.new_zeros(1, parents, self.cfg.action_dim)
+			], dim=0)
+			parents_std = torch.cat([
+				parents_std[1:],
+				parents_std.new_full((1, parents, self.cfg.action_dim), init_std)
+			], dim=0)
+			log.info('plan_train warm start: parents_actions=%s parents_std=%s policy_children=%s', tuple(parents_actions.shape), tuple(parents_std.shape), policy_children)
+			final_parent_payload = None
+			used_elite_count = None
+			for iteration in range(iterations):
+				noise = torch.randn(self.cfg.horizon, parents, children, self.cfg.action_dim, device=self.device)
+				base = parents_actions.unsqueeze(2) + parents_std.unsqueeze(2) * noise
+				children_actions = base.clamp_(-1.0, 1.0)
+				if policy_children > 0:
+					total_policy = parents * policy_children
+					policy_rollouts = self._sample_policy_rollouts(z0, total_policy, task)
+					policy_rollouts = policy_rollouts.view(self.cfg.horizon, parents, policy_children, self.cfg.action_dim)
+					children_actions[:, :, :policy_children, :] = policy_rollouts
+				flat_children = children_actions.reshape(self.cfg.horizon, parents * children, self.cfg.action_dim)
+				score_dict = self._score_sequences_with_ensemble(z0, flat_children, task)
+				raw_scores = score_dict['raw'].view(parents, children)
+				value_max = score_dict['value_max'].view(parents, children)
+				disagreement = score_dict['disagreement'].view(parents, children)
+				value_head = score_dict['value_max_head'].view(parents, children)
+				per_step_disagreement = score_dict['per_step_disagreement'].view(self.cfg.horizon, parents, children)
+				best_idx = raw_scores.argmax(dim=1)
+				index_expanded = best_idx.view(1, parents, 1, 1).expand(self.cfg.horizon, parents, 1, self.cfg.action_dim)
+				best_actions = torch.gather(children_actions, 2, index_expanded).squeeze(2)
+				elite_count = min(children, max(1, elite_k))
+				used_elite_count = elite_count
+				elite_scores, elite_indices = torch.topk(raw_scores, elite_count, dim=1)
+				elite_indices_exp = elite_indices.view(1, parents, elite_count, 1).expand(self.cfg.horizon, parents, elite_count, self.cfg.action_dim)
+				elite_actions = torch.gather(children_actions, 2, elite_indices_exp)
+				new_std = elite_actions.std(dim=2, unbiased=False).clamp(min=min_std)
+				parents_actions = best_actions
+				parents_std = new_std
+				if iteration == iterations - 1:
+					best_raw = torch.gather(raw_scores, 1, best_idx.unsqueeze(1)).squeeze(1)
+					best_value = torch.gather(value_max, 1, best_idx.unsqueeze(1)).squeeze(1)
+					best_disagreement = torch.gather(disagreement, 1, best_idx.unsqueeze(1)).squeeze(1)
+					best_value_head = torch.gather(value_head, 1, best_idx.unsqueeze(1)).squeeze(1)
+					best_per_step_disagreement = torch.gather(per_step_disagreement, 2, best_idx.view(1, parents, 1).expand(self.cfg.horizon, parents, 1)).squeeze(2)
+					if self.log_detailed:
+						values_all_heads = score_dict['values_all_heads'].view(len(self.model._dynamics), parents, children)
+						parents_payload = []
+						for p in range(parents):
+							children_payload = []
+							for c in range(children):
+								children_payload.append({
+									'raw_score': raw_scores[p, c].item(),
+									'value_max': value_max[p, c].item(),
+									'disagreement': disagreement[p, c].item(),
+									'value_max_head': int(value_head[p, c].item()),
+								})
+							parents_payload.append({
+								'best_child_actions': best_actions[:, p].detach().cpu(),
+								'best_child_raw_score': best_raw[p].item(),
+								'best_child_value_max': best_value[p].item(),
+								'best_child_disagreement': best_disagreement[p].item(),
+								'best_child_value_max_head': int(best_value_head[p].item()),
+								'children': children_payload,
+								'values_all_heads': values_all_heads[:, p].detach().cpu(),
+							})
+					final_parent_payload = {
+						'raw': best_raw,
+						'value_max': best_value,
+						'disagreement': best_disagreement,
+						'value_head': best_value_head,
+						'per_step_disagreement': best_per_step_disagreement,
+						'parents_payload': parents_payload if self.log_detailed else None,
+						'raw_scores_all': raw_scores.detach(),
+					}
+			log.info('plan_train final iteration completed')
+			if final_parent_payload is None:
+				raise RuntimeError('Train planner failed to finalize parent payload')
+			parent_raw = final_parent_payload['raw']
+			parent_value = final_parent_payload['value_max']
+			parent_disagreement = final_parent_payload['disagreement']
+			parent_head = final_parent_payload['value_head']
+			parent_step_disagreement = final_parent_payload['per_step_disagreement']
+			logits = parent_raw / temperature
+			logits = logits - logits.max()
+			weights = torch.exp(logits)
+			weights = weights / weights.sum().clamp_min(1e-9)
+			score = weights.unsqueeze(1)
+			self.previous_train_parents_actions.copy_(parents_actions.detach())
+			self.previous_train_parents_std.copy_(parents_std.detach())
+			if used_elite_count is None:
+				used_elite_count = min(children, max(1, elite_k))
+			info = {
+				'planner/type': 'particle',
+				'ensemble/size': len(self.model._dynamics),
+				'particle/parents': parents,
+				'particle/children': children,
+				'particle/iterations': iterations,
+				'particle/policy_children': policy_children,
+				'particle/elite_k': used_elite_count,
+				'planner/lambda': float(self.cfg.latent_disagreement_lambda),
+				'planner/temperature': temperature,
+				'parents/raw_scores': parent_raw.detach().cpu(),
+				'parents/softmax': weights.detach().cpu(),
+				'parents/value_max': parent_value.detach().cpu(),
+				'parents/disagreement': parent_disagreement.detach().cpu(),
+				'parents/value_max_head': parent_head.detach().cpu(),
+				'parents/per_step_disagreement': parent_step_disagreement.detach().cpu(),
+				'parents/value_max_mean': parent_value.mean().item(),
+				'parents/value_max_std': parent_value.std(unbiased=False).item(),
+				'parents/disagreement_mean': parent_disagreement.mean().item(),
+				'parents/disagreement_std': parent_disagreement.std(unbiased=False).item(),
+			}
+			if self.log_detailed and final_parent_payload['parents_payload'] is not None:
+				info['planning_info'] = final_parent_payload['parents_payload']
+			return score, parents_actions, parents_std, info
+
 
 
 
@@ -493,6 +660,141 @@ class TDMPC2(torch.nn.Module):
 	def update_planner_mean(self, mean):
 		self._prev_mean.copy_(mean)
 		return 
+
+	def _init_train_planner_state(self):
+		parents = int(self.cfg.particle_parents)
+		if parents <= 0:
+			raise ValueError('particle_parents must be positive')
+		horizon = int(self.cfg.horizon)
+		action_dim = int(self.cfg.action_dim)
+		initial_std = float(self.cfg.particle_init_gaussian_std)
+		parents_actions = torch.zeros(horizon, parents, action_dim, device=self.device)
+		parents_std = torch.full((horizon, parents, action_dim), initial_std, device=self.device)
+		self.register_buffer('previous_train_parents_actions', parents_actions, persistent=False)
+		self.register_buffer('previous_train_parents_std', parents_std, persistent=False)
+		self._train_planner_elite_count = py_math.ceil(self.cfg.particle_child_elite_ratio * self.cfg.particle_children)
+		log.info('Initialized train planner state: parents=%s, horizon=%s, action_dim=%s, init_std=%.4f, elite_count=%s', parents, horizon, action_dim, initial_std, self._train_planner_elite_count)
+
+	def _validate_train_planner_cfg(self):
+		required = [
+			'enable_train_planner',
+			'dynamics_heads',
+			'latent_disagreement_lambda',
+			'latent_disagreement_metric',
+			'particle_parents',
+			'particle_children',
+			'particle_iterations',
+			'particle_use_policy_ratio',
+			'particle_child_elite_ratio',
+			'particle_init_gaussian_std',
+			'min_std',
+			'temperature',
+		]
+		missing = [key for key in required if not hasattr(self.cfg, key)]
+		if missing:
+			raise AttributeError(f'Missing train planner config keys: {missing}')
+		if int(self.cfg.dynamics_heads) < 2:
+			raise ValueError('enable_train_planner requires cfg.dynamics_heads >= 2')
+		if str(self.cfg.latent_disagreement_metric).lower() != 'variance':
+			raise ValueError('Only latent_disagreement_metric == "variance" is supported')
+		if int(self.cfg.particle_parents) <= 0:
+			raise ValueError('particle_parents must be > 0')
+		if int(self.cfg.particle_children) <= 0:
+			raise ValueError('particle_children must be > 0')
+		if int(self.cfg.particle_iterations) <= 0:
+			raise ValueError('particle_iterations must be > 0')
+		if not (0.0 <= float(self.cfg.particle_use_policy_ratio) <= 1.0):
+			raise ValueError('particle_use_policy_ratio must be in [0, 1]')
+		if not (0.0 < float(self.cfg.particle_child_elite_ratio) <= 1.0):
+			raise ValueError('particle_child_elite_ratio must be in (0, 1]')
+		elite = py_math.ceil(self.cfg.particle_child_elite_ratio * self.cfg.particle_children)
+		if elite < 1:
+			raise ValueError('particle_child_elite_ratio * particle_children must yield at least one elite child')
+		if float(self.cfg.particle_init_gaussian_std) <= 0.0:
+			raise ValueError('particle_init_gaussian_std must be > 0')
+		if float(self.cfg.min_std) <= 0.0:
+			raise ValueError('min_std must be > 0')
+		if float(self.cfg.temperature) <= 0.0:
+			raise ValueError('temperature must be > 0')
+		log.info('Train planner configuration validated successfully')
+
+	def _score_sequences_with_ensemble(self, z0, actions, task):
+		T, N, _ = actions.shape
+		head_count = len(self.model._dynamics)
+		if z0.dim() == 1:
+			z0_expanded = z0.unsqueeze(0)
+		elif z0.dim() == 2 and z0.shape[0] == 1:
+			z0_expanded = z0
+		else:
+			raise ValueError(f'Unexpected latent shape {tuple(z0.shape)} for planner encoding')
+		z0_expanded = z0_expanded.to(actions.device)
+		latent_dim = z0_expanded.shape[-1]
+		reward_per_head = torch.zeros(head_count, T, N, device=actions.device)
+		alive_per_head = torch.ones(head_count, T, N, device=actions.device)
+		bootstrap_values = torch.zeros(head_count, N, device=actions.device)
+		latent_sum = torch.zeros(T, N, latent_dim, device=actions.device)
+		latent_sq_sum = torch.zeros(T, N, latent_dim, device=actions.device)
+		for head_idx in range(head_count):
+			z = z0_expanded.repeat(N, 1)
+			for t in range(T):
+				reward_logits = self.model.reward(z, actions[t], task)
+				reward_scalar = math.two_hot_inv(reward_logits, self.cfg).view(N)
+				reward_per_head[head_idx, t] = reward_scalar
+				z = self.model.next(z, actions[t], task, head_indices=head_idx)
+				latent_sum[t] += z
+				latent_sq_sum[t] += z * z
+				if self.cfg.episodic:
+					term_prob = self.model.termination(z, task)
+					alive_per_head[head_idx, t] = (term_prob <= 0.5).view(N).float()
+				else:
+					alive_per_head[head_idx, t].fill_(1.)
+			bootstrap_action = actions[-1]
+			with torch.no_grad():
+				if self.cfg.ema_value_planning:
+					q_vals = self.model.Q(z, bootstrap_action, task, return_type='avg', target=True)
+				else:
+					q_vals = self.model.Q(z, bootstrap_action, task, return_type='avg', target=False)
+			bootstrap_values[head_idx] = q_vals.view(N)
+		optimistic_mask = alive_per_head.max(dim=0).values
+		gamma = self.discount if not self.cfg.multitask else self.discount[task]
+		gamma = gamma.to(actions.device)
+		values = torch.zeros(head_count, N, device=actions.device)
+		for head_idx in range(head_count):
+			discount = torch.ones(N, device=actions.device)
+			for t in range(T):
+				mask_t = optimistic_mask[t]
+				values[head_idx] += discount * mask_t * reward_per_head[head_idx, t]
+				discount = discount * mask_t * gamma
+			values[head_idx] += discount * optimistic_mask[-1] * bootstrap_values[head_idx]
+		value_max, value_max_head_idx = values.max(dim=0)
+		disagreement_per_step = (latent_sq_sum / head_count - (latent_sum / head_count) ** 2).mean(dim=-1)
+		disagreement = disagreement_per_step.mean(dim=0)
+		value_scaled = self.scale(value_max.unsqueeze(0)).squeeze(0)
+		raw_scores = value_scaled + float(self.cfg.latent_disagreement_lambda) * disagreement
+		return {
+			'raw': raw_scores,
+			'value_max': value_max,
+			'value_max_head': value_max_head_idx,
+			'disagreement': disagreement,
+			'per_step_disagreement': disagreement_per_step,
+			'values_all_heads': values,
+		}
+
+	def _sample_policy_rollouts(self, z0, total_sequences, task):
+		if z0.dim() == 1:
+			base = z0.unsqueeze(0)
+		elif z0.dim() == 2 and z0.shape[0] == 1:
+			base = z0
+		else:
+			raise ValueError(f'Unexpected latent shape {tuple(z0.shape)} for policy rollouts')
+		actions = torch.zeros(self.cfg.horizon, total_sequences, self.cfg.action_dim, device=self.device)
+		latents = base.repeat(total_sequences, 1)
+		for t in range(self.cfg.horizon):
+			action_t, _ = self.model.pi(latents, task, use_ema=self.cfg.policy_ema_enabled, search_noise=True)
+			actions[t] = action_t
+			if t < self.cfg.horizon - 1:
+				latents = self.model.next(latents, action_t, task)
+		return actions
 
 	# ------------------------------ Gradient logging helpers ------------------------------
 	def _grad_param_groups(self):
@@ -590,7 +892,6 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update_pi', self.cfg):
 			action, info = self.model.pi(z, task)
 			qs = self.model.Q(z, action, task, return_type='avg', detach=True)
-			self.scale.update(qs[0])
 			qs = self.scale(qs)
 			rho_pows = torch.pow(self.cfg.rho,
 				torch.arange(z.shape[0], device=self.device)

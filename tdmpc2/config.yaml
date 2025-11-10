@@ -11,7 +11,6 @@ episodic: false
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
-
 sac_style_td: false
 
 n_mc_samples_target: 1
@@ -19,8 +18,6 @@ n_mc_samples_target: 1
 fix_value_est: false
 
 train_act_std_coeff: 1
-
-
 best_eval: true
 
 detach_encoder_ratio: 0.5  # fraction of training steps after which to detach encoder gradients
@@ -104,6 +101,7 @@ reset:
 # planning
 eval_mpc: true
 train_mpc: true
+enable_train_planner: false
 iterations: 6
 num_samples: 512
 num_elites: 64
@@ -139,6 +137,7 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
+dynamics_heads: 1
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8

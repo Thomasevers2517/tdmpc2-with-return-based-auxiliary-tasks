@@ -247,3 +247,82 @@ class Logger:
 				self._log_dir / "eval.csv", header=keys, index=None
 			)
 		self._print(d, category)
+
+	def log_planner(self, planning_info, step):
+		if not planning_info:
+			return
+		log_keys = [
+			'planner/type',
+			'ensemble/size',
+			'particle/parents',
+			'particle/children',
+			'particle/iterations',
+			'particle/policy_children',
+			'particle/elite_k',
+			'planner/lambda',
+			'planner/temperature',
+			'parents/value_max_mean',
+			'parents/value_max_std',
+			'parents/disagreement_mean',
+			'parents/disagreement_std',
+			'chosen_parent_index',
+			'chosen_value_max_head',
+			'chosen_value_max',
+			'chosen_disagreement',
+			'chosen_parent_weight',
+		]
+		payload = {}
+		for key in log_keys:
+			if key not in planning_info:
+				continue
+			value = planning_info[key]
+			if hasattr(value, 'item') and callable(value.item) and getattr(value, 'numel', lambda: 0)() == 1:
+				try:
+					value = float(value.item())
+				except (ValueError, TypeError):
+					value = value.item()
+			elif hasattr(value, 'tolist') and getattr(value, 'ndim', 1) == 0:
+				value = value.tolist()
+			prefix = key if key.startswith('planner/') else f'planner/{key}'
+			payload[prefix] = value
+		if not payload:
+			return
+		detailed_payload = planning_info.get('planning_info') if isinstance(planning_info, dict) else None
+		if detailed_payload:
+			payload['planner/detail_level'] = 'detailed'
+			parent_count = len(detailed_payload)
+			payload['planner/detail_parent_count'] = parent_count
+			child_counts = []
+			best_child_raw_scores = []
+			best_child_value = []
+			best_child_disagreement = []
+			for parent in detailed_payload:
+				children = parent.get('children') if isinstance(parent, dict) else None
+				if isinstance(children, list):
+					child_counts.append(len(children))
+				best_raw = parent.get('best_child_raw_score') if isinstance(parent, dict) else None
+				if best_raw is not None:
+					best_child_raw_scores.append(float(best_raw))
+				best_value = parent.get('best_child_value_max') if isinstance(parent, dict) else None
+				if best_value is not None:
+					best_child_value.append(float(best_value))
+				best_dis = parent.get('best_child_disagreement') if isinstance(parent, dict) else None
+				if best_dis is not None:
+					best_child_disagreement.append(float(best_dis))
+			if child_counts:
+				payload['planner/detail_children_mean'] = float(np.mean(child_counts))
+				payload['planner/detail_children_max'] = int(max(child_counts))
+			if best_child_raw_scores:
+				payload['planner/detail_best_raw_min'] = float(min(best_child_raw_scores))
+				payload['planner/detail_best_raw_max'] = float(max(best_child_raw_scores))
+			if best_child_value:
+				payload['planner/detail_best_value_min'] = float(min(best_child_value))
+				payload['planner/detail_best_value_max'] = float(max(best_child_value))
+			if best_child_disagreement:
+				payload['planner/detail_best_disagreement_min'] = float(min(best_child_disagreement))
+				payload['planner/detail_best_disagreement_max'] = float(max(best_child_disagreement))
+		else:
+			payload['planner/detail_level'] = 'basic'
+		if self._wandb:
+			self._wandb.log(payload, step=step)
+		_log.info('Planner logging step=%s keys=%s', step, sorted(payload.keys()))
