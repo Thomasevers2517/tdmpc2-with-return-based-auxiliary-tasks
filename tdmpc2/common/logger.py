@@ -5,6 +5,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import torch
 from termcolor import colored
 import logging
 from common.logging_utils import get_logger
@@ -249,80 +250,129 @@ class Logger:
 		self._print(d, category)
 
 	def log_planner(self, planning_info, step):
-		if not planning_info:
+		if not planning_info or not isinstance(planning_info, dict):
 			return
-		log_keys = [
-			'planner/type',
-			'ensemble/size',
-			'particle/parents',
-			'particle/children',
-			'particle/iterations',
-			'particle/policy_children',
-			'particle/elite_k',
-			'planner/lambda',
-			'planner/temperature',
-			'parents/value_max_mean',
-			'parents/value_max_std',
-			'parents/disagreement_mean',
-			'parents/disagreement_std',
-			'chosen_parent_index',
-			'chosen_value_max_head',
-			'chosen_value_max',
-			'chosen_disagreement',
-			'chosen_parent_weight',
-		]
+		def _as_tensor(data):
+			if data is None:
+				return None
+			if isinstance(data, torch.Tensor):
+				return data.detach().cpu()
+			try:
+				return torch.as_tensor(data)
+			except Exception:
+				return None
+
 		payload = {}
-		for key in log_keys:
+		base_keys = (
+			'planner/type', 'ensemble/size', 'particle/parents', 'particle/children',
+			'particle/iterations', 'particle/policy_children', 'particle/elite_k',
+			'planner/lambda', 'planner/temperature',
+			'parents/value_max_mean', 'parents/value_max_std',
+			'parents/disagreement_mean', 'parents/disagreement_std',
+			'chosen_parent_index', 'chosen_value_max_head',
+			'chosen_value_max', 'chosen_disagreement', 'chosen_parent_weight'
+		)
+		for key in base_keys:
 			if key not in planning_info:
 				continue
 			value = planning_info[key]
-			if hasattr(value, 'item') and callable(value.item) and getattr(value, 'numel', lambda: 0)() == 1:
-				try:
-					value = float(value.item())
-				except (ValueError, TypeError):
-					value = value.item()
-			elif hasattr(value, 'tolist') and getattr(value, 'ndim', 1) == 0:
+			if hasattr(value, 'item') and getattr(value, 'numel', lambda: 0)() == 1:
+				value = value.item()
+			elif isinstance(value, torch.Tensor):
+				value = value.detach().cpu().tolist()
+			elif hasattr(value, 'tolist') and not isinstance(value, (str, bytes)):
 				value = value.tolist()
 			prefix = key if key.startswith('planner/') else f'planner/{key}'
 			payload[prefix] = value
-		if not payload:
-			return
-		detailed_payload = planning_info.get('planning_info') if isinstance(planning_info, dict) else None
+
+		parent_raw = _as_tensor(planning_info.get('parents/raw_scores'))
+		parent_value = _as_tensor(planning_info.get('parents/value_max'))
+		parent_disagreement = _as_tensor(planning_info.get('parents/disagreement'))
+		parent_weights = _as_tensor(planning_info.get('parents/softmax'))
+		parent_heads = _as_tensor(planning_info.get('parents/value_max_head'))
+		per_step_disagreement = _as_tensor(planning_info.get('parents/per_step_disagreement'))
+		chosen_parent_index = planning_info.get('chosen_parent_index')
+		if isinstance(chosen_parent_index, torch.Tensor):
+			chosen_parent_index = int(chosen_parent_index.item())
+
+		if parent_raw is not None and parent_raw.ndim == 1:
+			top_k = min(3, parent_raw.shape[0])
+			indices = torch.argsort(parent_raw, descending=True)
+			for rank in range(top_k):
+				idx = int(indices[rank].item())
+				prefix = f'planner/top_{rank}'
+				payload[f'{prefix}/index'] = idx
+				payload[f'{prefix}/raw'] = float(parent_raw[idx].item())
+				if parent_value is not None:
+					payload[f'{prefix}/value'] = float(parent_value[idx].item())
+				if parent_disagreement is not None:
+					payload[f'{prefix}/disagreement'] = float(parent_disagreement[idx].item())
+				if parent_weights is not None:
+					payload[f'{prefix}/weight'] = float(parent_weights[idx].item())
+				if parent_heads is not None:
+					payload[f'{prefix}/value_head'] = int(parent_heads[idx].item())
+			if parent_weights is not None:
+				payload['planner/parents/weight_entropy'] = float((-parent_weights.clamp_min(1e-12) * parent_weights.log()).sum().item())
+
+		if per_step_disagreement is not None and chosen_parent_index is not None:
+			if per_step_disagreement.ndim == 2 and 0 <= chosen_parent_index < per_step_disagreement.shape[1]:
+				chosen = per_step_disagreement[:, chosen_parent_index]
+				payload['planner/chosen/per_step_disagreement_mean'] = float(chosen.mean().item())
+				payload['planner/chosen/per_step_disagreement_max'] = float(chosen.max().item())
+				payload['planner/chosen/per_step_disagreement_min'] = float(chosen.min().item())
+				if self._wandb:
+					payload['planner/chosen/per_step_disagreement'] = chosen.tolist()
+
+		detailed_payload = planning_info.get('planning_info')
 		if detailed_payload:
 			payload['planner/detail_level'] = 'detailed'
-			parent_count = len(detailed_payload)
-			payload['planner/detail_parent_count'] = parent_count
-			child_counts = []
-			best_child_raw_scores = []
-			best_child_value = []
-			best_child_disagreement = []
-			for parent in detailed_payload:
-				children = parent.get('children') if isinstance(parent, dict) else None
-				if isinstance(children, list):
-					child_counts.append(len(children))
-				best_raw = parent.get('best_child_raw_score') if isinstance(parent, dict) else None
-				if best_raw is not None:
-					best_child_raw_scores.append(float(best_raw))
-				best_value = parent.get('best_child_value_max') if isinstance(parent, dict) else None
-				if best_value is not None:
-					best_child_value.append(float(best_value))
-				best_dis = parent.get('best_child_disagreement') if isinstance(parent, dict) else None
-				if best_dis is not None:
-					best_child_disagreement.append(float(best_dis))
-			if child_counts:
-				payload['planner/detail_children_mean'] = float(np.mean(child_counts))
-				payload['planner/detail_children_max'] = int(max(child_counts))
-			if best_child_raw_scores:
-				payload['planner/detail_best_raw_min'] = float(min(best_child_raw_scores))
-				payload['planner/detail_best_raw_max'] = float(max(best_child_raw_scores))
-			if best_child_value:
-				payload['planner/detail_best_value_min'] = float(min(best_child_value))
-				payload['planner/detail_best_value_max'] = float(max(best_child_value))
-			if best_child_disagreement:
-				payload['planner/detail_best_disagreement_min'] = float(min(best_child_disagreement))
-				payload['planner/detail_best_disagreement_max'] = float(max(best_child_disagreement))
+			detail_rows = []
+			detail_limit = min(len(detailed_payload), 4)
+			for idx in range(detail_limit):
+				parent = detailed_payload[idx]
+				if not isinstance(parent, dict):
+					continue
+				best_raw = parent.get('best_child_raw_score')
+				best_value = parent.get('best_child_value_max')
+				best_disagreement = parent.get('best_child_disagreement')
+				best_head = parent.get('best_child_value_max_head')
+				row = {
+					'parent_index': idx,
+					'best_raw_score': float(best_raw) if best_raw is not None else None,
+					'best_value': float(best_value) if best_value is not None else None,
+					'best_disagreement': float(best_disagreement) if best_disagreement is not None else None,
+					'best_head': int(best_head) if best_head is not None else None,
+				}
+				best_actions = parent.get('best_child_actions')
+				if isinstance(best_actions, torch.Tensor) and best_actions.numel() > 0:
+					action_preview = best_actions[0].detach().cpu().numpy()
+					row['first_action'] = np.round(action_preview, 4).tolist()
+				if isinstance(parent.get('children'), list):
+					row['num_children'] = len(parent['children'])
+				if parent.get('children'):
+					child_scores = [float(child.get('raw_score')) for child in parent['children'] if isinstance(child, dict) and child.get('raw_score') is not None]
+					if child_scores:
+						row['children_raw_min'] = float(min(child_scores))
+						row['children_raw_max'] = float(max(child_scores))
+				detail_rows.append(row)
+				if chosen_parent_index is not None and idx == chosen_parent_index:
+					payload['planner/chosen/action_preview'] = row.get('first_action')
+			if self._wandb and detail_rows:
+				columns = sorted(detail_rows[0].keys())
+				table = self._wandb.Table(columns=columns)
+				for row in detail_rows:
+					table.add_data(*[row[col] for col in columns])
+				payload['planner/detail_table'] = table
 		else:
 			payload['planner/detail_level'] = 'basic'
+
+		if not payload:
+			return
+
 		if self._wandb:
 			self._wandb.log(payload, step=step)
-		_log.info('Planner logging step=%s keys=%s', step, sorted(payload.keys()))
+		if parent_raw is not None and parent_value is not None and parent_disagreement is not None:
+			top_values = [(float(parent_raw[i].item()), float(parent_value[i].item()), float(parent_disagreement[i].item())) for i in torch.argsort(parent_raw, descending=True)[:min(3, parent_raw.shape[0])]]
+			_log.info('Planner step=%s top sequences (raw, value, disagreement): %s', step, top_values)
+		else:
+			_log.info('Planner logging step=%s keys=%s', step, sorted(payload.keys()))

@@ -40,7 +40,7 @@ class OnlineTrainer(Trainer):
 		ep_elite_std, ep_elite_mean = [], []
 		# self.validation_buffer.empty()
 		for i in range(self.cfg.eval_episodes):
-			self.model.reset_planner_state()
+			self.agent.reset_planner_state()
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
 			self.val_tds = [self.to_td(obs)]
 			if self.cfg.save_video:
@@ -157,7 +157,8 @@ class OnlineTrainer(Trainer):
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
 				action, info = self.agent.act(obs, mpc=self.cfg.train_mpc)
 				if isinstance(info, dict) and 'planner/type' in info:
-					self.logger.log_planner(info, self._step)
+					if (self._step % self.cfg.log_detail_freq < 5):
+						self.logger.log_planner(info, self._step)
 				action = action.cpu()
 			else:
 				action = self.env.rand_act()

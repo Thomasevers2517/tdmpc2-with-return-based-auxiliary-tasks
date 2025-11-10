@@ -545,7 +545,7 @@ class TDMPC2(torch.nn.Module):
 				parents_std[1:],
 				parents_std.new_full((1, parents, self.cfg.action_dim), init_std)
 			], dim=0)
-			log.info('plan_train warm start: parents_actions=%s parents_std=%s policy_children=%s', tuple(parents_actions.shape), tuple(parents_std.shape), policy_children)
+			log.debug('plan_train warm start: parents_actions=%s parents_std=%s policy_children=%s', tuple(parents_actions.shape), tuple(parents_std.shape), policy_children)
 			final_parent_payload = None
 			used_elite_count = None
 			for iteration in range(iterations):
@@ -611,7 +611,7 @@ class TDMPC2(torch.nn.Module):
 						'parents_payload': parents_payload if self.log_detailed else None,
 						'raw_scores_all': raw_scores.detach(),
 					}
-			log.info('plan_train final iteration completed')
+			log.debug('plan_train final iteration completed')
 			if final_parent_payload is None:
 				raise RuntimeError('Train planner failed to finalize parent payload')
 			parent_raw = final_parent_payload['raw']
