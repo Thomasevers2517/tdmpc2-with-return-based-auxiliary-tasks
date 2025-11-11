@@ -11,11 +11,32 @@ episodic: false
 checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
+
+enable_train_planner: false
+train_plan_value_bootstrap: mean  # 'max' or 'mean' bootstrap value across multi-gamma heads during MPC training
+particle_parents: 8    # number of parent particles per iteration for latent disagreement MPC training
+particle_children: 8   # number of child particles per parent per iteration for latent disagreement MPC
+particle_iterations: 3  # number of iterations of particle resampling for latent disagreement MPC training
+latent_disagreement_lambda: 0.01  # weight (λ) for latent disagreement bonus
+dynamics_heads: 3
+particle_child_elite_ratio: 0.25  # fraction of child particles to select as elites per parent during latent disagreement MPC training
+particle_use_policy_ratio: 0.25  # fraction of child particles sampled from current policy during latent disagreement MPC training
+particle_init_gaussian_std: 0.5  # stddev of Gaussian noise added to initial particles during latent disagreement MPC training
+
+
 sac_style_td: false
+
 
 n_mc_samples_target: 1
 
 fix_value_est: false
+
+
+# Hot buffer (recent transitions) for mixed sampling
+hot_buffer_enabled: true         # When true, also store recent transitions in a small buffer
+hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
+hot_buffer_size: 200               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+
 
 train_act_std_coeff: 1
 best_eval: true
@@ -24,7 +45,7 @@ detach_encoder_ratio: 0.5  # fraction of training steps after which to detach en
 
 search_pi_std_mult: 1.0  # multiplier for noise added during seed action sampling in MPC planning
 # training
-buffer_update_interval: -1  # number of env steps between buffer additions when not at episode end
+buffer_update_interval: 10  # number of env steps between buffer additions when not at episode end
 
 # per_alpha: 0 # 0 means uniform sampling, >0 means prioritized experience replay
 # per_priority: recency # recency | consistency
@@ -71,10 +92,7 @@ discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1000_000
 
-# Hot buffer (recent transitions) for mixed sampling
-hot_buffer_enabled: false         # When true, also store recent transitions in a small buffer
-hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-hot_buffer_size: 200               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+
 
 pin_memory: true
 prefetch: 4
@@ -101,7 +119,6 @@ reset:
 # planning
 eval_mpc: true
 train_mpc: true
-enable_train_planner: false
 iterations: 6
 num_samples: 512
 num_elites: 64
@@ -137,7 +154,6 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
-dynamics_heads: 1
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8

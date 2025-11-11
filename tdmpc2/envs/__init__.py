@@ -90,7 +90,6 @@ def make_env(cfg):
 		cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
 	cfg.action_dim = env.action_space.shape[0]
 	cfg.episode_length = env.max_episode_steps
-	if cfg.seed_steps is None:
-		cfg.seed_steps = max(1000, 5*cfg.episode_length)
+	cfg.seed_steps = max(1000, 5*cfg.episode_length)
 	log.info(f"Created environment '{cfg.task}' with observation shape {cfg.obs_shape}, action dim {cfg.action_dim}, episode length {cfg.episode_length}, seed steps {cfg.seed_steps}")
 	return env

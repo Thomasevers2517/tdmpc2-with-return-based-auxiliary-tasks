@@ -65,8 +65,6 @@ class OnlineTrainer(Trainer):
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 			if mpc:
-				ep_elite_std.append(act_info['std'].mean().cpu())
-				ep_elite_mean.append(act_info['mean'].abs().mean().cpu())
 				self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 				self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 		if mpc:

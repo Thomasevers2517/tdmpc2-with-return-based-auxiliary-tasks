@@ -250,6 +250,13 @@ class Logger:
 		self._print(d, category)
 
 	def log_planner(self, planning_info, step):
+		"""Pretty-print and optionally upload planner diagnostics.
+
+		Args:
+			planning_info: Dictionary emitted by :class:`Planner` containing scalar
+				metrics, tensors, and optional detailed payloads.
+			step: Global environment step associated with these metrics.
+		"""
 		if not planning_info or not isinstance(planning_info, dict):
 			return
 		def _as_tensor(data):
@@ -263,6 +270,8 @@ class Logger:
 				return None
 
 		payload = {}
+		# Scalars and small tensors that should become wandb scalars live under
+		# ``base_keys``. We normalise them to cpu/python types for logging.
 		base_keys = (
 			'planner/type', 'ensemble/size', 'particle/parents', 'particle/children',
 			'particle/iterations', 'particle/policy_children', 'particle/elite_k',
@@ -296,6 +305,7 @@ class Logger:
 			chosen_parent_index = int(chosen_parent_index.item())
 
 		if parent_raw is not None and parent_raw.ndim == 1:
+			# Highlight the top-K parent trajectories for quick inspection.
 			top_k = min(3, parent_raw.shape[0])
 			indices = torch.argsort(parent_raw, descending=True)
 			for rank in range(top_k):
@@ -316,6 +326,7 @@ class Logger:
 
 		if per_step_disagreement is not None and chosen_parent_index is not None:
 			if per_step_disagreement.ndim == 2 and 0 <= chosen_parent_index < per_step_disagreement.shape[1]:
+				# Summarise the disagreement curve for the chosen parent.
 				chosen = per_step_disagreement[:, chosen_parent_index]
 				payload['planner/chosen/per_step_disagreement_mean'] = float(chosen.mean().item())
 				payload['planner/chosen/per_step_disagreement_max'] = float(chosen.max().item())
@@ -370,6 +381,7 @@ class Logger:
 			return
 
 		if self._wandb:
+			# Upload structured data to wandb so dashboards mirror console logs.
 			self._wandb.log(payload, step=step)
 		if parent_raw is not None and parent_value is not None and parent_disagreement is not None:
 			top_values = [(float(parent_raw[i].item()), float(parent_value[i].item()), float(parent_disagreement[i].item())) for i in torch.argsort(parent_raw, descending=True)[:min(3, parent_raw.shape[0])]]

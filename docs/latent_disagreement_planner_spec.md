@@ -109,7 +109,6 @@ The following keys MUST exist when `enable_train_planner` is true; otherwise rai
 - enable_train_planner: bool
 - dynamics_heads: int >= 2
 - latent_disagreement_lambda: float  (λ)
-- latent_disagreement_metric: string; must be 'variance'
 - particle_parents: int (P)
 - particle_children: int (C)
 - particle_iterations: int (I >= 1)
@@ -120,7 +119,6 @@ The following keys MUST exist when `enable_train_planner` is true; otherwise rai
 
 Validation rules:
 - If `enable_train_planner` and `dynamics_heads < 2` → error.
-- `latent_disagreement_metric` must be exactly 'variance' (other metrics not supported yet).
 - `particle_parents * particle_children` defines the number of evaluated sequences per iteration (no alternative `num_samples` allowed in train planner).
 - `particle_child_elite_ratio` ∈ (0,1]; compute elite_k = ceil(ratio * C); enforce elite_k >= 1.
 
@@ -283,7 +281,6 @@ Implementation note: array-heavy artifact logging can be gated and/or written vi
 - If `enable_train_planner` is True and any required key is missing → raise `RuntimeError` with a precise message (no silent defaults).
 - If multitask is enabled in config when using train planner (for this phase) → raise `NotImplementedError`.
 - If `dynamics_heads < 2` with train planner → error.
-- If `latent_disagreement_metric != 'variance'` → error.
 - If `cfg.temperature` is missing → error.
 
 ## Future TODOs
