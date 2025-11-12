@@ -588,7 +588,7 @@ class WorldModel(nn.Module):
 							# Use head-0 latents for policy sampling
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
 							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False))
-							a_t = a_flat.view(B, N, A)  # float32[B,N,A]
+							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
 					else:
 						a_t = actions[:, :, t, :]  # float32[B,N,A]
 					actions_steps.append(a_t)
