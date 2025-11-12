@@ -20,11 +20,11 @@ from torch.autograd.profiler import emit_nvtx
 from trainer.offline_trainer import OfflineTrainer
 from trainer.online_trainer import OnlineTrainer
 from common.logger import Logger
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
-
+torch.autograd.set_detect_anomaly(True)
 
 @hydra.main(config_name='config', config_path='.')
 def train(cfg: dict):
@@ -46,6 +46,8 @@ def train(cfg: dict):
 		$ python train.py task=dog-run steps=7000000
 	```
 	"""
+	torch.autograd.set_detect_anomaly(True)
+
 	assert torch.cuda.is_available()
 	assert cfg.steps > 0, 'Must train for at least 1 step.'
 	cfg = parse_cfg(cfg)

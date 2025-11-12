@@ -4,7 +4,7 @@ import torch
 from tensordict.tensordict import TensorDict
 from torchrl.data.replay_buffers import ReplayBuffer, LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 log = get_logger(__name__)
 
@@ -121,7 +121,8 @@ class Buffer():
 		"""Add an episode to the buffer."""
 		td['episode'] = torch.full_like(td['reward'], self._num_eps, dtype=torch.int64)
 
-		if self._num_eps == 0:
+		# Initialize underlying storage only once, on first add (regardless of episode count).
+		if self._buffer is None:
 			self._buffer = self._init(td)
 
 		self._buffer.extend(td)

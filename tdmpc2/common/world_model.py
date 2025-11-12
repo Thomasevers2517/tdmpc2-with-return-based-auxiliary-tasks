@@ -34,7 +34,19 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		self._dynamics = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], cfg.latent_dim, act=layers.SimNorm(cfg))
+		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
+		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
+		self._dynamics_heads = nn.ModuleList([
+			layers.mlp(
+				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+				2 * [cfg.mlp_dim],
+				cfg.latent_dim,
+				act=layers.SimNorm(cfg),
+			)
+			for _ in range(h_total)
+		])
+		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
+		self._dynamics = self._dynamics_heads[0]
 		
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
@@ -305,17 +317,48 @@ class WorldModel(nn.Module):
 				out = encoder[self.cfg.obs](obs)
 			return out.float()
 
-	def next(self, z, a, task):
-		"""
-		Predicts the next latent state given the current latent state and action.
+	def next(self, z, a, task, head_mode=None):
+		"""Predict next latent(s) for one step.
+
+		Args:
+			z (Tensor[B, L]): Current latent.
+			a (Tensor[B, A]): Current action.
+			task: Optional task id for multitask (passed to task_emb when enabled).
+			head_mode (str|None): If None, returns Tensor[B,L] using head 0 (legacy path).
+				If 'single', returns Tensor[1,B,L] using head 0.
+				If 'random', returns Tensor[1,B,L] using a random head per call.
+				If 'all', returns Tensor[H,B,L] stacked over all dynamics heads.
+
+		Returns:
+			Tensor[..., B, L]: Next latent(s) with optional head dimension leading.
 		"""
 		with maybe_range('WM/dynamics', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
-			with self._autocast_context():
-				out = self._dynamics(za)
-			return out.float()
+			H = len(self._dynamics_heads)
+			if head_mode is None:
+				# Legacy behavior: single head (0), no head dimension in output
+				with self._autocast_context():
+					out = self._dynamics_heads[0](za)
+				return out.float()
+			if head_mode == 'single':
+				with self._autocast_context():
+					out = self._dynamics_heads[0](za)
+				return out.float().unsqueeze(0)
+			elif head_mode == 'random':
+				idx = int(torch.randint(low=0, high=H, size=(1,), device=za.device))
+				with self._autocast_context():
+					out = self._dynamics_heads[idx](za)
+				return out.float().unsqueeze(0)
+			elif head_mode == 'all':
+				outs = []
+				with self._autocast_context():
+					for head in self._dynamics_heads:
+						outs.append(head(za)) 
+				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
+			else:
+				raise ValueError(f"Unsupported head_mode: {head_mode}")
 
 	def reward(self, z, a, task):
 		"""
@@ -403,31 +446,33 @@ class WorldModel(nn.Module):
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			if self._aux_joint_Qs is not None:
-				with self._autocast_context():
-					if target:
-						raw = self._target_aux_joint_Qs(za)
-					elif detach:
-						raw = self._detach_aux_joint_Qs(za)
-					else:
-						raw = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
-				out = raw.float()
-				# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
-				T, B = out.shape[0], out.shape[1]
-				G = self._num_aux_gamma
-				K = self.cfg.num_bins
-				if out.shape[-1] != G * K:
-					raise RuntimeError(f"Q_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
-				out = out.view(T, B, G, K).permute(2, 0, 1, 3).contiguous()  # (G,T,B,K)
+				with maybe_range('WM/Q_aux/joint', self.cfg):
+					with self._autocast_context():
+						if target:
+							raw = self._target_aux_joint_Qs(za)
+						elif detach:
+							raw = self._detach_aux_joint_Qs(za)
+						else:
+							raw = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+					out = raw.float()
+					# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
+					T, B = out.shape[0], out.shape[1]
+					G = self._num_aux_gamma
+					K = self.cfg.num_bins
+					if out.shape[-1] != G * K:
+						raise RuntimeError(f"Q_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
+					out = out.view(T, B, G, K).permute(2, 0, 1, 3)  # (G,T,B,K)
 			elif self._aux_separate_Qs is not None:
-				with self._autocast_context():
-					if target:
-						raw_list = [head(za) for head in self._target_aux_separate_Qs]
-					elif detach:
-						raw_list = [head(za) for head in self._detach_aux_separate_Qs]
-					else:
-						raw_list = [head(za) for head in self._aux_separate_Qs]
-				outs = [rl.float() for rl in raw_list]
-				out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
+				with maybe_range('WM/Q_aux/separate', self.cfg):
+					with self._autocast_context():
+						if target:
+							raw_list = [head(za) for head in self._target_aux_separate_Qs]
+						elif detach:
+							raw_list = [head(za) for head in self._detach_aux_separate_Qs]
+						else:
+							raw_list = [head(za) for head in self._aux_separate_Qs]
+					outs = [rl.float() for rl in raw_list]
+					out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
 	
 			if return_type == 'all':
 				return out
@@ -467,3 +512,113 @@ class WorldModel(nn.Module):
 			if return_type == "min":
 				return Q.min(0).values
 			return Q.sum(0) / 2
+
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None):
+		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
+
+		Args:
+			z0 (Tensor[L] or Tensor[B,L]): Initial latent(s).
+			actions (Tensor[B,N,T,A], optional): Action sequences when `use_policy=False`.
+			use_policy (bool): If True, ignore `actions` and sample actions from policy using head-0 latents.
+			horizon (int, optional): Number of steps `T` when `use_policy=True`.
+			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
+			head_mode (str): 'single' | 'all' | 'random'.
+			task: Optional task id for multitask.
+
+		Returns:
+			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
+		"""
+		if use_policy:
+			if actions is not None:
+				raise ValueError('Provide either actions or use_policy=True, not both.')
+			if horizon is None or num_rollouts is None:
+				raise ValueError('horizon and num_rollouts required when use_policy=True.')
+			T = int(horizon)  # steps
+			N = int(num_rollouts)  # sequences
+		else:
+			if actions is None:
+				raise ValueError('actions must be provided when use_policy=False.')
+			if actions.ndim != 4:
+				raise ValueError(f'actions must be [B,N,T,A], got shape {tuple(actions.shape)}')
+			B, N, T, A = actions.shape  # actions: float32[B,N,T,A]
+			if horizon is not None and horizon != T:
+				raise ValueError('Provided horizon does not match actions.shape[2].')
+
+		device = next(self.parameters()).device
+		# Normalize z0 to [B,L]
+		if z0.ndim == 1:
+			z0 = z0.unsqueeze(0)  # [1,L] -> [B=1,L]
+		B = z0.shape[0]
+		L = z0.shape[-1]
+
+		H_total = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
+		if head_mode == 'single':
+			H_sel = 1
+			head_indices = [0]
+		elif head_mode == 'all':
+			H_sel = H_total
+			head_indices = list(range(H_total))
+		elif head_mode == 'random':
+			H_sel = 1
+			idx = int(torch.randint(low=0, high=H_total, size=(1,), device=z0.device))
+			head_indices = [idx]
+		else:
+			raise ValueError(f'Unsupported head_mode: {head_mode}')
+
+		# Determine action dim
+		if not use_policy:
+			A = actions.shape[-1]
+		else:
+			A = self.cfg.action_dim
+
+		# Build per-step lists to avoid in-place writes on graph tensors
+		# t=0 state for all heads: broadcast z0 over N, then tile over heads
+		z0_bn = z0.unsqueeze(1).expand(B, N, L)  # float32[B,N,L]
+		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)  # float32[H_sel,B,N,L]
+		latents_steps = [z0_hbn]
+		actions_steps = []  # each entry: float32[B,N,A]
+
+		with maybe_range('WM/rollout_latents', self.cfg):
+			# Time loop over T
+			for t in range(T):
+				with maybe_range('WM/rollout_latents/step_loop', self.cfg):
+					# Select actions at time t
+					if use_policy:
+						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
+							# Use head-0 latents for policy sampling
+							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
+							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False))
+							a_t = a_flat.view(B, N, A)  # float32[B,N,A]
+					else:
+						a_t = actions[:, :, t, :]  # float32[B,N,A]
+					actions_steps.append(a_t)
+
+					# Advance each selected head independently
+					next_heads = []  # will hold float32[B,N,L] per head
+					for hi, h in enumerate(head_indices):
+						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
+							z_curr = latents_steps[t][hi].view(B * N, L)  # float32[B*N,L]
+							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
+							if self.cfg.multitask:
+								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
+							else:
+								z_cat = z_curr
+							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
+							with self._autocast_context():
+								next_flat = self._dynamics_heads[h](za)  # float32[B*N,L]
+							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
+							next_heads.append(next_bn)
+
+					# Aggregate heads for next timestep
+					next_hbn = torch.stack(next_heads, dim=0)  # float32[H_sel,B,N,L]
+					latents_steps.append(next_hbn)
+
+		# Stack over time to produce final outputs
+		with maybe_range('WM/rollout_latents/finalize', self.cfg):
+			latents = torch.stack(latents_steps, dim=3).contiguous()  # float32[H_sel,B,N,T+1,L]
+			actions_out = torch.stack(actions_steps, dim=2).contiguous()  # float32[B,N,T,A]
+
+		# Cheap sanity: ensure contiguity for downstream views
+		assert latents.is_contiguous(), "latents expected contiguous"
+		assert actions_out.is_contiguous(), "actions_out expected contiguous"
+		return latents, actions_out

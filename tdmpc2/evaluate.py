@@ -13,7 +13,7 @@ from common.parser import parse_cfg
 from common.seed import set_seed
 from envs import make_env
 from tdmpc2 import TDMPC2
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 torch.backends.cudnn.benchmark = True
 
@@ -40,6 +40,7 @@ def evaluate(cfg: dict):
 		$ python evaluate.py task=dog-run checkpoint=/path/to/dog-1.pt save_video=true
 	```
 	"""
+	raise NotImplementedError("Evaluation script is not yet implemented for new version.")
 	assert torch.cuda.is_available()
 	assert cfg.eval_episodes > 0, 'Must evaluate at least 1 episode.'
 	cfg = parse_cfg(cfg)

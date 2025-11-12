@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from common.buffer import Buffer
 from trainer.base import Trainer
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 log = get_logger(__name__)
 

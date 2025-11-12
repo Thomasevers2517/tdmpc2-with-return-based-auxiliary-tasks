@@ -7,7 +7,25 @@ import numpy as np
 import pandas as pd
 from termcolor import colored
 import logging
-from common.logging_utils import get_logger
+from typing import Optional
+import torch
+
+# Minimal shim: unified logger accessor for modules outside of Logger class
+def get_logger(name: Optional[str] = None, cfg: Optional[object] = None) -> logging.Logger:
+	"""Return a standard Python logger, optionally setting level from cfg.
+
+	Args:
+		name: Logger name.
+		cfg: Optional config object; if provided and has attribute `debug`, sets level DEBUG when True else INFO.
+	"""
+	logger = logging.getLogger(name if name else __name__)
+	if cfg is not None:
+		level = logging.DEBUG if getattr(cfg, 'debug', False) else logging.INFO
+		# Only raise level (avoid lowering an already more verbose logger unexpectedly)
+		if logger.level != level:
+			logger.setLevel(level)
+	return logger
+
 _log = get_logger(__name__)
 
 from common import TASK_SET
@@ -114,6 +132,7 @@ class Logger:
 	"""Primary logging object. Logs either locally or using wandb."""
 
 	def __init__(self, cfg):
+		self.stdlog = get_logger(__name__)
 		self._log_dir = make_dir(cfg.work_dir)
 		self._model_dir = make_dir(self._log_dir / "models")
 		self._save_csv = cfg.save_csv
@@ -197,6 +216,28 @@ class Logger:
 				pieces.append(f"{self._format(disp_k, d[k], ty):<22}")
 		_log.info("%s", "   ".join(pieces))
 
+	# ----------------------- Modular sink helpers -----------------------
+	def _wandb_log(self, payload: dict, step: int, category: str):
+		"""Log a flat dict to WandB with category-prefixed keys.
+
+		Assumes payload already contains scalar/serializable values and that
+		'step' is provided separately for x-axis alignment.
+		"""
+		if not self._wandb:
+			return
+		_d = {}
+		for k, v in payload.items():
+			_d[f"{category}/{k}"] = v
+		self._wandb.log(_d, step=step)
+
+	def _csv_eval_append(self, payload: dict):
+		"""Append eval metrics to CSV when present in payload."""
+		keys = ["step", "episode_reward"]
+		self._eval.append(np.array([payload[keys[0]], payload[keys[1]]]))
+		pd.DataFrame(np.array(self._eval)).to_csv(
+			self._log_dir / "eval.csv", header=keys, index=None
+		)
+
 	def pprint_multitask(self, d, cfg):
 		"""Pretty-print evaluation metrics for multi-task training."""
 		_log.info("%s", colored(f'Evaluated agent on {len(cfg.tasks)} tasks:', 'yellow', attrs=['bold']))
@@ -229,21 +270,69 @@ class Logger:
 
 	def log(self, d, category="train"):
 		# assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
+		# Determine x-axis key
+		if category in {"train", "eval"}:
+			xkey = "step"
+		elif category == "pretrain":
+			xkey = "iteration"
+		else:
+			xkey = "step"
+		# WandB sink
 		if self._wandb:
-			if category in {"train", "eval"}:
-				xkey = "step"
-			elif category == "pretrain":
-				xkey = "iteration"
-			else:
-				xkey = "step"
-			_d = dict()
-			for k, v in d.items():
-				_d[category + "/" + k] = v
-			self._wandb.log(_d, step=d[xkey])
-		if category == "eval" and self._save_csv:
-			keys = ["step", "episode_reward"]
-			self._eval.append(np.array([d[keys[0]], d[keys[1]]]))
-			pd.DataFrame(np.array(self._eval)).to_csv(
-				self._log_dir / "eval.csv", header=keys, index=None
-			)
+			self._wandb_log(d, step=d[xkey], category=category)
+		# Eval CSV sink
+		if category == "eval" and self._save_csv and ("episode_reward" in d):
+			self._csv_eval_append(d)
+		# Console print sink (legacy behavior retained)
 		self._print(d, category)
+
+	def log_planner_info(self, info, step: int, category: str = "train"):
+		"""Log planner information dataclass (basic or advanced).
+
+		Args:
+			info: PlannerBasicInfo or PlannerAdvancedInfo instance.
+			step: Global step for x-axis alignment.
+			category: Log category (train/eval/etc.).
+		"""
+		try:
+			from common.planner.info_types import PlannerBasicInfo, PlannerAdvancedInfo
+		except Exception:
+			# If planner not yet available, skip
+			return
+		payload = {
+			"step": step,
+			"planner/value_chosen": getattr(info, "value_chosen", None),
+			"planner/value_elite_mean": getattr(info, "value_elite_mean", None),
+			"planner/value_elite_std": getattr(info, "value_elite_std", None),
+			"planner/value_elite_max": getattr(info, "value_elite_max", None),
+			"planner/num_elites": getattr(info, "num_elites", None),
+		}
+		d_chosen = getattr(info, "disagreement_chosen", None)
+		if d_chosen is not None:
+			payload["planner/disagreement_chosen"] = d_chosen
+		d_mean = getattr(info, "disagreement_elite_mean", None)
+		d_std = getattr(info, "disagreement_elite_std", None)
+		d_max = getattr(info, "disagreement_elite_max", None)
+		if d_mean is not None:
+			payload["planner/disagreement_elite_mean"] = d_mean
+		if d_std is not None:
+			payload["planner/disagreement_elite_std"] = d_std
+		if d_max is not None:
+			payload["planner/disagreement_elite_max"] = d_max
+		# Planner: WandB-only by default. No console print, no eval CSV.
+		# If WandB disabled and debug_console is False: no-op.
+		# Normalize 0-dim tensors to Python scalars (detach -> cpu -> item)
+		for k, v in list(payload.items()):
+			if k == 'step':
+				continue
+			if isinstance(v, torch.Tensor):
+				if v.numel() == 1:
+					payload[k] = v.detach().cpu().item()
+				else:
+					# Skip large tensors (histograms could be added later)
+					payload.pop(k)
+		if self._wandb:
+			self._wandb_log({k: v for k, v in payload.items() if k != 'step'}, step=payload["step"], category=category)
+			# Optional console mirroring in debug mode
+
+		return

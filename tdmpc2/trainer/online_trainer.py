@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tensordict.tensordict import TensorDict
 from trainer.base import Trainer
-from common.logging_utils import get_logger
+from common.logger import get_logger
 from common.buffer import Buffer
 log = get_logger(__name__)
 
@@ -14,6 +14,8 @@ class OnlineTrainer(Trainer):
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
+		# Configure this module's logger level per cfg.debug
+		get_logger(log.name, cfg=self.cfg)
 		self._step = 0
 		self._ep_idx = 0
 		self._ep_rew = torch.tensor(0.0)
@@ -47,7 +49,7 @@ class OnlineTrainer(Trainer):
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, act_info = self.agent.act(obs, eval_mode=True, mpc=mpc)
+				action, planner_info = self.agent.act(obs, eval_mode=True, mpc=mpc)
 				action = action.cpu()
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
@@ -64,8 +66,6 @@ class OnlineTrainer(Trainer):
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 			if mpc:
-				ep_elite_std.append(act_info['std'].mean().cpu())
-				ep_elite_mean.append(act_info['mean'].abs().mean().cpu())
 				self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 				self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 		if mpc:
@@ -107,10 +107,16 @@ class OnlineTrainer(Trainer):
 
 	def train(self):
 		"""Train a TD-MPC2 agent."""
+		# Ensure trainer logger level matches cfg.debug
+		get_logger(__name__, cfg=self.cfg)
 		train_metrics, done, eval_next = {}, True, False
 		while self._step <= self.cfg.steps:
-			# Evaluate agent periodically
-			if self._step % (self.cfg.eval_freq) == 0:
+			# Logging cadence flags
+			detail_freq = self.cfg.log_detail_freq
+			detailed_log_flag = (self._step % detail_freq == 0) or (self._step == self.cfg.steps)
+			basic_log_flag = (self._step % self.cfg.log_freq == 0) or detailed_log_flag
+			# Evaluate agent periodically, but never at step 0
+			if self._step != 0 and (self._step % self.cfg.eval_freq == 0):
 				eval_next = True
 
 			# Reset environment
@@ -154,8 +160,10 @@ class OnlineTrainer(Trainer):
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, info = self.agent.act(obs, mpc=self.cfg.train_mpc)
+				action, planner_info = self.agent.act(obs, mpc=self.cfg.train_mpc)
 				action = action.cpu()
+				if basic_log_flag:
+					self.logger.log_planner_info(planner_info, self._step, category='train')
 			else:
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
@@ -168,18 +176,20 @@ class OnlineTrainer(Trainer):
 					log.info('Pretraining agent on seed data...')
 				else:
 					num_updates = self.cfg.utd_ratio
-				for _ in range(num_updates):
+				for update_idx in range(num_updates):
 
-					for _ in range(self.cfg.ac_utd_multiplier-1):
-						_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=True)
+					for ac_idx in range(self.cfg.ac_utd_multiplier-1):
+						_train_metrics = self.agent.update(self.buffer, step=self._step, ac_only=True)
 						train_metrics.update(_train_metrics)
-					_train_metrics = self.agent.update(self.buffer, step = self._step, ac_only=False)
+						if self.cfg.debug:
+							log.info('update step=%d inner_ac=%d/%d (ac_only)', self._step, ac_idx+1, self.cfg.ac_utd_multiplier-1)
+					_train_metrics = self.agent.update(self.buffer, step=self._step, ac_only=False)
 					train_metrics.update(_train_metrics)
+					if self.cfg.debug:
+						log.info('update step=%d main_update=%d/%d', self._step, update_idx+1, num_updates)
 
 
-			if (self._step * (self.cfg.utd_ratio)) % self.cfg.reset_agent_freq == 0 and self._step > 0:
-				self.agent.reset_agent()
-				log.info('Reset agent at step %d', self._step)
+			# Network reset removed per refactor; maintain steady training without periodic resets.
 					
 
 			self._step += 1

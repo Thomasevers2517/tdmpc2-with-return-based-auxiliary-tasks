@@ -5,7 +5,7 @@ import gymnasium as gym
 
 from envs.wrappers.multitask import MultitaskWrapper
 from envs.wrappers.tensor import TensorWrapper
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 log = get_logger(__name__)
 
@@ -90,5 +90,6 @@ def make_env(cfg):
 		cfg.obs_shape = {cfg.get('obs', 'state'): env.observation_space.shape}
 	cfg.action_dim = env.action_space.shape[0]
 	cfg.episode_length = env.max_episode_steps
-	cfg.seed_steps = max(1000, 5*cfg.episode_length)
+	if not hasattr(cfg, 'seed_steps') or cfg.seed_steps is None or type(cfg.seed_steps) != int:
+		cfg.seed_steps = max(1000, 5*cfg.episode_length)
 	return env

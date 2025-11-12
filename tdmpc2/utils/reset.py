@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from common import init, layers
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 
 log = get_logger(__name__)

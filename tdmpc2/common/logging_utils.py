@@ -1,34 +1,11 @@
-import logging
-import os
-import sys
-from typing import Optional, Union
+"""
+DEPRECATED: common.logging_utils has been removed.
 
+All code should import loggers via `from common.logger import get_logger` and use
+the `Logger` class for metrics/W&B logging. This module intentionally raises on
+import to surface any lingering, unintended dependencies.
+"""
 
-def configure_logging(level: Optional[Union[str, int]] = None) -> logging.Logger:
-    """Configure root logging once.
-
-    - Uses stdout stream handler.
-    - Default level from $LOGLEVEL or INFO.
-    - No-op if handlers already exist.
-    """
-    root = logging.getLogger()
-    if level is None:
-        level = os.getenv("LOGLEVEL", "INFO").upper()
-    if not root.handlers:
-        root.setLevel(level)  # type: ignore[arg-type]
-        handler = logging.StreamHandler(stream=sys.stdout)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s %(levelname).1s %(name)s: %(message)s",
-            datefmt="%H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-        root.addHandler(handler)
-    else:
-        if level is not None:
-            root.setLevel(level)  # type: ignore[arg-type]
-    return root
-
-
-def get_logger(name: Optional[str] = None) -> logging.Logger:
-    """Return a logger. Assumes logging is configured by Hydra or entry points."""
-    return logging.getLogger(name if name else __name__)
+raise ImportError(
+    "common.logging_utils is deprecated; use common.logger.get_logger instead."
+)

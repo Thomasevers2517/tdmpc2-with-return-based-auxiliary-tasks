@@ -1,0 +1,63 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train: Debug (prompt heads)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tdmpc2/train.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "HYDRA_FULL_ERROR": "1"
+            },
+            "args": [
+                "task=quadruped-walk",
+                "steps=100000",
+                "compile=true",
+                "enable_wandb=true",
+                "wandb_silent=false",
+                "save_video=false",
+                "planner_num_dynamics_heads=${input:plannerHeads}",
+                "planner_lambda_disagreement=30000"
+            ]
+        },
+        {
+            "name": "Train: Debug (GPU3, heads=4)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tdmpc2/train.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "HYDRA_FULL_ERROR": "1",
+                "CUDA_VISIBLE_DEVICES": "3"
+            },
+            "args": [
+                "task=quadruped-walk",
+                "steps=100000",
+                "compile=true",
+                "enable_wandb=true",
+                "wandb_silent=false",
+                "save_video=false",
+                "planner_num_dynamics_heads=4",
+                "planner_lambda_disagreement=30000"
+            ]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "plannerHeads",
+            "type": "promptString",
+            "description": "planner_num_dynamics_heads",
+            "default": "4"
+        }
+    ]
+}

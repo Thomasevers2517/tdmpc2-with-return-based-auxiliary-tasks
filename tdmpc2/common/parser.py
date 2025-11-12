@@ -120,6 +120,31 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		assert len(gammas) <= 6, f'multi_gamma supports at most 6 auxiliary gammas (got {len(gammas)}).'
 		assert cfg.multi_gamma_head in {'joint', 'separate'}, f"Invalid multi_gamma_head {cfg.multi_gamma_head}."
 
+	# ----------------------------------------------------------------------
+	# Fail-fast configuration constraints (centralized here)
+	# ----------------------------------------------------------------------
+	# 1) If buffer_update_interval is enabled (!= -1), ensure seed_steps > interval
+	#    so that at least one buffer write occurs before updates begin.
+	if not OmegaConf.is_missing(cfg, 'buffer_update_interval') and not OmegaConf.is_missing(cfg, 'seed_steps'):
+		if cfg.buffer_update_interval != -1:
+			assert (
+				cfg.seed_steps > cfg.buffer_update_interval
+			), (
+				f"seed_steps ({cfg.seed_steps}) must be > buffer_update_interval ({cfg.buffer_update_interval}) "
+				"when interval is enabled."
+			)
+
+	# 2) As requested: enforce seed_steps < episode_length.
+	#    Note: with buffer_update_interval == -1, this may reduce pretrain data if episodes are long.
+	#    This is intentional per current project policy and can be revisited.
+	if not OmegaConf.is_missing(cfg, 'episode_length') and not OmegaConf.is_missing(cfg, 'seed_steps'):
+		if cfg.episode_length is not None:
+			assert (
+				cfg.seed_steps < cfg.episode_length
+			), (
+				f"seed_steps ({cfg.seed_steps}) must be < episode_length ({cfg.episode_length})."
+			)
+
 	assert (cfg.value_coef > 0 )
  
 	return cfg_to_dataclass(cfg)

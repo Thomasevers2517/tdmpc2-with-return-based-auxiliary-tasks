@@ -1,7 +1,7 @@
 import torch
 from torch.nn import Buffer
 
-from common.logging_utils import get_logger
+from common.logger import get_logger
 
 
 log = get_logger(__name__)
