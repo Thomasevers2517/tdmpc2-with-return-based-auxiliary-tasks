@@ -44,7 +44,6 @@ std_max: 2.0
 
 
 fix_value_est: false # Ensure no policy used for bootstrapping value estimation at planning
-fix_value_est: false # Ensure no policy used for bootstrapping value estimation at planning
 
 train_act_std_coeff: 1 # multiplier of the noise added to training env actions
 
