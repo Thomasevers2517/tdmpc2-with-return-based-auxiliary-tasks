@@ -260,7 +260,7 @@ class WorldModel(nn.Module):
 				target.data.lerp_(source.data, tau)
 			online_vec = parameters_to_vector(source_params).detach()
 			target_vec = parameters_to_vector(target_params).detach()
-			return torch.max(torch.abs(online_vec - target_vec)).item()
+			return torch.max(torch.abs(online_vec - target_vec))
 
 	def soft_update_policy_encoder_targets(self):
 		updates = {}

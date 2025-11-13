@@ -36,6 +36,7 @@ Fail-Fast Expectations
 - No hidden backups: Avoid implicit backup code paths that change behavior when inputs/config are missing. Prefer explicit checks and fail fast.
 - Exceptions policy: Do not swallow exceptions in `try/except`; only catch to add context and re-raise. Prefer context managers over `try/finally` for cleanup; if `finally` is required, always re-raise the original error.
 - Required parameters: Avoid default argument values for parameters that are required for correctness; make them explicit and validate at boundaries.
+ - Config access: Access required config flags/attrs directly (e.g., `cfg.fixed_value`). Do not use `getattr`/`dict.get` with fallbacks. Let missing keys raise immediately. Avoid hidden defaults.
 
 Example style
 ```python

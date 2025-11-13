@@ -124,6 +124,7 @@ class Planner(torch.nn.Module):
                 scale = torch.pow(torch.tensor(self.cfg.rho, device=dis.device, dtype=dis.dtype), t_idx).mean()
                 dis = dis * scale
             scores = combine_scores(vals_scaled, dis, lambda_d)
+            weighted_dis_all = (lambda_d * dis) if dis is not None else None
 
             elite_scores, elite_indices = torch.topk(scores, K, largest=True, sorted=True)
             # Softmax weights over elite scores
@@ -177,6 +178,8 @@ class Planner(torch.nn.Module):
         info_basic = PlannerBasicInfo(
             value_chosen=vals_scaled.index_select(0, chosen_idx).squeeze(0),
             disagreement_chosen=disagreement_chosen,
+            score_chosen=scores.index_select(0, chosen_idx).squeeze(0),
+            weighted_disagreement_chosen=(weighted_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_dis_all is not None else None,
             value_elite_mean=value_elite_mean,
             value_elite_std=value_elite_std,
             value_elite_max=value_elite_max,
@@ -185,6 +188,9 @@ class Planner(torch.nn.Module):
             disagreement_elite_max=disagreement_elite_max,
             num_elites=K,
             elite_indices=elite_indices.to(torch.long),
+            scores_all=scores,
+            values_scaled_all=vals_scaled,
+            weighted_disagreements_all=weighted_dis_all,
         )
 
         detailed_every = int(getattr(self.cfg, 'log_detailed_every', -1))

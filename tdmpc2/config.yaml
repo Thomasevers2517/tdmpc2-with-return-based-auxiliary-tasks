@@ -39,11 +39,10 @@ planner_num_dynamics_heads: 1
 std_min: 0.05
 std_max: 2.0
 
-# Planner advanced logging frequency (steps). -1 disables detailed payloads.
-log_detailed_every: -1
 
 
-fix_value_est: false
+
+fix_value_est: false # Ensure no policy used for bootstrapping value estimation at planning
 
 train_act_std_coeff: 1
 

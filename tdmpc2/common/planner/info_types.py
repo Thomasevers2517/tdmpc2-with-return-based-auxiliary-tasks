@@ -10,6 +10,8 @@ class PlannerBasicInfo:
     Attributes:
         value_chosen: Scalar value of the chosen sequence.
         disagreement_chosen: Latent disagreement of chosen (None if not computed).
+        score_chosen: Combined score of the chosen sequence.
+        weighted_disagreement_chosen: Weighted disagreement (lambda_d * disagreement) of chosen (None if not computed).
         value_elite_mean: Mean value over elite set.
         value_elite_std: Std of value over elite set.
         value_elite_max: Max value over elite set.
@@ -18,9 +20,14 @@ class PlannerBasicInfo:
         disagreement_elite_max: Max disagreement over elites (None if not computed).
         num_elites: Number of elites used for updates.
         elite_indices: Indices of elites within candidate set; int64[E].
+        scores_all: Combined scores for all candidates; Tensor[E].
+        values_scaled_all: Scaled values for all candidates; Tensor[E].
+        weighted_disagreements_all: Weighted disagreements for all candidates (None if not computed); Tensor[E].
     """
     value_chosen: torch.Tensor  # 0-dim tensor
     disagreement_chosen: Optional[torch.Tensor]
+    score_chosen: torch.Tensor  # 0-dim tensor
+    weighted_disagreement_chosen: Optional[torch.Tensor]
     value_elite_mean: torch.Tensor
     value_elite_std: torch.Tensor
     value_elite_max: torch.Tensor
@@ -29,6 +36,9 @@ class PlannerBasicInfo:
     disagreement_elite_max: Optional[torch.Tensor]
     num_elites: int
     elite_indices: torch.Tensor  # int64[E]
+    scores_all: torch.Tensor  # (E,)
+    values_scaled_all: torch.Tensor  # (E,)
+    weighted_disagreements_all: Optional[torch.Tensor]  # (E,)
 
 
 @dataclass

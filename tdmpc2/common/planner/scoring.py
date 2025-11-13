@@ -20,20 +20,27 @@ def compute_values_head0(latents_head0: torch.Tensor, actions: torch.Tensor, wor
     T = Tp1 - 1
     device = latents_head0.device
     dtype = latents_head0.dtype
+    cfg = world_model.cfg
 
     # Sum per-step rewards (distributional -> scalar via two_hot_inv)
     z_t = latents_head0[:, :-1, :]  # [E,T,L]
     a_t = actions  # [E,T,A]
     rew_logits = world_model.reward(z_t, a_t, task)  # expect [E,T,K] or [E,T,1]
     # two_hot_inv expects shape [*, K]; we let it handle trailing dims
-    r_t = math.two_hot_inv(rew_logits, world_model.cfg).squeeze(-1)  # [E,T]
-    returns = r_t.sum(dim=1)  # [E]
-
-    # Bootstrap from last latent via policy prior + target Q if available
-    z_last = latents_head0[:, -1, :]  # [E,L]
-    #TODO Fix bootstrapping with policy task, should be an action that is optimized....
-    a_boot, _ = world_model.pi(z_last, task, use_ema=getattr(world_model.cfg, 'policy_ema_enabled', False))
-    q_boot = world_model.Q(z_last, a_boot, task, return_type='min', target=True)
+    r_t = math.two_hot_inv(rew_logits, cfg).squeeze(-1)  # [E,T]
+    # TODO: Consider discounting alignment with legacy; early rewards slightly prioritized historically.
+    if cfg.fix_value_est:
+        # Fixed-value: sum rewards for steps 0..T-2, bootstrap using provided last action at z_{T-1}
+        returns = r_t[:, :-1].sum(dim=1)  # [E]
+        z_boot = latents_head0[:, -2, :]   # [E,L]
+        a_boot = actions[:, -1, :]         # [E,A]
+        q_boot = world_model.Q(z_boot, a_boot, task, return_type='min', target=True)
+    else:
+        # Legacy: sum all rewards and bootstrap with policy action at last latent
+        returns = r_t.sum(dim=1)  # [E]
+        z_last = latents_head0[:, -1, :]  # [E,L]
+        a_boot, _ = world_model.pi(z_last, task, use_ema=cfg.policy_ema_enabled)
+        q_boot = world_model.Q(z_last, a_boot, task, return_type='min', target=True)
     q_boot = q_boot.squeeze(-1).squeeze(-1) if q_boot.ndim > 1 else q_boot  # [E]
 
     values_unscaled = returns + q_boot
