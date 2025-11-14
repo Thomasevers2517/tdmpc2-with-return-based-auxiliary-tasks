@@ -248,18 +248,13 @@ class TDMPC2(torch.nn.Module):
 			if mpc:
 				# Encode observation -> latent start (shape [1,L])
 				z0 = self.model.encode(obs, task_tensor)
-				chosen_action, planner_info, mean, std = self.planner.plan(z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step)
+				chosen_action, planner_info, mean, std = self.planner.plan(
+					z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step,
+					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff))
+				)
 
-				if eval_mode:
-					action = chosen_action
-				else:
-					action = chosen_action + std[0] * self.cfg.train_act_std_coeff * torch.randn_like(chosen_action, device=chosen_action.device)
-
-				# Ensure actions respect env bounds after optional training noise
-				action = action.clamp(-1.0, 1.0)
-
-
-				return action, planner_info
+				# Planner already applies any training noise and clamps
+				return chosen_action, planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
 			action_pi, info_pi = self.model.pi(z, task_tensor, use_ema=self.cfg.policy_ema_enabled)
@@ -1251,9 +1246,9 @@ class TDMPC2(torch.nn.Module):
 			return float(self.cfg.end_entropy_coeff)
 		else:
 			lin_step = (step - start_dynamic) 
-			duration_dynamic = end_dynamic - start_dynamic
+			duration_dynamic = end_dynamic - start_dynamic + 1e-6
 			if self.cfg.dynamic_entropy_schedule == 'linear':
-				coeff = self.cfg.start_entropy_coeff + (self.cfg.end_entropy_coeff - self.cfg.start_entropy_coeff) * (lin_step / (duration_dynamic + 1e-6))
+				coeff = self.cfg.start_entropy_coeff + (self.cfg.end_entropy_coeff - self.cfg.start_entropy_coeff) * (lin_step / (duration_dynamic))
 			elif self.cfg.dynamic_entropy_schedule == 'exponential':
 				ratio = lin_step / duration_dynamic
 				coeff = self.cfg.start_entropy_coeff * ( (self.cfg.end_entropy_coeff / self.cfg.start_entropy_coeff) ** ratio )

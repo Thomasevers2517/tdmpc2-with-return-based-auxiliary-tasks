@@ -1,0 +1,81 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Base task (matches config default). Add more tasks if desired.
+  task:
+    values:
+      # - acrobot-swingup
+      - quadruped-walk
+      - walker-run
+
+  # UTD sweep (align with config key `utd_ratio`)
+  utd_ratio:
+    values: [1, 2]
+
+  # Core: latent disagreement refactor knobs
+  planner_num_dynamics_heads:
+    values: [4]
+  planner_lambda_disagreement:
+    values: [0, 300.0, 3000.0, 30000.0]
+  fix_value_est:
+    values: [false, true]
+
+  # Keep MPC defaults from config; override as needed
+  iterations:
+    value: 6
+  num_samples:
+    value: 512
+  num_elites:
+    value: 64
+  horizon:
+    value: 3
+  planner_num_seed_policy_trajectories:
+    value: 24
+  planner_temperature_train:
+    value: 0.5
+  planner_temperature_eval:
+    value: 0.5
+
+  # Training noise multiplier (planner applies to first action in training)
+  train_act_std_coeff:
+    values: [1.0, 0.1, 0.0]
+
+  # Common training/eval settings from config
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    values: [state]
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  # Repro and logging
+  seed:
+    values: [101, 202, 303]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: test_auxiliary
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation on to validate advanced analysis path
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

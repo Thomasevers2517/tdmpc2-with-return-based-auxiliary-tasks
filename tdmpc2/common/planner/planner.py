@@ -30,7 +30,7 @@ class Planner(torch.nn.Module):
         self.prev_mean.zero_()
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
+    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
         """Plan an action sequence and return the first action.
 
         Args:
@@ -152,11 +152,16 @@ class Planner(torch.nn.Module):
             probs = torch.softmax(elite_scores / max(temp, 1e-8), dim=0)
             elite_pick = torch.multinomial(probs, 1)              # [1]
             chosen_idx = elite_indices.gather(0, elite_pick)      # [1]
-        # Select chosen action without converting to Python scalars
-        chosen_action = (
-            actions_cat.index_select(0, chosen_idx)  # [1,T,A]
-            .squeeze(0)[0]                           # [A]
-        )
+        # Select chosen sequence and first action
+        chosen_seq = actions_cat.index_select(0, chosen_idx).squeeze(0)  # [T,A]
+        chosen_action = chosen_seq[0]  # [A]
+
+        # Prepare first-step std for potential noise (planner-owned)
+        std_first = std[0]  # [A]
+        noise_vec_first = None
+        if (not eval_mode) and (train_noise_multiplier is not None) and (float(train_noise_multiplier) > 0.0):
+            noise_vec_first = torch.randn_like(chosen_action) * std_first * float(train_noise_multiplier)
+            chosen_action = (chosen_action + noise_vec_first).clamp(-1.0, 1.0)
 
         # Build info
         value_elite_mean = elite_scores.mean()
@@ -193,10 +198,10 @@ class Planner(torch.nn.Module):
             weighted_disagreements_all=weighted_dis_all,
         )
 
-        detailed_every = int(getattr(self.cfg, 'log_detailed_every', -1))
+
         # Use existing global log_detail_freq instead of new key if available.
-        detailed_every_cfg = getattr(self.cfg, 'log_detail_freq', detailed_every)
-        if detailed_every_cfg > 0 and (step is not None) and (step % detailed_every_cfg == 0):
+        log_detailed = self.cfg.log_detail_freq > 0 and (step is not None) and (step % self.cfg.log_detail_freq == 0)
+        if log_detailed:
             # Stack iteration histories
             actions_all = torch.stack(actions_hist, dim=0)               # [I,E,T,A]
             latents_all = torch.stack(latents_hist, dim=0)               # [I,H,E,T+1,L]
@@ -205,6 +210,7 @@ class Planner(torch.nn.Module):
             raw_scores = torch.stack(scores_hist, dim=0)                  # [I,E]
             disagreements_all = torch.stack(disagreement_hist, dim=0) if len(disagreement_hist) > 0 else None  # [I,E]
 
+            # Build advanced info (includes context for post-noise analysis)
             info_adv = PlannerAdvancedInfo(
                 **vars(info_basic),
                 actions_all=actions_all,
@@ -213,11 +219,26 @@ class Planner(torch.nn.Module):
                 values_all_scaled=values_all_scaled,
                 disagreements_all=disagreements_all,
                 raw_scores=raw_scores,
+                # Context for analysis
+                action_seq_chosen=chosen_seq.detach(),
+                action_noise=(noise_vec_first.detach() if noise_vec_first is not None else None),
+                std_first_action=std_first.detach(),
+                z0=z0.detach() if z0.dim() == 1 else z0.squeeze(0).detach(),
+                task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
+                lambda_d=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
+                head_mode=('single' if eval_mode else 'all'),
+                T=T,
             )
+            # Compute post-noise effects once (no-grad), available for logger + wandb
+            with torch.no_grad():
+                info_adv.compute_post_noise_effects(self.world_model)
             # Update warm-start mean for next call
             self.prev_mean.copy_(mean)
+            # Ensure bounds
             return chosen_action.detach(), info_adv, mean.detach(), std.detach()
 
         # Update warm-start mean for next call
         self.prev_mean.copy_(mean)
+        # Ensure bounds
+        chosen_action = chosen_action.clamp(-1.0, 1.0)
         return chosen_action.detach(), info_basic, mean.detach(), std.detach()

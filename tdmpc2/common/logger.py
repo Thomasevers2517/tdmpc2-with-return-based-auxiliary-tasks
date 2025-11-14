@@ -299,40 +299,79 @@ class Logger:
 		except Exception:
 			# If planner not yet available, skip
 			return
-		payload = {
-			"step": step,
-			"planner/value_chosen": getattr(info, "value_chosen", None),
-			"planner/value_elite_mean": getattr(info, "value_elite_mean", None),
-			"planner/value_elite_std": getattr(info, "value_elite_std", None),
-			"planner/value_elite_max": getattr(info, "value_elite_max", None),
-			"planner/num_elites": getattr(info, "num_elites", None),
-		}
-		d_chosen = getattr(info, "disagreement_chosen", None)
-		if d_chosen is not None:
-			payload["planner/disagreement_chosen"] = d_chosen
-		d_mean = getattr(info, "disagreement_elite_mean", None)
-		d_std = getattr(info, "disagreement_elite_std", None)
-		d_max = getattr(info, "disagreement_elite_max", None)
-		if d_mean is not None:
-			payload["planner/disagreement_elite_mean"] = d_mean
-		if d_std is not None:
-			payload["planner/disagreement_elite_std"] = d_std
-		if d_max is not None:
-			payload["planner/disagreement_elite_max"] = d_max
-		# Planner: WandB-only by default. No console print, no eval CSV.
-		# If WandB disabled and debug_console is False: no-op.
-		# Normalize 0-dim tensors to Python scalars (detach -> cpu -> item)
-		for k, v in list(payload.items()):
-			if k == 'step':
+
+		# Always log all PlannerBasicInfo fields by default
+		payload = {"step": step}
+
+		def _summarize_tensor(key: str, t: torch.Tensor, out: dict):
+			"""Add scalar or summary stats for tensor `t` into out under key prefix.
+
+			- 0-dim or single-element -> scalar
+			- 1D+ -> mean/std/min/max and size
+			"""
+			if t is None:
+				return
+			if not isinstance(t, torch.Tensor):
+				return
+			if t.numel() == 1:
+				out[f"planner/{key}"] = t.detach().cpu().item()
+				return
+			# For non-scalars, log light summaries to avoid large payloads
+			cpu = t.detach().float().cpu()
+			out[f"planner/{key}_n"] = int(cpu.numel())
+			try:
+				out[f"planner/{key}_mean"] = float(cpu.mean().item())
+				out[f"planner/{key}_std"] = float(cpu.std(unbiased=False).item())
+				out[f"planner/{key}_min"] = float(cpu.min().item())
+				out[f"planner/{key}_max"] = float(cpu.max().item())
+			except Exception:
+				# In rare cases (empty), skip stats
+				pass
+
+		# Collect only the basic fields even if info is Advanced
+		basic_fields = []
+		try:
+			basic_fields = [f.name for f in dataclasses.fields(PlannerBasicInfo)]
+		except Exception:
+			pass
+		for name in basic_fields:
+			val = getattr(info, name, None)
+			if val is None:
 				continue
-			if isinstance(v, torch.Tensor):
-				if v.numel() == 1:
-					payload[k] = v.detach().cpu().item()
-				else:
-					# Skip large tensors (histograms could be added later)
-					payload.pop(k)
+			# Tensors -> scalar or summary; ints/floats -> scalar
+			if isinstance(val, torch.Tensor):
+				_summarize_tensor(name, val, payload)
+			elif isinstance(val, (int, float)):
+				payload[f"planner/{name}"] = val
+			else:
+				# Non-numeric (e.g., lists) are skipped by default
+				continue
+
+		# If advanced info, print a concise text summary and include post-noise scalars
+		try:
+			if isinstance(info, PlannerAdvancedInfo):
+				# Build and log a multi-line summary to console/file
+				summary = info.to_text_summary(num_random=5, num_action=4)
+				_log.info("%s", summary)
+				# Add post-noise scalars when available
+				for k in [
+					("value_chosen_post_noise", getattr(info, "value_chosen_post_noise", None)),
+					("disagreement_chosen_post_noise", getattr(info, "disagreement_chosen_post_noise", None)),
+					("score_chosen_post_noise", getattr(info, "score_chosen_post_noise", None)),
+				]:
+					v = k[1]
+					if isinstance(v, torch.Tensor) and v.numel() == 1:
+						payload[f"planner/{k[0]}"] = v.detach().cpu().item()
+					elif isinstance(v, (int, float)):
+						payload[f"planner/{k[0]}"] = v
+		except Exception:
+			pass
+
+		# Send to WandB if available
 		if self._wandb:
-			self._wandb_log({k: v for k, v in payload.items() if k != 'step'}, step=payload["step"], category=category)
-			# Optional console mirroring in debug mode
+			# Strip step for wandb payload; _wandb_log will prefix category
+			step_val = payload.get("step", step)
+			wandb_payload = {k: v for k, v in payload.items() if k != "step"}
+			self._wandb_log(wandb_payload, step=step_val, category=category)
 
 		return
