@@ -12,7 +12,9 @@ checkpoint: ???
 eval_episodes: 10
 eval_freq: 10000
 
+sac_style_td: false
 
+n_mc_samples_target: 1
 
 ###############################################
 # Planner (Refactor: latent disagreement, CEM/MPPI)
@@ -99,6 +101,11 @@ discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1000_000
+
+# Hot buffer (recent transitions) for mixed sampling
+hot_buffer_enabled: false         # When true, also store recent transitions in a small buffer
+hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
+hot_buffer_size: 200               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
 pin_memory: true
 prefetch: 4

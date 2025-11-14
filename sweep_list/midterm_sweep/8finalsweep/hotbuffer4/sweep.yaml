@@ -23,7 +23,7 @@ parameters:
       # - hopper-stand
       # - hopper-hop
       # # - cheetah-run
-      # - acrobot-swingup
+      - acrobot-swingup
       # - cartpole-swingup-sparse
       # - finger-turn-easy
       # - finger-turn-hard
@@ -34,12 +34,12 @@ parameters:
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
     values: [true]
   hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-    values: [0.1, 0.01]
+    values: [0.005, 0.01, 0.03]  # int(256*0.01)=3 
   hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
-    values: [100, 1000]
+    values: [5]
   
   fix_value_est:
-    values: [false]
+    values: [true]
 
   train_act_std_coeff:
     values: [1]
@@ -73,7 +73,7 @@ parameters:
     values: [1]
 
   buffer_update_interval:
-    values: [30]
+    values: [1]
 
   policy_coef:
     values: [1] #seems it shouldnt increase
@@ -140,7 +140,7 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102]
+    values: [102, 203, 304, 405, 506]
   best_eval: 
     values: [true]
 

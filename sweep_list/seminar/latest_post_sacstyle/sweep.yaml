@@ -30,13 +30,18 @@ parameters:
       - quadruped-walk
       # - quadruped-run
       # - walker-run
+  sac_style_td:
+    values: [true]
   
+  n_mc_samples_target:
+    values: [4]
+
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
     values: [true]
   hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-    values: [0.1, 0.01]
+    values: [0.01]  # int(256*0.01)=3 
   hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
-    values: [100, 1000]
+    values: [50]
   
   fix_value_est:
     values: [false]
@@ -47,7 +52,7 @@ parameters:
   end_dynamic_entropy_ratio: 
     values: [1]
   start_dynamic_entropy_ratio: 
-    values: [0.5]
+    values: [0.75]
 
   start_entropy_coeff:
     values: [1e-5]
@@ -68,12 +73,12 @@ parameters:
     values: [24]
 
   detach_encoder_ratio:
-    values: [0.5]  # fraction of training steps after which to detach encoder gradients
+    values: [0.75]  # fraction of training steps after which to detach encoder gradients
   search_pi_std_mult:
     values: [1]
 
   buffer_update_interval:
-    values: [30]
+    values: [10]
 
   policy_coef:
     values: [1] #seems it shouldnt increase
@@ -140,7 +145,7 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102]
+    values: [102, 203, 304, 405, 506]
   best_eval: 
     values: [true]
 

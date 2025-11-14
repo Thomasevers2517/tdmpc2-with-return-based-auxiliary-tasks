@@ -1,24 +1,8 @@
-# W&B sweep: 1M-step runs over selected control tasks, 3 seeds each.
-# Requested (interpreted) tasks:
-#   acrobot-swingup, finger-turn-easy, finger-turn-hard, walker-walk, walker-run
-# Updated: removed finger-spin (too easy), added quadruped-walk, reacher-hard per user request.
-# If you intended another task (e.g., fish-swim, hopper-walk variant, etc.), let me know to add it.
-#
-# Sweep is a full grid: tasks x seeds. All other hyperparameters fixed.
-# Steps fixed to 1_000_000 as requested.
-#
-# Launch:
-#   wandb sweep wandb_sweeps/one_million_task_sweep.yaml
-#   wandb agent <entity>/<project>/<sweep_id>
-# To run multiple agents in parallel (e.g., 2 GPUs): start multiple wandb agent commands.
-#
-# Each run calls tdmpc2/train.py with hydra overrides from these parameters.
-
 program: tdmpc2/train.py
-method: random
+method: grid
 command:
   - ${env}
-  - /space/thomasevers/conda-envs/tdmpc2/bin/python
+  - python
   - ${program}
   - ${args_no_hyphens}
 metric:
@@ -26,33 +10,72 @@ metric:
   goal: maximize
 parameters:
   task:
-    values:
     values: 
-      # - cartpole_balance
-      # - cartpole_balance_sparse
-      # - cartpole_swingup
-      # - cup_catch
-      # - finger_spin
-      # - reacher_easy
-      - reacher_hard
-      # - walker_stand
-      # - walker_walk
-      # - hopper_stand
-      # - hopper_hop
-      - cheetah_run
-      - acrobot_swingup
-      # - cartpole_swingup_sparse
-      # - finger_turn_easy
-      # - finger_turn_hard
-      - quadruped_walk
-      # - quadruped_run
-      - walker_run
+      # - cartpole-balance
+      # - cartpole-balance-sparse
+      # - cartpole-swingup-sparse
+      # - cup-catch
+      # - finger-spin
+      # - reacher-easy
+      # - reacher-hard
+      # - walker-stand
+      # - walker-walk
+      # - hopper-stand
+      # - hopper-hop
+      # # - cheetah-run
+      - acrobot-swingup
+      # - cartpole-swingup-sparse
+      # - finger-turn-easy
+      # - finger-turn-hard
+      - quadruped-walk
+      # - quadruped-run
+      # - walker-run
+  n_mc_samples_target:
+    values: [1,4, 16]
 
-      # - humanoid-run
+  hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
+    values: [true]
+  hot_buffer_ratio:            # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
+    values: [0.01]  # int(256*0.01)=3 
+  hot_buffer_size:               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+    values: [5]
   
+  fix_value_est:
+    values: [false]
+
+  train_act_std_coeff:
+    values: [1]
+
+  end_dynamic_entropy_ratio: 
+    values: [1]
+  start_dynamic_entropy_ratio: 
+    values: [0.5]
+
+  start_entropy_coeff:
+    values: [1e-5]
+  end_entropy_coeff:
+    values: [1e-6]
+  dynamic_entropy_schedule:
+    values: ["exponential"] # linear | exponential
+
+  num_q:
+    values: [5]
+
+  iterations: 
+    values: [6]
+  num_samples: 
+    values: [512]
+
+  num_pi_trajs: 
+    values: [24]
+
+  detach_encoder_ratio:
+    values: [0.5]  # fraction of training steps after which to detach encoder gradients
+  search_pi_std_mult:
+    values: [1]
 
   buffer_update_interval:
-    values: [100]
+    values: [1]
 
   policy_coef:
     values: [1] #seems it shouldnt increase
@@ -81,8 +104,7 @@ parameters:
     values: [1]
   # num_enc_layers:
   #   values: [2] # originally 2
-  entropy_coef:
-    values: [1e-4, 3e-5, 1e-5] #originally 1e-4
+
   hinge_coef:
     values: [0.01] #[0.01]
 
@@ -98,14 +120,14 @@ parameters:
     values: [true]
 
   utd_ratio:
-    values: [1,2]
+    values: [2]
   ac_utd_multiplier:
     values: [1]
 
   lr:
     values: [3e-4]
   enc_lr_scale:
-    values: [0.1]
+    values: [0.3]
   horizon:
     values: [3]
   rho:
@@ -120,9 +142,9 @@ parameters:
         # - joint 
         - separate
   seed:
-    values: [102, 203, 304]
+    values: [102, 203, 304, 405, 506]
   best_eval: 
-    values: [false]
+    values: [true]
 
   # Multi-gamma auxiliary value experiments (mirroring earlier setup)
   multi_gamma_gammas:
@@ -154,8 +176,8 @@ parameters:
 
   batch_size:
     value: 256
-  model_size:
-    values: [5]
+  # model_size:
+  #   values: [5]
   obs:
     values:
       # - rgb
