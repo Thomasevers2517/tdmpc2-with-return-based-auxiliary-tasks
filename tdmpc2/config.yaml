@@ -36,6 +36,10 @@ planner_temperature_eval: 0.5
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0.0
 
+# When true, policy-seeded trajectories are only eligible for elites during
+# the first MPPI iteration; subsequent iterations rely solely on sampled rollouts.
+planner_policy_elites_first_iter_only: false
+
 # Number of dynamics heads for latent disagreement; currently placeholder duplication of head 0.
 planner_num_dynamics_heads: 1
 

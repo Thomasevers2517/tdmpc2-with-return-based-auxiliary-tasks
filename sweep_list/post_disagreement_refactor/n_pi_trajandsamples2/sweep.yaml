@@ -17,20 +17,23 @@ parameters:
       # - walker-run
 
   #THIS VERSION ALSO SET REDUCE ENTROPY COEFF at 0.5, unlike the previous one
+    # Keep MPC defaults from config; override as needed
+  iterations:
+    value: 6
   num_samples:
-    value: 1024
+    value: 2048
   num_elites:
-    values : [64, 16]
+    values : [64]
   num_pi_trajs:
-    values: [896]
+    values: [1024]
   horizon:
     values: [3, 6]
   final_rho:
-    value: 0.0125
+    value: 0.125
   min_std:
-    values: [0]
+    values: [0, 0.05]
   max_std:
-    values: [1, 0.2]
+    values: [0.5]
 
 # Hot buffer (recent transitions) for mixed sampling
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
@@ -66,12 +69,8 @@ parameters:
 
   buffer_update_interval:
     value: 10
-  # Keep MPC defaults from config; override as needed
-  iterations:
-    value: 6
 
-  num_elites:
-    value: 64
+
 
 
   planner_temperature_train:

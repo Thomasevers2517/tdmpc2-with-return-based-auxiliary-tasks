@@ -75,12 +75,13 @@ class Planner(torch.nn.Module):
 
 
         head_mode = 'single' if eval_mode else 'all'
+        policy_elites_first_iter_only = bool(self.cfg.planner_policy_elites_first_iter_only)
 
         mean = self.shifted_prev_mean()  # float32[T,A]
         std = torch.full((T, A), self.cfg.max_std, device=device, dtype=dtype)
 
         # Prepare policy-seeded candidates (frozen across iterations)
-        latents_p = actions_p = None
+        policy_cache = None
         if S > 0:
             latents_p, actions_p = self.world_model.rollout_latents(
                 z0, use_policy=True, horizon=T, num_rollouts=S, head_mode=head_mode, task=task
@@ -88,6 +89,23 @@ class Planner(torch.nn.Module):
             # Squeeze singleton batch dim: latents [H,1,S,T+1,L] -> [H,S,T+1,L], actions [1,S,T,A] -> [S,T,A]
             latents_p = latents_p[:, 0]
             actions_p = actions_p[0]
+            latents_head0_p = latents_p[0]
+            vals_unscaled_p, vals_scaled_p = compute_values_head0(latents_head0_p, actions_p, self.world_model, task)
+            dis_p = None
+            if not eval_mode and latents_p.shape[0] > 1:
+                final_policy = latents_p[:, :, -1, :]
+                dis_p = compute_disagreement(final_policy)
+            scores_p = combine_scores(vals_scaled_p, dis_p, lambda_d)
+            weighted_dis_p = (lambda_d * dis_p) if dis_p is not None else None
+            policy_cache = dict(
+                latents=latents_p,
+                actions=actions_p,
+                vals_unscaled=vals_unscaled_p,
+                vals_scaled=vals_scaled_p,
+                disagreement=dis_p,
+                weighted_dis=weighted_dis_p,
+                scores=scores_p,
+            )
 
         # Containers for per-iteration histories (for advanced logging)
         # actions_hist: float32[I, E, T, A]; E varies only after concat (policy + sampled)
@@ -112,29 +130,48 @@ class Planner(torch.nn.Module):
             latents_s = latents_s[:, 0]
             actions_s = actions_s[0]
 
-            # Concatenate frozen policy seeds (if any)
-            if S > 0:
-                # latents: [H,S,T+1,L], actions: [S,T,A]
-                latents_cat = torch.cat([latents_p, latents_s], dim=1)
-                actions_cat = torch.cat([actions_p, actions_s], dim=0)
-            else:
-                latents_cat, actions_cat = latents_s, actions_s
+            # Head 0 values for sampled trajectories only
+            latents_head0_s = latents_s[0]
+            vals_unscaled_s, vals_scaled_s = compute_values_head0(latents_head0_s, actions_s, self.world_model, task)
+            dis_s = None
+            if not eval_mode and latents_s.shape[0] > 1:
+                # Multiple dynamics heads are present; measure disagreement at final latent state.
+                final_s = latents_s[:, :, -1, :]
+                dis_s = compute_disagreement(final_s)
+            scores_s = combine_scores(vals_scaled_s, dis_s, lambda_d)
+            weighted_dis_s = (lambda_d * dis_s) if dis_s is not None else None
 
-            # Head 0 values
-            latents_head0 = latents_cat[0]  # [E,T+1,L]
-            vals_unscaled, vals_scaled = compute_values_head0(latents_head0, actions_cat, self.world_model, task)
-            # Disagreement only when training with multi-head
-            dis = None
-            if not eval_mode and latents_cat.shape[0] > 1:
-                final_all = latents_cat[:, :, -1, :]  # [H,E,L]
-                dis = compute_disagreement(final_all)
-                # Scale disagreement by the average of rho^t over the planning horizon
-                # to roughly match the magnitude of the logged consistency loss.
-                t_idx = torch.arange(T, device=dis.device, dtype=dis.dtype)
-                scale = torch.pow(torch.tensor(self.cfg.rho, device=dis.device, dtype=dis.dtype), t_idx).mean()
-                dis = dis * scale
-            scores = combine_scores(vals_scaled, dis, lambda_d)
-            weighted_dis_all = (lambda_d * dis) if dis is not None else None
+            include_policy = (
+                (policy_cache is not None) and
+                ((it == 0) or (not policy_elites_first_iter_only))
+            )
+
+            if include_policy:
+                latents_cat = torch.cat([policy_cache['latents'], latents_s], dim=1)
+                actions_cat = torch.cat([policy_cache['actions'], actions_s], dim=0)
+                vals_unscaled = torch.cat([policy_cache['vals_unscaled'], vals_unscaled_s], dim=0)
+                vals_scaled = torch.cat([policy_cache['vals_scaled'], vals_scaled_s], dim=0)
+                if policy_cache['disagreement'] is not None and dis_s is not None:
+                    dis = torch.cat([policy_cache['disagreement'], dis_s], dim=0)
+                elif policy_cache['disagreement'] is not None:
+                    dis = policy_cache['disagreement']
+                else:
+                    dis = dis_s
+                if policy_cache['weighted_dis'] is not None and weighted_dis_s is not None:
+                    weighted_dis_all = torch.cat([policy_cache['weighted_dis'], weighted_dis_s], dim=0)
+                elif policy_cache['weighted_dis'] is not None:
+                    weighted_dis_all = policy_cache['weighted_dis']
+                else:
+                    weighted_dis_all = weighted_dis_s
+                scores = torch.cat([policy_cache['scores'], scores_s], dim=0)
+            else:
+                latents_cat = latents_s
+                actions_cat = actions_s
+                vals_unscaled = vals_unscaled_s
+                vals_scaled = vals_scaled_s
+                dis = dis_s
+                weighted_dis_all = weighted_dis_s
+                scores = scores_s
 
             elite_scores, elite_indices = torch.topk(scores, K, largest=True, sorted=True)
             # Softmax weights over elite scores
