@@ -12,9 +12,25 @@ parameters:
   # Base task (matches config default). Add more tasks if desired.
   task:
     values:
-      # - acrobot-swingup
+      - acrobot-swingup
       - quadruped-walk
       # - walker-run
+
+  #THIS VERSION ALSO SET REDUCE ENTROPY COEFF at 0.5, unlike the previous one
+  num_samples:
+    value: 1024
+  num_elites:
+    values : [64, 16]
+  num_pi_trajs:
+    values: [896]
+  horizon:
+    values: [3, 6]
+  final_rho:
+    value: 0.0125
+  min_std:
+    values: [0]
+  max_std:
+    values: [1, 0.2]
 
 # Hot buffer (recent transitions) for mixed sampling
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
@@ -26,10 +42,10 @@ parameters:
 
 
   sac_style_td: 
-    value: true
+    value: false
 
   n_mc_samples_target:
-    value: 4
+    value: 1
 
   # UTD sweep (align with config key `utd_ratio`)
   utd_ratio:
@@ -39,13 +55,13 @@ parameters:
   planner_num_dynamics_heads:
     values: [4]
   planner_lambda_disagreement:
-    values: [0, 300.0, 3000.0, 30000.0]
+    values: [0]
   fix_value_est:
-    values: [false, true]
+    values: [true]
 
-      # Training noise multiplier (planner applies to first action in training)
+    # Training noise multiplier (planner applies to first action in training)
   train_act_std_coeff:
-    values: [1.0, 0.1, 0.0]
+    values: [0.0]
 
 
   buffer_update_interval:
@@ -53,14 +69,11 @@ parameters:
   # Keep MPC defaults from config; override as needed
   iterations:
     value: 6
-  num_samples:
-    value: 512
+
   num_elites:
     value: 64
-  horizon:
-    value: 3
-  planner_num_seed_policy_trajectories:
-    value: 24
+
+
   planner_temperature_train:
     value: 0.5
   planner_temperature_eval:
@@ -84,7 +97,7 @@ parameters:
 
   # Repro and logging
   seed:
-    values: [101, 202, 303]
+    values: [101, 202, 303, 404]
   enable_wandb:
     value: true
   wandb_project:

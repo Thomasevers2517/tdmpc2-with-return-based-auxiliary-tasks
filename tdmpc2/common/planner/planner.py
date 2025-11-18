@@ -24,10 +24,21 @@ class Planner(torch.nn.Module):
         self.scale = scale  # reserved; scaling currently disabled
         T, A = cfg.horizon, cfg.action_dim
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.register_buffer('prev_mean', torch.zeros(T, A, device=device))
+        self.register_buffer('prev_mean', torch.zeros(T, A, device=device))  # float32[T,A]
 
     def reset_warm_start(self) -> None:
         self.prev_mean.zero_()
+
+    def shifted_prev_mean(self) -> torch.Tensor:
+        """Return previous mean shifted left by one step with zeroed tail.
+
+        Returns:
+            Tensor[T, A]: Warm-start mean after temporal shift.
+        """
+        shifted = torch.zeros_like(self.prev_mean)  # float32[T,A]
+        if shifted.shape[0] > 1:
+            shifted[:-1].copy_(self.prev_mean[1:])
+        return shifted
 
     @torch.no_grad()
     def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
@@ -50,7 +61,7 @@ class Planner(torch.nn.Module):
         iterations = int(self.cfg.iterations)
         N = int(self.cfg.num_samples)
         K = int(self.cfg.num_elites)
-        S = int(getattr(self.cfg, 'planner_num_seed_policy_trajectories', 0))
+        S = int(self.cfg.num_pi_trajs)
         # Temperature: prefer new keys; fallback to legacy cfg.temperature
         if eval_mode:
             temp = getattr(self.cfg, 'planner_temperature_eval', None)
@@ -59,15 +70,14 @@ class Planner(torch.nn.Module):
         if temp is None:
             temp = getattr(self.cfg, 'temperature', 1.0)
         temp = float(temp)
-        lambda_d = 0.0 if eval_mode else float(getattr(self.cfg, 'planner_lambda_disagreement', 0.0))
+        lambda_d = 0.0 if eval_mode else self.cfg.planner_lambda_disagreement
         # Std bounds: prefer std_min/std_max; fallback to legacy min_std/max_std
-        std_min = float(getattr(self.cfg, 'std_min', getattr(self.cfg, 'min_std', 0.1)))
-        std_max = float(getattr(self.cfg, 'std_max', getattr(self.cfg, 'max_std', 1.0)))
+
 
         head_mode = 'single' if eval_mode else 'all'
 
-        mean = self.prev_mean.clone()
-        std = torch.full((T, A), std_max, device=device, dtype=dtype)
+        mean = self.shifted_prev_mean()  # float32[T,A]
+        std = torch.full((T, A), self.cfg.max_std, device=device, dtype=dtype)
 
         # Prepare policy-seeded candidates (frozen across iterations)
         latents_p = actions_p = None
@@ -92,7 +102,7 @@ class Planner(torch.nn.Module):
 
         # Iterative refinement
         for it in range(iterations):
-            std = std.clamp(std_min, std_max)
+            std = std.clamp(self.cfg.min_std, self.cfg.max_std)
             actions_s = sample_action_sequences(mean, std, N).detach()
             # World model expects actions [B,N,T,A]; here B=1
             latents_s, actions_s = self.world_model.rollout_latents(
@@ -132,7 +142,7 @@ class Planner(torch.nn.Module):
             elite_actions = actions_cat[elite_indices]  # [K,T,A]
             mean = (w.view(K, 1, 1) * elite_actions).sum(dim=0)
             var = (w.view(K, 1, 1) * (elite_actions - mean).pow(2)).sum(dim=0)
-            std = var.clamp_min(0).sqrt().clamp(std_min, std_max)
+            std = var.clamp_min(0).sqrt().clamp(self.cfg.min_std, self.cfg.max_std)
 
             # Append iteration snapshots
             actions_hist.append(actions_cat.detach())          # [E,T,A]

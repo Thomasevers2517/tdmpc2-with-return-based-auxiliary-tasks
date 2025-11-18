@@ -22,8 +22,8 @@ class OnlineTrainer(Trainer):
 		self._ep_len = 0
 		self._start_time = time()
 
-		self.validation_buffer = Buffer(cfg=self.cfg)
-		self.recent_validation_buffer = Buffer(cfg=self.cfg)
+		self.validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
+		self.recent_validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""

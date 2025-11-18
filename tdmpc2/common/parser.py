@@ -146,5 +146,14 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			)
 
 	assert (cfg.value_coef > 0 )
+
+	if cfg.planner_lambda_disagreement == 0:
+		if cfg.planner_num_dynamics_heads > 1:
+			print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. setting planner_num_dynamics_heads = 1 to save compute.")
+			cfg.planner_num_dynamics_heads = 1
  
+	if cfg.final_rho != -1:
+		import math as _math
+		cfg.rho = _math.pow(cfg.final_rho, 1 / cfg.horizon)
+		print(f"Overriding rho schedule to end at final_rho = {cfg.final_rho} at horizon = {cfg.horizon}, setting rho = {cfg.rho:.6f}")
 	return cfg_to_dataclass(cfg)

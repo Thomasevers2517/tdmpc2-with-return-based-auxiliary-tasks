@@ -26,10 +26,10 @@ parameters:
 
 
   sac_style_td: 
-    value: true
+    value: false
 
   n_mc_samples_target:
-    value: 4
+    value: 1
 
   # UTD sweep (align with config key `utd_ratio`)
   utd_ratio:

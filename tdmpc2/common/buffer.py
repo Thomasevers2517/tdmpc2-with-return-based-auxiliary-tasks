@@ -15,11 +15,11 @@ class Buffer():
 	Uses CUDA memory if available, and CPU memory otherwise.
 	"""
 
-	def __init__(self, cfg):
+	def __init__(self, cfg, isTrainBuffer=True):
 		self.cfg = cfg
 		self._device = torch.device('cuda:0')
 		self._capacity = min(cfg.buffer_size, cfg.steps)
-
+		self.isTrainBuffer = isTrainBuffer
 		self._size = 0         # number of valid items currently in storage (<= capacity)
 
 		# --- Hot buffer configuration ---
@@ -268,15 +268,17 @@ class Buffer():
 
 	def _preload_gpu(self):
 		try:
-			use_hot = (
-				self._hot_buffer is not None and
-				self._hot_slices > 0 and
-				self._curr_ep_len >= self._slice_len
-			)
+			# use_hot = (
+			# 	self._hot_buffer is not None and
+			# 	self._hot_slices > 0 and
+			# 	self._curr_ep_len >= self._slice_len
+			# )
+			use_hot = self.isTrainBuffer
 			if not use_hot:
 				# Entire batch from main buffer
 				td_cpu = self._buffer.sample()
 				obs_cpu, action_cpu, reward_cpu, terminated_cpu, task_cpu = self.from_td(td_cpu)
+
 			else:
 				# Split between main and hot buffers, then concatenate along batch dimension
 				td_main = self._buffer.sample()

@@ -9,12 +9,15 @@ episodic: false
 
 # evaluation
 checkpoint: ???
-eval_episodes: 10
+eval_episodes: 5
 eval_freq: 10000
+
+final_rho: -1 # if set, overrides rho schedule such at the end of the horizon the discount is final_rho
 
 sac_style_td: false
 
 n_mc_samples_target: 1
+
 
 ###############################################
 # Planner (Refactor: latent disagreement, CEM/MPPI)
@@ -23,8 +26,7 @@ n_mc_samples_target: 1
 # - Training selection: value + lambda*disagreement
 # - Evaluation selection: value-only (argmax)
 ###############################################
-# Number of policy-seeded trajectories included in the candidate set each iteration.
-planner_num_seed_policy_trajectories: 24   # was: num_pi_trajs
+
 
 # Temperatures for elite weighting during planning.
 # If unset, falls back to legacy `temperature`.
@@ -37,15 +39,7 @@ planner_lambda_disagreement: 0.0
 # Number of dynamics heads for latent disagreement; currently placeholder duplication of head 0.
 planner_num_dynamics_heads: 1
 
-# Std bounds used by the planner; if absent, falls back to min_std/max_std.
-std_min: 0.05
-std_max: 2.0
-
-
-
-
-
-fix_value_est: false # Ensure no policy used for bootstrapping value estimation at planning
+fix_value_est: true # Ensure no policy used for bootstrapping value estimation at planning
 
 train_act_std_coeff: 1 # multiplier of the noise added to training env actions
 
@@ -129,10 +123,10 @@ temperature: 0.5
 # actor
 log_std_min: -10
 log_std_max: 2
-end_entropy_coeff: 1e-7
+end_entropy_coeff: 1e-6
 start_entropy_coeff: 1e-4
 end_dynamic_entropy_ratio: 1
-start_dynamic_entropy_ratio: 1
+start_dynamic_entropy_ratio: 0.5
 dynamic_entropy_schedule : exponential  # linear | exponential
 
 hinge_power: 4
@@ -163,7 +157,7 @@ wandb_silent: false
 enable_wandb: true
 save_csv: true
 log_gradients_per_loss: true
-log_detail_freq: 1000
+log_detail_freq: 5000
 log_freq: 50
 
 # misc
