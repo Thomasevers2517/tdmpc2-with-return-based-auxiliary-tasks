@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 import torch
-from .scoring import compute_values_head0, compute_disagreement, combine_scores
+from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
@@ -18,9 +18,14 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         task=task,
     )  # [H,1,1,T+1,L]
     lat_all = lat_all[:, 0]            # [H,1,T+1,L]
-    lat_head0 = lat_all[0, 0]          # [T+1,L]
-    # compute_values_head0 expects [E,T+1,L]; use E=1
-    vals_unscaled, vals_scaled = compute_values_head0(lat_head0.unsqueeze(0), noisy_seq.unsqueeze(0), world_model, task)
+    # compute_values expects latents_all [H,E,T+1,L] and actions [E,T,A]; here E=1
+    vals_unscaled, vals_scaled, vals_std = compute_values(
+        lat_all,
+        noisy_seq.unsqueeze(0),
+        world_model,
+        task,
+        head_reduce=world_model.cfg.planner_value_head_reduce,
+    )
     dis = None
     if lat_all.shape[0] > 1:
         final_all = lat_all[:, 0, -1, :]  # [H,L]

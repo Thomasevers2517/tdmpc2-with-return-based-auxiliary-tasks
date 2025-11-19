@@ -15,27 +15,28 @@ parameters:
       - acrobot-swingup
       - quadruped-walk
       # - walker-run
-  reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value
+  reward_dim_div: 
+    values: [64]  # Keep reward MLP dimension as in config
 
+  reward_coef:
+    values: [0.1, 0.4]
 
-  #THIS VERSION ALSO SET REDUCE ENTROPY COEFF at 0.5, unlike the previous one
-    # Keep MPC defaults from config; override as needed
   iterations:
     value: 6
   num_samples:
-    value: 2048
+    value: 1024
   num_elites:
     values : [64]
   num_pi_trajs:
-    values: [1024]
+    values: [512]
   horizon:
-    values: [3, 6]
+    values: [3]
   final_rho:
     value: 0.125
   min_std:
-    values: [0, 0.05]
+    values: [0]
   max_std:
-    values: [0.5]
+    values: [1]
 
 # Hot buffer (recent transitions) for mixed sampling
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
@@ -70,7 +71,9 @@ parameters:
 
 
   buffer_update_interval:
-    value: 10
+    values: [1, 10]
+
+
 
 
 
@@ -98,7 +101,7 @@ parameters:
 
   # Repro and logging
   seed:
-    values: [101, 202, 303, 404]
+    values: [101, 202, 303]
   enable_wandb:
     value: true
   wandb_project:
