@@ -165,7 +165,7 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			if cfg.planner_value_head_reduce != "max":
 				print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. Planner valuehead reduce is also not max but mean, so just avging across heads. Setting planner_num_dynamics_heads = 1 to save computation. ")
 				cfg.planner_num_dynamics_heads = 1
-			print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. Set planner_num_dynamics_heads = 1 to save computation. Leaving as is for for max value estimation")
+			print("Keeping multiple dynamics heads because taking max among them for exploration. Planner lambda_disagreement is zero tho")
 
  
 	if cfg.final_rho != -1:

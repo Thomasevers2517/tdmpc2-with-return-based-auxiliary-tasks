@@ -30,7 +30,7 @@ n_mc_samples_target: 1
 
 # Aggregation over dynamics heads when computing trajectory values.
 # Options: 'mean' or 'max'.
-planner_value_head_reduce: mean
+planner_value_head_reduce: max
 
 # Std of Gaussian noise added to policy actions when seeding the planner.
 # Applied only when use_policy=True in world_model.rollout_latents.
