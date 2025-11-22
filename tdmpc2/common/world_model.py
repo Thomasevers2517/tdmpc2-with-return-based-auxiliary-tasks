@@ -34,19 +34,35 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
-		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
-		self._dynamics_heads = nn.ModuleList([
-			layers.mlp(
-				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				2 * [cfg.mlp_dim],
-				cfg.latent_dim,
-				act=layers.SimNorm(cfg),
-			)
-			for _ in range(h_total)
-		])
-		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
-		self._dynamics = self._dynamics_heads[0]
+		# Multi-head dynamics: vectorized ensemble of heads; first head exposed for repr
+		h_total = int(cfg.planner_num_dynamics_heads)
+		self.dynamics_type = cfg.dynamics_type
+		if self.dynamics_type not in ('mlp', 'cnn'):
+			raise ValueError(f"Unsupported dynamics_type: {self.dynamics_type}")
+		if self.dynamics_type == 'mlp':
+			modules = [
+				layers.mlp(
+					cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+					2 * [cfg.mlp_dim],
+					cfg.latent_dim,
+					act=layers.SimNorm(cfg),
+				)
+				for _ in range(h_total)
+			]
+			self._dynamics = layers.Ensemble(modules)
+		else:
+			# CNN dynamics requires spatial latent from EfficientZero encoder without projection.
+			if not (cfg.rgb_encoder_type == 'efficientzero' and not cfg.project_latent):
+				raise ValueError("CNN dynamics requires rgb_encoder_type=='efficientzero' and project_latent==False")
+			# Latent is interpreted as [B, 64, 4, 4] (from EfficientZeroBackbone).
+			if cfg.latent_dim != 64 * 4 * 4:
+				raise ValueError("For cnn dynamics, latent_dim must be 1024 (64*4*4).")
+			action_planes = cfg.action_dim
+			modules = [
+				layers.CnnDynamicsBlock(64 + action_planes, 64)
+				for _ in range(h_total)
+			]
+			self._dynamics = layers.Ensemble(modules)
 		
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
@@ -192,6 +208,8 @@ class WorldModel(nn.Module):
 		return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 	def to(self, *args, **kwargs):
+		# Move module parameters/devices first, then re-build meta-parameter-backed
+		# structures via init(). Avoid copying meta buffers directly.
 		super().to(*args, **kwargs)
 		self.init()
 		return self
@@ -333,32 +351,67 @@ class WorldModel(nn.Module):
 			Tensor[..., B, L]: Next latent(s) with optional head dimension leading.
 		"""
 		with maybe_range('WM/dynamics', self.cfg):
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
-			za = torch.cat([z, a], dim=-1)
-			H = len(self._dynamics_heads)
-			if head_mode is None:
-				# Legacy behavior: single head (0), no head dimension in output
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float()
-			if head_mode == 'single':
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float().unsqueeze(0)
-			elif head_mode == 'random':
-				idx = int(torch.randint(low=0, high=H, size=(1,), device=za.device))
-				with self._autocast_context():
-					out = self._dynamics_heads[idx](za)
-				return out.float().unsqueeze(0)
-			elif head_mode == 'all':
-				outs = []
-				with self._autocast_context():
-					for head in self._dynamics_heads:
-						outs.append(head(za)) 
-				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
-			else:
-				raise ValueError(f"Unsupported head_mode: {head_mode}")
+			# NOTE: `next` operates on a *single* dynamics selection pattern for the
+			# whole batch. It does not mix heads within the batch. This keeps rollouts
+			# per-head consistent when called in a loop.
+			head_indices = self._head_indices(head_mode, z.device)
+			if self.dynamics_type == 'mlp':
+				return self._next_mlp(z, a, task, head_indices, head_mode)
+			return self._next_cnn(z, a, head_indices, head_mode)
+
+	def _head_indices(self, head_mode, device):
+		"""Return LongTensor of head indices based on head_mode."""
+		H = self.cfg.planner_num_dynamics_heads
+		if head_mode is None or head_mode == 'single':
+			return torch.zeros(1, dtype=torch.long, device=device)
+		if head_mode == 'random':
+			return torch.randint(low=0, high=H, size=(1,), device=device)
+		if head_mode == 'all':
+			return torch.arange(H, device=device, dtype=torch.long)
+		raise ValueError(f"Unsupported head_mode: {head_mode}")
+
+	def _next_mlp(self, z, a, task, head_indices, head_mode):
+		"""MLP dynamics step.
+
+		Args:
+			z (Tensor[B,L]): Current latent.
+			a (Tensor[B,A]): Action.
+			head_indices (Tensor[H_sel]): Indices of selected heads.
+			head_mode: None|'single'|'random'|'all'.
+		"""
+		if self.cfg.multitask:
+			z = self.task_emb(z, task)
+		za = torch.cat([z, a], dim=-1)
+		with self._autocast_context():
+			all_out = self._dynamics(za)  # [H,B,L]
+		all_out = all_out.float()
+		selected = all_out[head_indices]  # [H_sel,B,L]
+		if head_mode is None:
+			return selected[0]
+		return selected
+
+	def _next_cnn(self, z, a, head_indices, head_mode):
+		"""CNN dynamics step on spatial latent.
+
+		Expects z flattened from [B,64,4,4] -> [B,L].
+		"""
+		B, L = z.shape[0], z.shape[-1]
+		expected_L = 64 * 4 * 4
+		if L != expected_L:
+			raise RuntimeError(f"CNN dynamics expects latent dim {expected_L}, got {L}")
+		z_map = z.view(B, 64, 4, 4)
+		a_map = a.unsqueeze(-1).unsqueeze(-1).expand(B, a.shape[-1], 4, 4)
+		x_dyn = torch.cat([z_map, a_map], dim=1)
+		H = self.cfg.planner_num_dynamics_heads
+		with self._autocast_context():
+			all_out = self._dynamics(x_dyn)  # [H,B,64,4,4]
+		all_out = all_out.float().view(H, B, -1)  # [H,B,L]
+		# Apply SimNorm after each transition on the flattened latent
+		all_out = layers.SimNorm(self.cfg)(all_out)
+		selected = all_out[head_indices]  # [H_sel,B,L]
+		if head_mode is None:
+			return selected[0]
+		return selected
 
 	def reward(self, z, a, task):
 		"""
@@ -547,17 +600,17 @@ class WorldModel(nn.Module):
 		B = z0.shape[0]
 		L = z0.shape[-1]
 
+		# Determine how many heads we want to roll out *in parallel*.
+		# Crucially, each trajectory sticks to its chosen head across time;
+		# we never mix heads within a single rollout.
 		H_total = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
 		if head_mode == 'single':
 			H_sel = 1
-			head_indices = [0]
 		elif head_mode == 'all':
 			H_sel = H_total
-			head_indices = list(range(H_total))
 		elif head_mode == 'random':
+			# One randomly chosen head per call to rollout_latents.
 			H_sel = 1
-			idx = int(torch.randint(low=0, high=H_total, size=(1,), device=z0.device))
-			head_indices = [idx]
 		else:
 			raise ValueError(f'Unsupported head_mode: {head_mode}')
 
@@ -568,9 +621,10 @@ class WorldModel(nn.Module):
 			A = self.cfg.action_dim
 
 		# Build per-step lists to avoid in-place writes on graph tensors
-		# t=0 state for all heads: broadcast z0 over N, then tile over heads
+		# t=0 state for all heads: broadcast z0 over N, then tile over selected heads
 		z0_bn = z0.unsqueeze(1).expand(B, N, L)  # float32[B,N,L]
-		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)  # float32[H_sel,B,N,L]
+		# Broadcast initial latent over selected heads: [H_sel,B,N,L].
+		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)
 		latents_steps = [z0_hbn]
 		actions_steps = []  # each entry: float32[B,N,A]
 
@@ -592,24 +646,32 @@ class WorldModel(nn.Module):
 						a_t = actions[:, :, t, :]  # float32[B,N,A]
 					actions_steps.append(a_t)
 
-					# Advance each selected head independently
-					next_heads = []  # will hold float32[B,N,L] per head
-					for hi, h in enumerate(head_indices):
-						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
-							z_curr = latents_steps[t][hi].view(B * N, L)  # float32[B*N,L]
-							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
-							if self.cfg.multitask:
-								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
-							else:
-								z_cat = z_curr
-							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
-							with self._autocast_context():
-								next_flat = self._dynamics_heads[h](za)  # float32[B*N,L]
-							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
-							next_heads.append(next_bn)
-
-					# Aggregate heads for next timestep
-					next_hbn = torch.stack(next_heads, dim=0)  # float32[H_sel,B,N,L]
+					# Advance each selected head with its *own* dynamics head index,
+					# keeping head assignment fixed over the entire rollout.
+					z_curr_hbn = latents_steps[t]  # float32[H_sel,B,N,L]
+					z_next_list = []
+					for h in range(H_sel):
+						z_curr_flat = z_curr_hbn[h].view(B * N, L)  # [B*N,L]
+						a_curr_flat = a_t.contiguous().view(B * N, A)  # [B*N,A]
+						# Map local head index h to a concrete dynamics head.
+						if head_mode == 'single':
+							# Always use head-0 dynamics.
+							z_next_flat = self.next(z_curr_flat, a_curr_flat, task, head_mode=None)  # [B*N,L]
+						elif head_mode == 'all':
+							# Use deterministic head index h.
+							z_next_all = self.next(z_curr_flat, a_curr_flat, task, head_mode='all')  # [H_total,B*N,L]
+							if H_total != H_sel:
+								raise RuntimeError('Expected H_total==H_sel for head_mode="all" in rollout_latents.')
+							z_next_flat = z_next_all[h]  # [B*N,L]
+						elif head_mode == 'random':
+							# One random head per rollout (shared across all trajectories).
+							z_next_rand = self.next(z_curr_flat, a_curr_flat, task, head_mode='random')  # [1,B*N,L]
+							z_next_flat = z_next_rand[0]
+						else:
+							raise ValueError(f'Unsupported head_mode inside rollout_latents: {head_mode}')
+						z_next_list.append(z_next_flat.view(1, B, N, L))
+					# Stack back over heads: [H_sel,B,N,L]
+					next_hbn = torch.cat(z_next_list, dim=0)
 					latents_steps.append(next_hbn)
 
 		# Stack over time to produce final outputs

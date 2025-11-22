@@ -14,7 +14,7 @@ parameters:
     values:
       # - acrobot-swingup
       - quadruped-walk
-      - hopper-hop
+      # - hopper-hop
       # - walker-run
 
   train_act_std_coeff:
@@ -66,11 +66,11 @@ parameters:
 
   # UTD sweep (align with config key `utd_ratio`)
   utd_ratio:
-    values: [4]
+    values: [16]
 
   # Core: latent disagreement refactor knobs
   planner_num_dynamics_heads:
-    values: [2, 4, 8]
+    values: [4]
   planner_lambda_disagreement:
     values: [0]
 
@@ -101,7 +101,7 @@ parameters:
 
   # Repro and logging
   seed:
-    values: [101, 202, 303, 404 , 505, 606]
+    values: [101, 202, 303, 404]
   enable_wandb:
     value: true
   wandb_project:

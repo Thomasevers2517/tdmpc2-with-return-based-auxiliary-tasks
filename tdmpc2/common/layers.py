@@ -118,6 +118,83 @@ class NormedLinear(nn.Linear):
 			f"act={self.act.__class__.__name__})"
 
 
+class ResidualBlock(nn.Module):
+	"""Residual block with 3x3 convs, BN, and ReLU."""
+
+	def __init__(self, planes: int, in_planes: int = None):
+		super().__init__()
+		if in_planes is None:
+			in_planes = planes
+		self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+		self.bn1 = nn.BatchNorm2d(planes)
+		self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+		self.bn2 = nn.BatchNorm2d(planes)
+		self.relu = nn.ReLU(inplace=False)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		identity = x
+		out = self.conv1(x)
+		out = self.bn1(out)
+		out = self.relu(out)
+		out = self.conv2(out)
+		out = self.bn2(out)
+		out = out + identity
+		out = self.relu(out)
+		return out
+
+
+class CnnDynamicsBlock(nn.Module):
+	"""Single 3x3 conv dynamics block with optional projection skip.
+
+	Used for CNN dynamics: maps [B,in_planes,H,W] -> [B,out_planes,H,W].
+	"""
+
+	def __init__(self, in_planes: int, out_planes: int):
+		super().__init__()
+		self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=1, padding=1, bias=False)
+		self.bn = nn.BatchNorm2d(out_planes)
+		self.relu = nn.ReLU(inplace=False)
+		self.proj = None
+		if in_planes != out_planes:
+			self.proj = nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=1, bias=False)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		identity = x if self.proj is None else self.proj(x)
+		out = self.conv(x)
+		out = self.bn(out)
+		out = self.relu(out)
+		out = out + identity
+		out = self.relu(out)
+		return out
+
+
+class ResidualDownsampleBlock(nn.Module):
+	"""Residual block that downsamples spatially and changes channels."""
+
+	def __init__(self, in_planes: int, out_planes: int, stride: int = 2):
+		super().__init__()
+		self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+		self.bn1 = nn.BatchNorm2d(out_planes)
+		self.conv2 = nn.Conv2d(out_planes, out_planes, kernel_size=3, stride=1, padding=1, bias=False)
+		self.bn2 = nn.BatchNorm2d(out_planes)
+		self.downsample = nn.Sequential(
+			nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False),
+			nn.BatchNorm2d(out_planes),
+		)
+		self.relu = nn.ReLU(inplace=False)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		identity = self.downsample(x)
+		out = self.conv1(x)
+		out = self.bn1(out)
+		out = self.relu(out)
+		out = self.conv2(out)
+		out = self.bn2(out)
+		out = out + identity
+		out = self.relu(out)
+		return out
+
+
 def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	"""
 	Basic building block of TD-MPC2.
@@ -156,6 +233,97 @@ def conv(in_shape, num_channels, out_dim, act=None):
 	return nn.Sequential(*modules)
 
 
+class EfficientZeroBackbone(nn.Module):
+	"""EfficientZeroV2-style representation CNN adapted to 64x64 inputs.
+
+	Input:
+		x: float32[B, C_total, 64, 64]
+	Output:
+		Tensor[B, 64, 4, 4]
+	"""
+
+	def __init__(self, in_channels: int):
+		super().__init__()
+		self.in_channels = in_channels
+		self.conv0 = nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False)
+		self.bn0 = nn.BatchNorm2d(32)
+		self.relu = nn.ReLU(inplace=False)
+		self.block1 = ResidualBlock(32)
+		self.down1 = ResidualDownsampleBlock(32, 64, stride=2)
+		self.block2 = ResidualBlock(64)
+		self.pool1 = nn.AvgPool2d(kernel_size=2, stride=2)
+		self.bn1 = nn.BatchNorm2d(64)
+		self.block3 = ResidualBlock(64)
+		self.pool2 = nn.AvgPool2d(kernel_size=2, stride=2)
+		self.bn2 = nn.BatchNorm2d(64)
+		self.block4 = ResidualBlock(64)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		# x: [B, C_in, 64, 64]
+		B, C, H, W = x.shape
+		assert C == self.in_channels, f"EfficientZeroBackbone expected {self.in_channels} channels, got {C}"
+		assert H == 64 and W == 64, f"EfficientZeroBackbone expects 64x64 inputs, got {H}x{W}"
+		out = self.conv0(x)
+		out = self.bn0(out)
+		out = self.relu(out)
+		out = self.block1(out)
+		out = self.down1(out)
+		out = self.block2(out)
+		out = self.pool1(out)
+		out = self.bn1(out)
+		out = self.relu(out)
+		out = self.block3(out)
+		out = self.pool2(out)
+		out = self.bn2(out)
+		out = self.relu(out)
+		out = self.block4(out)
+		# out: [B, 64, 4, 4]
+		return out
+
+
+class EfficientZeroEncoder(nn.Module):
+	"""RGB encoder using EfficientZeroV2 backbone with optional projection.
+
+	If cfg.project_latent is True, flattens backbone output and projects to
+	cfg.latent_dim with an MLP ending in SimNorm. Otherwise, returns a
+	flattened feature of size 64*4*4.
+	"""
+
+	def __init__(self, cfg):
+		super().__init__()
+		self.cfg = cfg
+		in_shape = cfg.obs_shape['rgb']
+		c_total, h, w = in_shape
+		assert h == 64 and w == 64, f"EfficientZeroEncoder expects 64x64 rgb, got {h}x{w}"
+		# Match default conv encoder preprocessing: random shift + pixel normalize.
+		self.augment = ShiftAug()
+		self.preprocess = PixelPreprocess()
+		self.backbone = EfficientZeroBackbone(c_total)
+		self.project_latent = cfg.project_latent
+		self.backbone_channels = 64
+		self.backbone_hw = 4
+		self.backbone_dim = self.backbone_channels * self.backbone_hw * self.backbone_hw
+		if self.project_latent:
+			self.head = mlp(
+				self.backbone_dim,
+				max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
+				cfg.latent_dim,
+				act=SimNorm(cfg),
+			)
+		else:
+			# When not projecting, still apply SimNorm on the 1024-dim latent.
+			self.head = SimNorm(cfg)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		# x: [B, C_total, 64, 64] (typically uint8 from env/buffer)
+		# Apply same preprocessing and augmentation as default conv encoder.
+		x = self.augment(x)
+		x = self.preprocess(x)
+		feat = self.backbone(x)  # [B,64,4,4]
+		flat = feat.view(feat.shape[0], -1)  # [B,1024]
+		return self.head(flat)
+
+
 def enc(cfg, out={}):
 	"""
 	Returns a dictionary of encoders for each observation in the dict.
@@ -164,7 +332,12 @@ def enc(cfg, out={}):
 		if k == 'state':
 			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg))
 		elif k == 'rgb':
-			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
+			if cfg.rgb_encoder_type == 'default':
+				out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
+			elif cfg.rgb_encoder_type == 'efficientzero':
+				out[k] = EfficientZeroEncoder(cfg)
+			else:
+				raise NotImplementedError(f"Unknown rgb_encoder_type: {cfg.rgb_encoder_type}")
 		else:
 			raise NotImplementedError(f"Encoder for observation type {k} not implemented.")
 	return nn.ModuleDict(out)

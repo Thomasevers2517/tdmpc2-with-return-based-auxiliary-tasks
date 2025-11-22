@@ -167,6 +167,26 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 				cfg.planner_num_dynamics_heads = 1
 			print("Keeping multiple dynamics heads because taking max among them for exploration. Planner lambda_disagreement is zero tho")
 
+		# ----------------------------------------------------------------------
+		# EfficientZero encoder + CNN dynamics latent dimension override
+		# ----------------------------------------------------------------------
+		# When using the EfficientZero-style encoder without projection, the
+		# latent representation is spatial with shape [B, 64, 4, 4]. We must
+		# ensure cfg.latent_dim matches the flattened size so that all heads
+		# (reward, termination, policy, Q, dynamics, etc.) are constructed
+		# with the correct input dimension.
+		if getattr(cfg, 'rgb_encoder_type', None) == 'efficientzero' and getattr(cfg, 'project_latent', None) is False:
+			in_h = getattr(cfg, 'image_height', 64)
+			in_w = getattr(cfg, 'image_width', 64)
+			# Current EfficientZero backbone is hard-coded for 64x64 -> 4x4.
+			# We fail fast if the input resolution deviates from this assumption.
+			if in_h != 64 or in_w != 64:
+				raise ValueError(f"EfficientZero encoder without projection currently assumes 64x64 inputs, got {in_h}x{in_w}.")
+			latent_dim_ez = 64 * 4 * 4
+			if cfg.latent_dim != latent_dim_ez:
+				print(f"Overriding cfg.latent_dim from {cfg.latent_dim} to {latent_dim_ez} for EfficientZero encoder without projection.")
+				cfg.latent_dim = latent_dim_ez
+
  
 	if cfg.final_rho != -1:
 		import math as _math

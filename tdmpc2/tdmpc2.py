@@ -90,7 +90,7 @@ class TDMPC2(torch.nn.Module):
 		# ------------------------------------------------------------------
 		param_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
-			{'params': self.model._dynamics_heads.parameters()},
+			{'params': self.model._dynamics.parameters()},
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Qs.parameters()},
@@ -279,7 +279,7 @@ class TDMPC2(torch.nn.Module):
 		if len(enc_params) > 0:
 			groups["encoder"] = enc_params
 		# dynamics (all heads)
-		groups["dynamics"] = list(self.model._dynamics_heads.parameters())
+		groups["dynamics"] = list(self.model._dynamics.parameters())
 		# reward
 		groups["reward"] = list(self.model._reward.parameters())
 		# termination (optional)
