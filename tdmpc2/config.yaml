@@ -28,10 +28,13 @@ n_mc_samples_target: 1
 ###############################################
 
 
-# Temperatures for elite weighting during planning.
-# If unset, falls back to legacy `temperature`.
-planner_temperature_train: 0.5
-planner_temperature_eval: 0.5
+# Aggregation over dynamics heads when computing trajectory values.
+# Options: 'mean' or 'max'.
+planner_value_head_reduce: max
+
+# Std of Gaussian noise added to policy actions when seeding the planner.
+# Applied only when use_policy=True in world_model.rollout_latents.
+policy_seed_noise_std: 0.1
 
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0.0
@@ -106,7 +109,7 @@ hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from th
 hot_buffer_size: 200               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
 pin_memory: true
-prefetch: 4
+prefetch: 1
 
 exp_name: default
 data_dir: ???
@@ -150,7 +153,7 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
-num_q: 5
+num_q: 2
 dropout: 0.01
 simnorm_dim: 8
 reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value

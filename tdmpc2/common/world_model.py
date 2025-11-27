@@ -419,8 +419,6 @@ class WorldModel(nn.Module):
 			log_prob = math.gaussian_logprob(eps, log_std)
 			size = eps.shape[-1] if action_dims is None else action_dims
 			scaled_log_prob = log_prob * size
-			if search_noise:
-				eps = eps * self.cfg.search_pi_std_mult
 			action = mean + eps * log_std.exp()
 			presquash_mean = mean
 			mean, action, log_prob = math.squash(mean, action, log_prob)
@@ -480,14 +478,8 @@ class WorldModel(nn.Module):
 			return vals  # 'min'/'avg' identical with single head
 
 	def Q(self, z, a, task, return_type='min', target=False, detach=False):
-		"""Predict state-action value.
-		`return_type` can be one of [`min`, `avg`, `all`]:
-			- `min`: return the minimum of two randomly subsampled Q-values.
-			- `avg`: return the average of two randomly subsampled Q-values.
-			- `all`: return all Q-values.
-		`target` specifies whether to use the target Q-networks or not.
-		"""
-		assert return_type in {'min', 'avg', 'all'}
+		
+		assert return_type in {'min', 'avg',  'max', 'all'}
 
 		with maybe_range('WM/Q', self.cfg):
 			if self.cfg.multitask:
@@ -511,9 +503,11 @@ class WorldModel(nn.Module):
 			Q = math.two_hot_inv(out[qidx], self.cfg)
 			if return_type == "min":
 				return Q.min(0).values
+			if return_type == "max":
+				return Q.max(0).values
 			return Q.sum(0) / 2
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None):
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
 
 		Args:
@@ -524,6 +518,8 @@ class WorldModel(nn.Module):
 			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
 			head_mode (str): 'single' | 'all' | 'random'.
 			task: Optional task id for multitask.
+			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
+				when `use_policy=True`. Ignored when `use_policy=False`.
 
 		Returns:
 			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
@@ -589,6 +585,9 @@ class WorldModel(nn.Module):
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
 							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False))
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
+							if policy_action_noise_std > 0.0:
+								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
+								a_t = (a_t + noise).clamp(-1.0, 1.0)
 					else:
 						a_t = actions[:, :, t, :]  # float32[B,N,A]
 					actions_steps.append(a_t)

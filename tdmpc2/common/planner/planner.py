@@ -3,7 +3,7 @@ import torch
 import torch._dynamo as dynamo
 
 from .sampling import sample_action_sequences
-from .scoring import compute_values_head0, compute_disagreement, combine_scores
+from .scoring import compute_values, compute_disagreement, combine_scores
 from .info_types import PlannerBasicInfo, PlannerAdvancedInfo
 from common.logger import get_logger
 
@@ -62,14 +62,9 @@ class Planner(torch.nn.Module):
         N = int(self.cfg.num_samples)
         K = int(self.cfg.num_elites)
         S = int(self.cfg.num_pi_trajs)
-        # Temperature: prefer new keys; fallback to legacy cfg.temperature
-        if eval_mode:
-            temp = getattr(self.cfg, 'planner_temperature_eval', None)
-        else:
-            temp = getattr(self.cfg, 'planner_temperature_train', None)
-        if temp is None:
-            temp = getattr(self.cfg, 'temperature', 1.0)
-        temp = float(temp)
+
+        temp = float(self.cfg.temperature)
+
         lambda_d = 0.0 if eval_mode else self.cfg.planner_lambda_disagreement
         # Std bounds: prefer std_min/std_max; fallback to legacy min_std/max_std
 
@@ -84,13 +79,24 @@ class Planner(torch.nn.Module):
         policy_cache = None
         if S > 0:
             latents_p, actions_p = self.world_model.rollout_latents(
-                z0, use_policy=True, horizon=T, num_rollouts=S, head_mode=head_mode, task=task
+                z0,
+                use_policy=True,
+                horizon=T,
+                num_rollouts=S,
+                head_mode=head_mode,
+                task=task,
+                policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
             )
             # Squeeze singleton batch dim: latents [H,1,S,T+1,L] -> [H,S,T+1,L], actions [1,S,T,A] -> [S,T,A]
             latents_p = latents_p[:, 0]
             actions_p = actions_p[0]
-            latents_head0_p = latents_p[0]
-            vals_unscaled_p, vals_scaled_p = compute_values_head0(latents_head0_p, actions_p, self.world_model, task)
+            vals_unscaled_p, vals_scaled_p, vals_std_p = compute_values(
+                latents_p,
+                actions_p,
+                self.world_model,
+                task,
+                head_reduce=self.cfg.planner_value_head_reduce,
+            )
             dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
                 final_policy = latents_p[:, :, -1, :]
@@ -102,6 +108,7 @@ class Planner(torch.nn.Module):
                 actions=actions_p,
                 vals_unscaled=vals_unscaled_p,
                 vals_scaled=vals_scaled_p,
+                vals_std=vals_std_p,
                 disagreement=dis_p,
                 weighted_dis=weighted_dis_p,
                 scores=scores_p,
@@ -130,9 +137,14 @@ class Planner(torch.nn.Module):
             latents_s = latents_s[:, 0]
             actions_s = actions_s[0]
 
-            # Head 0 values for sampled trajectories only
-            latents_head0_s = latents_s[0]
-            vals_unscaled_s, vals_scaled_s = compute_values_head0(latents_head0_s, actions_s, self.world_model, task)
+            # Values for sampled trajectories using all heads and configured reduction.
+            vals_unscaled_s, vals_scaled_s, vals_std_s = compute_values(
+                latents_s,
+                actions_s,
+                self.world_model,
+                task,
+                head_reduce=self.cfg.planner_value_head_reduce,
+            )
             dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:
                 # Multiple dynamics heads are present; measure disagreement at final latent state.

@@ -147,10 +147,26 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 
 	assert (cfg.value_coef > 0 )
 
+	# Planner policy seed noise std must be non-negative.
+	if hasattr(cfg, 'policy_seed_noise_std'):
+		if cfg.policy_seed_noise_std < 0.0:
+			raise ValueError(f"policy_seed_noise_std must be >= 0.0, got {cfg.policy_seed_noise_std}.")
+
+	# Planner value head reduction mode must be explicitly configured.
+	if not hasattr(cfg, 'planner_value_head_reduce'):
+		raise AttributeError("Missing cfg.planner_value_head_reduce; expected 'mean' or 'max'.")
+	if cfg.planner_value_head_reduce not in {"mean", "max"}:
+		raise ValueError(
+			f"Invalid planner_value_head_reduce '{cfg.planner_value_head_reduce}'. Expected 'mean' or 'max'."
+		)
+
 	if cfg.planner_lambda_disagreement == 0:
 		if cfg.planner_num_dynamics_heads > 1:
-			print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. setting planner_num_dynamics_heads = 1 to save compute.")
-			cfg.planner_num_dynamics_heads = 1
+			if cfg.planner_value_head_reduce != "max":
+				print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. Planner valuehead reduce is also not max but mean, so just avging across heads. Setting planner_num_dynamics_heads = 1 to save computation. ")
+				cfg.planner_num_dynamics_heads = 1
+			print("Keeping multiple dynamics heads because taking max among them for exploration. Planner lambda_disagreement is zero tho")
+
  
 	if cfg.final_rho != -1:
 		import math as _math

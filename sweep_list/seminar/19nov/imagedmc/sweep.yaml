@@ -13,29 +13,42 @@ parameters:
   task:
     values:
       - acrobot-swingup
+      - cartpole-swingup-sparse
       - quadruped-walk
-      # - walker-run
-  reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value
+      - hopper-hop
+      - walker-run
+
+  train_act_std_coeff:
+    values: [0.0]
+
+  temperature:
+    values: [0.1]
+
+  policy_seed_noise_std:
+    values: [0.05]
+  planner_value_head_reduce:
+    values: [max]
+
+  planner_policy_elites_first_iter_only:
+    values: [false]
 
 
-  #THIS VERSION ALSO SET REDUCE ENTROPY COEFF at 0.5, unlike the previous one
-    # Keep MPC defaults from config; override as needed
   iterations:
     value: 6
   num_samples:
-    value: 2048
+    values: [1024]
   num_elites:
     values : [64]
   num_pi_trajs:
-    values: [1024]
+    values: [512]
   horizon:
-    values: [3, 6]
+    values: [3]
   final_rho:
     value: 0.125
   min_std:
-    values: [0, 0.05]
+    values: [0]
   max_std:
-    values: [0.5]
+    values: [1]
 
 # Hot buffer (recent transitions) for mixed sampling
   hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
@@ -43,7 +56,7 @@ parameters:
   hot_buffer_ratio: 
     value: 0.01      #0.01 is 3 samples     # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
   hot_buffer_size: 
-    value: 50              # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+    value: 5              # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
 
   sac_style_td: 
@@ -54,31 +67,22 @@ parameters:
 
   # UTD sweep (align with config key `utd_ratio`)
   utd_ratio:
-    values: [2]
+    values: [4]
 
   # Core: latent disagreement refactor knobs
   planner_num_dynamics_heads:
     values: [4]
   planner_lambda_disagreement:
     values: [0]
+
   fix_value_est:
     values: [true]
 
-    # Training noise multiplier (planner applies to first action in training)
-  train_act_std_coeff:
-    values: [0.0]
+
 
 
   buffer_update_interval:
-    value: 10
-
-
-
-
-  planner_temperature_train:
-    value: 0.5
-  planner_temperature_eval:
-    value: 0.5
+    values: [1]
 
 
 
@@ -88,9 +92,9 @@ parameters:
   train_mpc:
     value: true
   obs:
-    values: [state]
+    values: [rgb]
   steps:
-    value: 100000
+    value: 200000
   eval_freq:
     value: 10000
   batch_size:
