@@ -662,13 +662,7 @@ def _plotly_px():
 
 
 def _qualitative_colors():
-    try:
-        from plotly.colors import qualitative  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - environment specific.
-        raise RuntimeError(
-            "plotly is required for plotting. Install it in the tdmpc2 env."
-        ) from exc
-    return list(qualitative.Plotly)
+    return encoding_utils.color_sequence()
 
 
 def _rgba_with_alpha(color: str, alpha: float) -> str:

@@ -16,7 +16,25 @@ from .cache import (
 from .serialization import make_json_safe
 
 
+import os
+from pathlib import Path
+from .paths import ANALYSIS_ROOT
+
 SCAN_HISTORY_PAGE_SIZE = 20000000
+
+def _load_wandb_key():
+    """Load W&B API key from analysis/wandb-key.txt if not already set."""
+    if "WANDB_API_KEY" in os.environ:
+        return
+
+    key_path = ANALYSIS_ROOT / "wandb-key.txt"
+    if key_path.exists():
+        try:
+            key = key_path.read_text().strip()
+            if key:
+                os.environ["WANDB_API_KEY"] = key
+        except Exception:
+            pass
 
 def fetch_sweep_runs(
     *,
@@ -28,6 +46,8 @@ def fetch_sweep_runs(
     force_refresh: bool,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
     """Return sweep runs, manifest metadata, and the data source."""
+    
+    _load_wandb_key()
 
     _validate_history_keys(history_keys)
     canonical_keys = tuple(dict.fromkeys(history_keys))

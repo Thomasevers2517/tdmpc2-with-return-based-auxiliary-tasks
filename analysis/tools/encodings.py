@@ -49,13 +49,16 @@ def _assign_from_sequence(
 
 
 def color_sequence() -> List[str]:
-    try:
-        from plotly.colors import qualitative  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - environment specific.
-        raise RuntimeError(
-            "plotly is required for plotting. Install it in the tdmpc2 env."
-        ) from exc
-    return list(qualitative.Plotly)
+    """Return the TU Delft qualitative color sequence."""
+    return [
+        "#00A6D6",  # Cyan (Primary)
+        "#EF60A3",  # Pink
+        "#E03C31",  # Red
+        "#FFB81C",  # Yellow
+        "#009B77",  # Green
+        "#0C2340",  # Dark Blue
+        "#6D1E70",  # Purple
+    ]
 
 
 def dash_sequence() -> List[str]:
