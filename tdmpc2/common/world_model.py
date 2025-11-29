@@ -34,19 +34,10 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
-		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
-		self._dynamics_heads = nn.ModuleList([
-			layers.mlp(
-				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				2 * [cfg.mlp_dim],
-				cfg.latent_dim,
-				act=layers.SimNorm(cfg),
-			)
-			for _ in range(h_total)
-		])
-		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
-		self._dynamics = self._dynamics_heads[0]
+		# Infer spatial latent shape (C,H,W) for CNN dynamics when applicable.
+		self._latent_spatial_shape = self._get_latent_spatial_shape(cfg)
+		# Multi-head dynamics: independent heads; first head used by default.
+		self._dynamics_heads = self._build_dynamics_heads(cfg)
 		
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
@@ -174,22 +165,84 @@ class WorldModel(nn.Module):
 
 	def __repr__(self):
 		repr = 'TD-MPC2 World Model\n'
-		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', 'Q-functions']
-		# Optionally append auxiliary Q ensembles to representation
-		aux_modules = []
+		# Core modules and labels; show all dynamics heads explicitly
+		modules = [
+			("Encoder", self._encoder),
+			("Dynamics heads", self._dynamics_heads),
+			("Reward", self._reward),
+			("Termination", self._termination),
+			("Policy prior", self._pi),
+			("Q-functions", self._Qs),
+		]
+		# Optionally append auxiliary Q heads
 		if self._num_aux_gamma > 0:
-			modules.append('Aux Q-functions')
-			aux_modules = [self._aux_joint_Qs if self._aux_joint_Qs is not None else self._aux_separate_Qs]
-		for i, m in enumerate([self._encoder, self._dynamics, self._reward, self._termination, self._pi, self._Qs] + aux_modules):
-			if m == self._termination and not self.cfg.episodic:
+			aux_module = self._aux_joint_Qs if self._aux_joint_Qs is not None else self._aux_separate_Qs
+			modules.append(("Aux Q-functions", aux_module))
+
+		def count_params(m: nn.Module) -> int:
+			return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+		for name, m in modules:
+			if m is None and name == "Termination" and not self.cfg.episodic:
 				continue
-			repr += f"{modules[i]}: {m}\n"
-		repr += "Learnable parameters: {:,}".format(self.total_params)
+			if m is None:
+				continue
+			mod_params = count_params(m)
+			repr += f"{name} ({mod_params:,} params): {m}\n"
+		repr += "Learnable parameters (total): {:,}".format(self.total_params)
 		return repr
 
 	@property
 	def total_params(self):
 		return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+	def _get_latent_spatial_shape(self, cfg):
+		"""Infer (C,H,W) latent spatial shape when using CNN dynamics.
+
+		Returns None when dynamics_type is not 'cnn'.
+		"""
+		if getattr(cfg, 'dynamics_type', 'mlp') != 'cnn':
+			return None
+		if cfg.obs != 'rgb':
+			raise ValueError("CNN dynamics currently require obs == 'rgb'.")
+		if cfg.cnn_use_projection:
+			raise ValueError("CNN dynamics require cnn_use_projection == False so latent is spatial.")
+		# Build a dummy RGB batch and run through encoder conv body to get 4D features.
+		in_shape = cfg.obs_shape['rgb']
+		encoder_rgb = self._encoder['rgb']
+		if not hasattr(encoder_rgb, 'body'):
+			raise RuntimeError("RGB encoder is expected to expose a `body` attribute returning 4D conv features.")
+		body = encoder_rgb.body
+		with torch.no_grad():
+			dummy = torch.zeros(1, *in_shape, device=next(encoder_rgb.parameters()).device)
+			feat = body(dummy)
+		if feat.ndim != 4:
+			raise RuntimeError(f"Expected 4D conv features, got shape {tuple(feat.shape)}")
+		_, C, H, W = feat.shape
+		latent_dim = int(cfg.latent_dim)
+		if C * H * W != latent_dim:
+			raise RuntimeError(f"CNN dynamics expect latent_dim == C*H*W; got latent_dim={latent_dim}, C*H*W={C*H*W}")
+		return (C, H, W)
+
+	def _build_dynamics_heads(self, cfg):
+		"""Construct list of dynamics heads (MLP or CNN)."""
+		n_heads = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
+		in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
+		if getattr(cfg, 'dynamics_type', 'mlp') == 'mlp':
+			head_modules = [
+				layers.mlp(in_dim, 2 * [cfg.mlp_dim], cfg.latent_dim)
+				for _ in range(n_heads)
+			]
+		elif getattr(cfg, 'dynamics_type', 'mlp') == 'cnn':
+			if self._latent_spatial_shape is None:
+				raise RuntimeError("_latent_spatial_shape must be set for cnn dynamics.")
+			head_modules = [
+				layers.CnnDynamicsHead(self._latent_spatial_shape, cfg.action_dim)
+				for _ in range(n_heads)
+			]
+		else:
+			raise ValueError(f"Unsupported dynamics_type: {cfg.dynamics_type}")
+		return nn.ModuleList(head_modules)
 
 	def to(self, *args, **kwargs):
 		super().to(*args, **kwargs)
@@ -338,7 +391,7 @@ class WorldModel(nn.Module):
 			za = torch.cat([z, a], dim=-1)
 			H = len(self._dynamics_heads)
 			if head_mode is None:
-				# Legacy behavior: single head (0), no head dimension in output
+				# Legacy: use head 0 without an explicit head dimension
 				with self._autocast_context():
 					out = self._dynamics_heads[0](za)
 				return out.float()
@@ -352,11 +405,12 @@ class WorldModel(nn.Module):
 					out = self._dynamics_heads[idx](za)
 				return out.float().unsqueeze(0)
 			elif head_mode == 'all':
+				# Explicitly evaluate each head and stack: [H,B,L].
 				outs = []
 				with self._autocast_context():
 					for head in self._dynamics_heads:
-						outs.append(head(za)) 
-				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
+						outs.append(head(za))
+				return torch.stack([o.float() for o in outs], dim=0)
 			else:
 				raise ValueError(f"Unsupported head_mode: {head_mode}")
 
@@ -550,14 +604,10 @@ class WorldModel(nn.Module):
 		H_total = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
 		if head_mode == 'single':
 			H_sel = 1
-			head_indices = [0]
 		elif head_mode == 'all':
 			H_sel = H_total
-			head_indices = list(range(H_total))
 		elif head_mode == 'random':
 			H_sel = 1
-			idx = int(torch.randint(low=0, high=H_total, size=(1,), device=z0.device))
-			head_indices = [idx]
 		else:
 			raise ValueError(f'Unsupported head_mode: {head_mode}')
 
@@ -592,22 +642,29 @@ class WorldModel(nn.Module):
 						a_t = actions[:, :, t, :]  # float32[B,N,A]
 					actions_steps.append(a_t)
 
-					# Advance each selected head independently
+					# Advance each selected head independently (no Ensemble, different data per head).
 					next_heads = []  # will hold float32[B,N,L] per head
+					if head_mode == 'all':
+						head_indices = list(range(H_total))
+					else:  # 'single' or 'random'
+						if head_mode == 'single':
+							head_indices = [0]
+						else:  # 'random'
+							idx = int(torch.randint(low=0, high=H_total, size=(1,), device=z0.device))
+							head_indices = [idx]
 					for hi, h in enumerate(head_indices):
 						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
 							z_curr = latents_steps[t][hi].view(B * N, L)  # float32[B*N,L]
 							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
 							if self.cfg.multitask:
-								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
+								z_cat = self.task_emb(z_curr, task)  # float32[B*N,L+T]
 							else:
 								z_cat = z_curr
-							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
+							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N,L(+T)+A]
 							with self._autocast_context():
 								next_flat = self._dynamics_heads[h](za)  # float32[B*N,L]
 							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
 							next_heads.append(next_bn)
-
 					# Aggregate heads for next timestep
 					next_hbn = torch.stack(next_heads, dim=0)  # float32[H_sel,B,N,L]
 					latents_steps.append(next_hbn)

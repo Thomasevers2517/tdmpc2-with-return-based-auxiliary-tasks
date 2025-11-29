@@ -148,6 +148,12 @@ model_size: ???
 num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
+cnn_use_projection: false       # If true, linearly project CNN features to latent_dim; if false, use raw CNN features.
+dynamics_type: mlp             # 'mlp' (current default) or 'cnn' for spatial CNN dynamics heads.
+
+rgb_encoder_type: default      # RGB encoder: 'default' (conv) or 'large' (ResNet-style conv_large)
+large_conv_num_blocks: 4       # Depth (number of residual blocks) for conv_large when rgb_encoder_type == 'large'
+
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96

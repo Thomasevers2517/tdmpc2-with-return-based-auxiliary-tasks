@@ -14,8 +14,25 @@ parameters:
     values:
       # - acrobot-swingup
       - quadruped-walk
-      - hopper-hop
+      # - hopper-hop
       # - walker-run
+  encoder_consistency_coef:
+    values: [0.0]
+    
+  dynamics_type:
+    values: [mlp,cnn]
+
+  cnn_use_projection:
+    values: [false]
+    
+  rgb_encoder_type:
+    values: [large]
+
+  num_channels:
+    values: [32, 64, 128] 
+
+  large_conv_num_blocks:
+    values: [8]
 
   train_act_std_coeff:
     values: [0.0]
@@ -66,11 +83,11 @@ parameters:
 
   # UTD sweep (align with config key `utd_ratio`)
   utd_ratio:
-    values: [4]
+    values: [2]
 
   # Core: latent disagreement refactor knobs
   planner_num_dynamics_heads:
-    values: [2, 4, 8]
+    values: [4]
   planner_lambda_disagreement:
     values: [0]
 
@@ -91,9 +108,9 @@ parameters:
   train_mpc:
     value: true
   obs:
-    values: [state]
+    values: [rgb]
   steps:
-    value: 100000
+    value: 300000
   eval_freq:
     value: 10000
   batch_size:
@@ -101,7 +118,7 @@ parameters:
 
   # Repro and logging
   seed:
-    values: [101, 202, 303, 404 , 505, 606]
+    values: [101, 202]
   enable_wandb:
     value: true
   wandb_project:
