@@ -18,6 +18,9 @@ pi_rollout_horizon: 1  # Number of steps to rollout for model-based policy optim
 
 final_rho: -1 # if set, overrides rho schedule such at the end of the horizon the discount is final_rho
 
+# DEPRECATED: sac_style_td is no longer used. The SAC-style entropy subtraction
+# from TD targets has been removed in favor of multi-head dynamics pessimism.
+# This config key is kept for backward compatibility but has no effect.
 sac_style_td: false
 
 n_mc_samples_target: 1
