@@ -1,0 +1,124 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Base task (matches config default). Add more tasks if desired.
+  task:
+    values:
+      - quadruped-walk
+
+  # Sweep reward heads as well
+  num_reward_heads:
+    values: [1, 2]
+
+  # Aggregation over reward and dynamics heads when computing trajectory values for planning.
+  planner_head_reduce:
+    value: max
+
+  # Aggregation over reward and dynamics heads when computing policy loss.
+  # Using min for pessimistic policy optimization.
+  policy_head_reduce: 
+    value: min
+
+  actor_source:
+    value: replay_rollout
+    
+  tau:
+    value: 0.01
+  critic_type:
+    value: V
+  pi_rollout_horizon:
+    value: 1
+  train_act_std_coeff:
+    value: 0.0
+
+  temperature:
+    value: 0.5
+
+  policy_seed_noise_std:
+    value: 0
+
+  planner_policy_elites_first_iter_only:
+    value: false
+
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Hot buffer (recent transitions) for mixed sampling
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio: 
+    value: 0.01
+  hot_buffer_size: 
+    value: 5
+
+  sac_style_td: 
+    value: false
+
+  n_mc_samples_target:
+    value: 1
+
+  utd_ratio:
+    value: 4
+
+  # Sweep dynamics heads to compare H=2 vs H=4 with loss weighting fix
+  planner_num_dynamics_heads:
+    values: [2, 4]
+  planner_lambda_disagreement:
+    value: 0
+
+  buffer_update_interval:
+    value: 1
+
+  # Common training/eval settings from config
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  # Repro and logging - 3 seeds
+  seed:
+    values: [101, 202, 303]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation enabled
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

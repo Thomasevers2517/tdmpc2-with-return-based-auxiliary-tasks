@@ -751,21 +751,26 @@ class TDMPC2(torch.nn.Module):
 		termination_loss = torch.stack(branch_term_losses).mean()
 		rew_ce_mean = torch.stack(branch_rew_ce).mean(dim=0)
 
+		# Scale losses by number of ensemble heads to restore per-head gradient magnitude.
+		# Without this, mean() over H heads dilutes gradients by 1/H per head.
+		H = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))  # dynamics heads
+		R = int(getattr(self.cfg, 'num_reward_heads', 1))  # reward heads
+
 		wm_total = (
-			self.cfg.consistency_coef * consistency_loss
-			+ self.cfg.encoder_consistency_coef * encoder_consistency_loss
-			+ self.cfg.reward_coef * reward_loss
+			self.cfg.consistency_coef * consistency_loss * H
+			+ self.cfg.encoder_consistency_coef * encoder_consistency_loss * H
+			+ self.cfg.reward_coef * reward_loss * R
 			+ self.cfg.termination_coef * termination_loss
 		)
 
 		info = TensorDict({
 			'consistency_losses': consistency_losses,
 			'consistency_loss': consistency_loss,
-			'consistency_loss_weighted': consistency_losses * self.cfg.consistency_coef,
+			'consistency_loss_weighted': consistency_losses * self.cfg.consistency_coef * H,
 			'encoder_consistency_loss': encoder_consistency_loss,
-			'encoder_consistency_loss_weighted': encoder_consistency_losses * self.cfg.encoder_consistency_coef,
+			'encoder_consistency_loss_weighted': encoder_consistency_losses * self.cfg.encoder_consistency_coef * H,
 			'reward_loss': reward_loss,
-			'reward_loss_weighted': reward_loss * self.cfg.reward_coef,
+			'reward_loss_weighted': reward_loss * self.cfg.reward_coef * R,
 			'termination_loss': termination_loss,
 			'termination_loss_weighted': termination_loss * self.cfg.termination_coef,
 			'world_model_loss': wm_total,
@@ -783,7 +788,7 @@ class TDMPC2(torch.nn.Module):
 				weight_mode = branch['weight_mode']
 				info.update({
 					f'reward_loss_{weight_mode}': branch_reward_losses[idx],
-					f'reward_loss_{weight_mode}_weighted': branch_reward_losses[idx] * self.cfg.reward_coef,
+					f'reward_loss_{weight_mode}_weighted': branch_reward_losses[idx] * self.cfg.reward_coef * R,
 					f'termination_loss_{weight_mode}': branch_term_losses[idx],
 					f'termination_loss_{weight_mode}_weighted': branch_term_losses[idx] * self.cfg.termination_coef,
 				}, non_blocking=True)
