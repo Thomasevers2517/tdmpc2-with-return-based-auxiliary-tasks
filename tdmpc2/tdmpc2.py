@@ -22,8 +22,8 @@ log = get_logger(__name__)
 #   B  = batch size (cfg.batch_size)
 #   A  = action_dim (cfg.action_dim)
 #   L  = latent_dim (cfg.latent_dim)
-#   K  = num_bins (distributional support for reward & Q-value regression)
-#   Qe = num_q (ensemble size for Q-functions)
+#   K  = num_bins (distributional support for reward & V-value regression)
+#   Ve = num_q (ensemble size for V-functions, kept as num_q for config compatibility)
 #   G_aux = number of auxiliary discounts (len(cfg.multi_gamma_gammas))
 #
 # Shapes Summary (core tensors used during update):
@@ -34,11 +34,11 @@ log = get_logger(__name__)
 #   next_z           : (T,   B, L)                     encoded latents for time steps 1..T
 #   zs               : (T+1, B, L)                     latent rollout (predicted) with zs[0] = encode(obs[0])
 #   _zs              : (T,   B, L)                     alias zs[:-1] for action-aligned states
-#   qs (primary)     : (Qe,  T, B, K)                  distributional Q logits per ensemble head
+#   vs (primary)     : (Ve,  T, B, K)                  distributional V logits per ensemble head
 #   td_targets       : (T,   B, K)                     primary distributional TD target (two-hot supervision)
 #   reward_preds     : (T,   B, K)                     reward prediction logits
 #   termination_pred : (T,   B, 1) (episodic only)     termination logits
-#   q_aux_logits     : (T, B, G_aux, K)                auxiliary multi-gamma Q logits (if enabled; no ensemble)
+#   v_aux_logits     : (T, B, G_aux, K)                auxiliary multi-gamma V logits (if enabled; no ensemble)
 #   aux_td_targets   : (G_aux, T, B, 1)                scalar TD targets per auxiliary gamma
 #
 # Loss Terms:
@@ -50,12 +50,12 @@ log = get_logger(__name__)
 #   total_loss       : weighted sum including optional auxiliary mean loss
 #
 # Planner (_plan): Uses MPPI/CEM style sampling with mixture of policy prior
-# trajectories & Gaussian noise. Q-values used for value estimation via model.
+# trajectories & Gaussian noise. V-values used for value estimation via model.
 #
-# Policy Update: Optimizes expected Q (scaled) + entropy bonus along latent
-# trajectory produced by world model (not environment).
+# Policy Update: With V-function, we optimize expected V (scaled) + entropy bonus
+# by backpropagating through frozen dynamics to find actions that lead to high-value states.
 #
-# Multi-Gamma Extension: Adds auxiliary action-value ensembles predicting
+# Multi-Gamma Extension: Adds auxiliary state-value heads predicting
 # discounted returns for alternative γ's; training-only supervision improves
 # representation without affecting planner or policy targets directly.
 # -----------------------------------------------------------------------------
@@ -72,7 +72,7 @@ class TDMPC2(torch.nn.Module):
 		super().__init__()
 		self.cfg = cfg
 		self.device = torch.device('cuda:0')
-		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, Q ensembles, aux Q ensembles)
+		self.model = WorldModel(cfg).to(self.device)  # World model modules (encoder, dynamics, reward, termination, policy prior, V ensembles, aux V heads)
 		if self.cfg.dtype == 'float16':
 			self.autocast_dtype = torch.float16
 		elif self.cfg.dtype == 'bfloat16':
@@ -93,15 +93,15 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._dynamics_heads.parameters()},
 			{'params': self.model._reward.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
-			{'params': self.model._Qs.parameters()},
+			{'params': self.model._Vs.parameters()},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
 		]
 		if getattr(self.cfg, 'multi_gamma_gammas', None) and len(self.cfg.multi_gamma_gammas) > 0:
 			# Append auxiliary head params (single heads, not ensembles)
-			if self.model._aux_joint_Qs is not None:
-				param_groups.append({'params': self.model._aux_joint_Qs.parameters()})
-			elif self.model._aux_separate_Qs is not None:
-				for head in self.model._aux_separate_Qs:
+			if self.model._aux_joint_Vs is not None:
+				param_groups.append({'params': self.model._aux_joint_Vs.parameters()})
+			elif self.model._aux_separate_Vs is not None:
+				for head in self.model._aux_separate_Vs:
 					param_groups.append({'params': head.parameters()})
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
@@ -268,7 +268,7 @@ class TDMPC2(torch.nn.Module):
 	def _grad_param_groups(self):
 		"""Return mapping of component group name -> list of parameters.
 
-		Groups: encoder, dynamics, reward, termination (if episodic), Qs, aux_Qs (combined),
+		Groups: encoder, dynamics, reward, termination (if episodic), Vs, aux_Vs (combined),
 		task_emb (if multitask), policy.
 		"""
 		groups = {}
@@ -285,17 +285,17 @@ class TDMPC2(torch.nn.Module):
 		# termination (optional)
 		if self.cfg.episodic:
 			groups["termination"] = list(self.model._termination.parameters())
-		# primary Q ensemble
-		groups["Qs"] = list(self.model._Qs.parameters())
-		# auxiliary Q heads (combined)
+		# primary V ensemble
+		groups["Vs"] = list(self.model._Vs.parameters())
+		# auxiliary V heads (combined)
 		aux_params = []
-		if getattr(self.model, "_aux_joint_Qs", None) is not None:
-			aux_params.extend(list(self.model._aux_joint_Qs.parameters()))
-		elif getattr(self.model, "_aux_separate_Qs", None) is not None:
-			for head in self.model._aux_separate_Qs:
+		if getattr(self.model, "_aux_joint_Vs", None) is not None:
+			aux_params.extend(list(self.model._aux_joint_Vs.parameters()))
+		elif getattr(self.model, "_aux_separate_Vs", None) is not None:
+			for head in self.model._aux_separate_Vs:
 				aux_params.extend(list(head.parameters()))
 		if len(aux_params) > 0:
-			groups["aux_Qs"] = aux_params
+			groups["aux_Vs"] = aux_params
 		# task embedding (optional)
 		if self.cfg.multitask:
 			groups["task_emb"] = list(self.model._task_emb.parameters())
@@ -324,7 +324,7 @@ class TDMPC2(torch.nn.Module):
 		"""Hinge^p penalty on pre-squash mean μ, aggregated with same time-weighting as policy loss.
 
 		Args:
-			presquash_mean: Tensor of shape (T,B,A) or (T,2*B,A) when pred_from=="both".
+			presquash_mean: Tensor of shape (T, B, A).
 			rho_pows: Tensor of shape (T,) containing rho^t weights.
 
 		Config (must exist):
@@ -334,17 +334,7 @@ class TDMPC2(torch.nn.Module):
 		"""
 		p = int(self.cfg.hinge_power)
 		tau = float(self.cfg.hinge_tau)
-		if self.cfg.pred_from == "both":
-			T = presquash_mean.shape[0]
-			B2 = presquash_mean.shape[1]
-			assert B2 % 2 == 0, "Expected second dim to be 2*B for pred_from=='both'"
-			B = B2 // 2
-			mu_both = presquash_mean.view(T, 2, B, -1)
-			hinge_tb = F.relu(mu_both.abs() - tau).pow(p).mean(dim=(2, 3))  # (T,2)
-			hinge_true = hinge_tb[:, 0].mean() * rho_pows.mean()
-			hinge_roll = (hinge_tb[:, 1] * rho_pows).mean()
-			return 0.5 * (hinge_true + hinge_roll)
-		elif self.cfg.pred_from == "rollout":
+		if self.cfg.pred_from == "rollout":
 			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))  # (T,)
 			return (hinge_t * rho_pows).mean()
 		else:  # true_state
@@ -352,30 +342,84 @@ class TDMPC2(torch.nn.Module):
 			return hinge_t.mean() * rho_pows.mean()
 
 	def calc_pi_losses(self, z, task):
-		#Z is shape (T,B,L) or (T,2,B,L)
-		if self.cfg.pred_from == "both":
-			assert z.dim() == 4 and z.shape[1] == 2, "For 'both' pred_from, z must have shape (T,2,B,L)"
-			T, B, L = z.shape[0], z.shape[2], z.shape[3]
-			z = z.view(T, 2*B, L)  # z: float32[T,2*B,L]
+		"""
+		Compute policy loss using state-value function V(s).
+		
+		For V-learning, we maximize: r(z, a) + γ * V(z') + entropy_bonus
+		where z' is reached by taking action a from policy pi(z) and rolling
+		through dynamics. The dynamics, reward, and value function are frozen
+		during policy optimization (SAC-style backprop through frozen model).
+		
+		Args:
+			z (Tensor[T, B, L]): Current latent states.
+			task: Task identifier for multitask setup.
+			
+		Returns:
+			Tuple[Tensor, TensorDict]: Policy loss and info dict.
+		"""
+		T, B, L = z.shape
+		
+		# Ensure contiguity for torch.compile compatibility
+		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
+			
 		with maybe_range('Agent/update_pi', self.cfg):
-			action, info = self.model.pi(z, task)
-			qs = self.model.Q(z, action, task, return_type='avg', detach=True)
-			self.scale.update(qs[0])
-			qs = self.scale(qs)
-			rho_pows = torch.pow(self.cfg.rho,
-				torch.arange(z.shape[0], device=self.device)
-			)
-			# Loss is a weighted sum of Q-values
-			if self.cfg.actor_source == "ac":
-				if self.cfg.ac_source == "imagine" or self.cfg.ac_source == "replay_rollout":
-					pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
-				else:
-					raise NotImplementedError(f"ac_source {self.cfg.ac_source} not implemented for TD-MPC2")
-			elif self.cfg.actor_source == "imagine" or self.cfg.actor_source == "replay_rollout":
-				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows).mean()
-			elif self.cfg.actor_source == "replay_true":
-				pi_loss = (-(self.dynamic_entropy_coeff * info["scaled_entropy"] + qs).mean(dim=(1,2)) * rho_pows.mean()).mean()
-    
+			# Sample action from policy at current state (policy has gradients)
+			action, info = self.model.pi(z, task)  # action: float32[T, B, A]
+			
+			# Flatten for model calls
+			z_flat = z.view(T * B, L)              # float32[T*B, L]
+			action_flat = action.view(T * B, -1)  # float32[T*B, A]
+			
+			# Get discount factor
+			if self.cfg.multitask:
+				task_flat = task.repeat(T) if task is not None else None
+				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B, 1]
+			else:
+				task_flat = None
+				gamma = self.discount  # scalar
+			
+			# Predict reward r(z, a) - immediate reward from taking action
+			# reward() returns distributional logits [T*B, K], convert to scalar
+			# NOTE: Gradients flow through reward/dynamics/V to the action, but only
+			# policy params are updated (pi_optim only contains policy parameters).
+			reward_logits_flat = self.model.reward(z_flat, action_flat, task_flat)  # float32[T*B, K]
+			reward_flat = math.two_hot_inv(reward_logits_flat, self.cfg)  # float32[T*B, 1]
+			
+			# Roll through ALL dynamics heads to get next states z', then take min V
+			# This adds pessimism to prevent policy from exploiting dynamics errors
+			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B, L]
+			H = next_z_all.shape[0]  # number of dynamics heads
+			
+			# Evaluate V(z') for each dynamics head using detached network
+			# Use return_type='min' to also take minimum over V ensemble heads
+			# Reshape to evaluate all heads at once: [H*T*B, L]
+			next_z_all_flat = next_z_all.view(H * T * B, L)  # float32[H*T*B, L]
+			task_flat_expanded = task_flat.repeat(H) if task_flat is not None else None
+			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B, 1]
+			v_next_all = v_next_all_flat.view(H, T * B, 1)  # float32[H, T*B, 1]
+			
+			# Take minimum over dynamics heads for additional pessimism
+			v_next_flat = v_next_all.min(dim=0).values  # float32[T*B, 1]
+			
+			# Compute Q-like estimate: r(z, a) + γ * min_h V(z'_h)
+			# This is what the action "earns" - immediate reward plus discounted future value
+			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B, 1]
+			q_estimate = q_estimate_flat.view(T, B, 1)           # float32[T, B, 1]
+			
+			# Update scale with the Q-estimate (first timestep batch for stability)
+			self.scale.update(q_estimate[0])
+			q_scaled = self.scale(q_estimate)  # float32[T, B, 1]
+			
+			# Temporal weighting
+			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+			
+			# Entropy from policy (already scaled by action_dim in model.pi)
+			scaled_entropy = info["scaled_entropy"]  # float32[T, B, 1]
+			
+			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
+			# Apply rho weighting across time
+			objective = q_scaled + self.dynamic_entropy_coeff * scaled_entropy  # float32[T, B, 1]
+			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
 			lam = float(self.cfg.hinge_coef)
@@ -383,23 +427,25 @@ class TDMPC2(torch.nn.Module):
 			pi_loss = pi_loss + lam * hinge_loss
 
 			info = TensorDict({
-			"pi_loss": pi_loss,
-			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
-			"pi_entropy": info["entropy"],
-			"pi_scaled_entropy": info["scaled_entropy"],
-			"pi_scale": self.scale.value,
-			"pi_std": info["log_std"].mean(),
-			"pi_mean": info["mean"].mean(),
-			"pi_abs_mean": info["mean"].abs().mean(),
-			"pi_presquash_mean": info["presquash_mean"].mean(),
-			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
-
-			"pi_presquash_abs_std": info["presquash_mean"].abs().std(),
-			"pi_presquash_abs_min": info["presquash_mean"].abs().min(),
-			"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
-			"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
-			"entropy_coeff": self.dynamic_entropy_coeff
-				}, device=self.device)
+				"pi_loss": pi_loss,
+				"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
+				"pi_entropy": info["entropy"],
+				"pi_scaled_entropy": info["scaled_entropy"],
+				"pi_scale": self.scale.value,
+				"pi_std": info["log_std"].mean(),
+				"pi_mean": info["mean"].mean(),
+				"pi_abs_mean": info["mean"].abs().mean(),
+				"pi_presquash_mean": info["presquash_mean"].mean(),
+				"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
+				"pi_presquash_abs_std": info["presquash_mean"].abs().std(),
+				"pi_presquash_abs_min": info["presquash_mean"].abs().min(),
+				"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
+				"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
+				"entropy_coeff": self.dynamic_entropy_coeff,
+				"pi_q_estimate_mean": q_estimate.mean(),
+				"pi_reward_mean": reward_flat.mean(),
+				"pi_v_next_mean": v_next_flat.mean(),
+			}, device=self.device)
 
 			return pi_loss, info
 
@@ -416,52 +462,43 @@ class TDMPC2(torch.nn.Module):
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 		pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
-		# if log_grads:
-		# 	# self.probe_pi_gradients(pi_loss, info)
-
 		return pi_loss, info
 
 	@torch.no_grad()
 	def _td_target(self, next_z, reward, terminated, task):
 		"""
 		Compute the TD-target from a reward and the observation at the following time step.
+		
+		With V-function, the TD target is simply: r + γ * (1 - terminated) * V(next_z)
+		No action sampling is needed since V is state-only.
 
 		Args:
-			next_z (torch.Tensor): Latent state at the following time step.
-			reward (torch.Tensor): Reward at the current time step.
-			terminated (torch.Tensor): Termination signal at the current time step.
+			next_z (torch.Tensor[T, B, L]): Latent state at the following time step.
+			reward (torch.Tensor[T, B, 1]): Reward at the current time step.
+			terminated (torch.Tensor[T, B, 1]): Termination signal at the current time step.
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			torch.Tensor: TD-target.
+			torch.Tensor[T, B, 1]: TD-target values.
 		"""
-		# Monte Carlo bootstrap over policy actions.
-		# Shapes:
-		#   next_z: (T, B, L)
-		#   N = self.cfg.n_mc_samples_target
-		# We create a contiguous repeated latent tensor along the time axis:
-		#   expanded_seq = next_z.repeat(N, 1, 1) -> (N*T, B, L)
-		# Make N explicit (N, T, B, L), then flatten only the leading (N*T*B) dims
-		# into a single batch to call policy/critic once:
-		#   flat_expanded = expanded_seq.view(N, T, B, L).reshape(N*T*B, L)
+		# With V-function, no Monte Carlo sampling over actions is needed
+		# V(s) directly gives us the value of the state
 		T, B, L = next_z.shape
-		N = int(self.cfg.n_mc_samples_target)
-		expanded_seq = next_z.contiguous().repeat(N, 1, 1)  # (N*T, B, L) contiguous (no stride-0 dims)
-		expanded_seq = expanded_seq.view(N, T, B, L)       # (N, T, B, L) — explicit MC dim
-		flat_expanded = expanded_seq.reshape(N * T * B, L)  # (N*T*B, L) — single batch for model calls
-		action, info = self.model.pi(flat_expanded, task, use_ema=self.cfg.policy_ema_enabled)
-		# Evaluate critic on all (N*T*B) latent-action pairs, returns logits over K bins per pair.
-		q_values = self.model.Q(flat_expanded, action, task, return_type='min', target=True)  # (N*T*B, 1)
-		# Reshape back to (N, T, B, K), average across MC sample
-		q_value = q_values.view(N, T, B, -1).mean(dim=0)  #  (T, B, K)
+		
+		# Evaluate V on next states using target network
+		v_values = self.model.V(next_z, task, return_type='min', target=True)  # (T, B, 1)
+		
+		# Optionally subtract entropy for SAC-style target
 		if self.cfg.sac_style_td:
-			scaled_entropy = info["scaled_entropy"].view(N, T, B).mean(dim=0)  # (T, B)
+			# Sample action for entropy estimation (policy at next state)
+			_, info = self.model.pi(next_z.view(T * B, L), task, use_ema=self.cfg.policy_ema_enabled)
+			scaled_entropy = info["scaled_entropy"].view(T, B)  # (T, B)
 			scale = self.scale.value
-			q_value = q_value - self.dynamic_entropy_coeff * scaled_entropy.unsqueeze(-1) * scale
+			v_values = v_values - self.dynamic_entropy_coeff * scaled_entropy.unsqueeze(-1) * scale
   
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		# Primary TD target distribution (still stored as distributional bins via CE loss)
-		return reward + discount * (1 - terminated) * q_value  # 
+		# Primary TD target: r + γ * (1 - done) * V(s')
+		return reward + discount * (1 - terminated) * v_values 
   
 
 	@torch.no_grad()
@@ -471,26 +508,19 @@ class TDMPC2(torch.nn.Module):
 		if G_aux <= 0:
 			return None
 
-		N = int(self.cfg.n_mc_samples_target)
-		# MC-average over N policy samples for auxiliary discounts.
-		# Shapes mirror _td_target:
-		#   next_z: (T, B, L)
-		#   expanded_seq = next_z.repeat(N, 1, 1) -> (N*T, B, L)
-		# IMPORTANT: Q_aux expects inputs with explicit (T, B, ...) leading dims (see world_model.Q_aux).
-		# Therefore, we keep the (N*T, B, L) shape (fold N into T) and DO NOT flatten B for Q_aux.
+		# With V-function, no Monte Carlo sampling over actions is needed
+		# V_aux(s) directly gives us the value of the state for each auxiliary gamma
 		T, B, L = next_z.shape
-		expanded_seq = next_z.contiguous().repeat(N, 1, 1)  # (N*T, B, L)
-		# Sample actions on the same (N*T, B, L) grid; policy supports arbitrary leading dims.
-		action, _ = self.model.pi(expanded_seq, task, use_ema=self.cfg.policy_ema_enabled)
-		# Evaluate auxiliary critics; with return_type!='all' this returns values with shape (G_aux, N*T, B, 1).
-		q_values = self.model.Q_aux(expanded_seq, action, task, return_type='min', target=True)  # (G_aux, N*T, B, 1)
-		# Reshape (fold N out of T) and average across MC samples -> (G_aux, T, B, 1)
-		q_values = q_values.view(G_aux, N, T, B, -1).mean(dim=1)  #  (G_aux, T, B, 1)
+		
+		# Evaluate auxiliary V on next states using target network
+		# V_aux returns (G_aux, T, B, 1) for scalar values
+		v_values = self.model.V_aux(next_z, task, return_type='min', target=True)  # (G_aux, T, B, 1)
+		
 		td_targets_aux = []
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		for g in range(G_aux):
 			gamma_aux = self._all_gammas[g + 1]
-			td_target_aux_g = reward + gamma_aux * discount * (1 - terminated) * q_values[g]  # (T, B, 1)
+			td_target_aux_g = reward + gamma_aux * discount * (1 - terminated) * v_values[g]  # (T, B, 1)
 			td_targets_aux.append(td_target_aux_g)
 		return torch.stack(td_targets_aux, dim=0)  # (G_aux, T, B, 1)
 
@@ -537,46 +567,17 @@ class TDMPC2(torch.nn.Module):
 				'terminated': terminated,
 				'weight_mode': 'rollout'
 			})
-		elif self.cfg.pred_from == 'both':
-			if self.cfg.split_batch:
-				if B % 2 != 0:
-					raise ValueError('Batch size must be even when split_batch is True and pred_from=="both".')
-				half = B // 2
-				branches.append({
-					'latents': z_true[:-1, :half],
-					'next_latents': z_true[1:, :half],
-					'actions': action[:, :half],
-					'reward_target': reward[:, :half],
-					'terminated': terminated[:, :half],
-					'weight_mode': 'true'
-				})
-				branches.append({
-					'latents': z_rollout[:-1, half:],
-					'next_latents': z_rollout[1:, half:],
-					'actions': action[:, half:],
-					'reward_target': reward[:, half:],
-					'terminated': terminated[:, half:],
-					'weight_mode': 'rollout'
-				})
-			else:
-				branches.append({
-					'latents': z_true[:-1],
-					'next_latents': z_true[1:],
-					'actions': action,
-					'reward_target': reward,
-					'terminated': terminated,
-					'weight_mode': 'true'
-				})
-				branches.append({
-					'latents': z_rollout[:-1],
-					'next_latents': z_rollout[1:],
-					'actions': action,
-					'reward_target': reward,
-					'terminated': terminated,
-					'weight_mode': 'rollout'
-				})
+		elif self.cfg.pred_from == 'true_state':
+			branches.append({
+				'latents': z_true[:-1],
+				'next_latents': z_true[1:],
+				'actions': action,
+				'reward_target': reward,
+				'terminated': terminated,
+				'weight_mode': 'true'
+			})
 		else:
-			raise ValueError(f"Unsupported pred_from='{self.cfg.pred_from}' for world_model_losses")
+			raise ValueError(f"Unsupported pred_from='{self.cfg.pred_from}'. Must be 'rollout' or 'true_state'.")
 
 		branch_reward_losses = []
 		branch_rew_ce = []
@@ -763,38 +764,42 @@ class TDMPC2(torch.nn.Module):
 
 
 	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
-		"""Compute primary critic loss on arbitrary latent sequences."""
+		"""Compute primary critic loss on arbitrary latent sequences.
+		
+		With V-function, we predict V(z) for each state in the sequence and
+		train against TD targets r + γ * V(next_z).
+		"""
 		if z_td is None:
 			assert self.cfg.ac_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
-		T, B, _ = actions.shape  # actions: float32[T,B,A]
+		T, B, _ = actions.shape  # actions: float32[T,B,A] (kept for interface compatibility)
 		K  = self.cfg.num_bins
 		device = z_seq.device
 
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=z_seq.dtype))  # float32[T]
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # z_seq: float32[T+1,B,L]
-		actions = actions.detach()  # float32[T,B,A]
 		rewards = rewards.detach()  # float32[T,B,1]
 		terminated = terminated.detach()  # float32[T,B,1]
 
-		qs = self.model.Q(z_seq[:-1], actions, task, return_type='all')  # float32[Qe,T,B,K]
+		# V-function: input is state only, no action
+		vs = self.model.V(z_seq[:-1], task, return_type='all')  # float32[Ve,T,B,K]
 		with maybe_range('Value/td_target', self.cfg):
 			with torch.no_grad():
 				if z_td is not None:
-					td_targets = self._td_target(z_td, rewards, terminated, task)  # float32[T,B,K]
+					td_targets = self._td_target(z_td, rewards, terminated, task)  # float32[T,B,1]
 				else:
-					td_targets = self._td_target(z_seq[1:], rewards, terminated, task)  # float32[T,B,K]
+					td_targets = self._td_target(z_seq[1:], rewards, terminated, task)  # float32[T,B,1]
 
-		Qe = qs.shape[0]
+		Ve = vs.shape[0]  # num_q ensemble size
 		with maybe_range('Value/ce', self.cfg):
-			qs_flat = qs.view(Qe * T * B, K)  # float32[Qe*T*B,K]
-			td_expanded = td_targets.unsqueeze(0).expand(Qe, -1, -1, -1)  # float32[Qe,T,B,K]
-			td_flat = td_expanded.contiguous().view(Qe * T * B, 1)  # float32[Qe*T*B,1]
+			vs_flat = vs.view(Ve * T * B, K)  # float32[Ve*T*B,K]
+			td_expanded = td_targets.unsqueeze(0).expand(Ve, -1, -1, -1)  # float32[Ve,T,B,1]
+			td_flat = td_expanded.contiguous().view(Ve * T * B, 1)  # float32[Ve*T*B,1]
 			val_ce = math.soft_ce(
-				qs_flat,
+				vs_flat,
 				td_flat,
 				self.cfg,
-			).view(Qe, T, B, 1).mean(dim=(0, 2)).squeeze(-1)  # float32[T]
+			).view(Ve, T, B, 1).mean(dim=(0, 2)).squeeze(-1)  # float32[T]
 
 		weighted = val_ce * rho_pows
 		loss = weighted.mean()
@@ -805,7 +810,7 @@ class TDMPC2(torch.nn.Module):
 
 		for t in range(T):
 			info.update({f'value_loss/step{t}': val_ce[t]}, non_blocking=True)
-		value_pred = math.two_hot_inv(qs, self.cfg)  # float32[Qe,T,B,1]
+		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve,T,B,1]
 		if self.log_detailed:
 			info.update({
 				'td_target_mean': td_targets.mean(),
@@ -818,8 +823,8 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
    
-		td_full = td_targets.unsqueeze(0).expand(Qe, -1, -1, -1)  # float32[Qe,T,B,K]
-		value_error = (value_pred - td_full.contiguous().view(Qe, T, B, 1))  # float32[Qe,T,B,1]
+		td_full = td_targets.unsqueeze(0).expand(Ve, -1, -1, -1)  # float32[Ve,T,B,1]
+		value_error = (value_pred - td_full.contiguous().view(Ve, T, B, 1))  # float32[Ve,T,B,1]
 		for i in range(T):
 			info.update({f"value_error_abs_mean/step{i}": value_error[:,i].abs().mean(),
 						f"value_error_std/step{i}": value_error[:,i].std(),
@@ -829,24 +834,27 @@ class TDMPC2(torch.nn.Module):
 		return loss, info
 
 	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
-		"""Compute auxiliary multi-gamma critic losses."""
+		"""Compute auxiliary multi-gamma critic losses.
+		
+		With V-function, we predict V_aux(z) for each state and auxiliary gamma.
+		"""
 		if z_td is None:
 			assert self.cfg.aux_value_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
 		if self.model._num_aux_gamma == 0:
 			return torch.zeros((), device=z_seq.device), TensorDict({}, device=z_seq.device)
 
-		T, B, _ = actions.shape  # actions: float32[T,B,A]
+		T, B, _ = actions.shape  # actions: float32[T,B,A] (kept for interface compatibility)
 		device = z_seq.device
 
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=z_seq.dtype))  # float32[T]
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # z_seq: float32[T+1,B,L]
-		actions = actions.detach()  # float32[T,B,A]
 		rewards = rewards.detach()  # float32[T,B,1]
 		terminated = terminated.detach()  # float32[T,B,1]
 
-		q_aux_logits = self.model.Q_aux(z_seq[:-1], actions, task, return_type='all')  # float32[G_aux,T,B,K] or None
-		if q_aux_logits is None:
+		# V_aux: input is state only, no action
+		v_aux_logits = self.model.V_aux(z_seq[:-1], task, return_type='all')  # float32[G_aux,T,B,K] or None
+		if v_aux_logits is None:
 			return torch.zeros((), device=device), TensorDict({}, device=device)
 
 		with maybe_range('Aux/td_target', self.cfg):
@@ -856,12 +864,12 @@ class TDMPC2(torch.nn.Module):
 				else:
 					aux_td_targets = self._td_target_aux(z_seq[1:], rewards, terminated, task) # bootstrap using rolledout
 
-		G_aux = q_aux_logits.shape[0]
+		G_aux = v_aux_logits.shape[0]
 		with maybe_range('Aux/ce', self.cfg):
-			qaux_flat = q_aux_logits.contiguous().view(G_aux * T * B, self.cfg.num_bins)  # float32[G_aux*T*B,K]
+			vaux_flat = v_aux_logits.contiguous().view(G_aux * T * B, self.cfg.num_bins)  # float32[G_aux*T*B,K]
 			aux_targets_flat = aux_td_targets.view(G_aux * T * B, 1)  # float32[G_aux*T*B,1]
 			aux_ce = math.soft_ce(
-				qaux_flat,
+				vaux_flat,
 				aux_targets_flat,
 				self.cfg,
 			).view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)
@@ -1066,6 +1074,8 @@ class TDMPC2(torch.nn.Module):
     
 			pi_loss, pi_info = self.update_pi(z_for_pi, task)
 			pi_total = pi_loss * self.cfg.policy_coef
+			if log_grads:
+				info = self.probe_pi_gradients(pi_total, info)
 			pi_total.backward()
 			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
 			if self.cfg.compile and log_grads:
@@ -1074,7 +1084,7 @@ class TDMPC2(torch.nn.Module):
 				self.pi_optim_step()
 			self.pi_optim.zero_grad(set_to_none=True)
 
-			self.model.soft_update_target_Q()
+			self.model.soft_update_target_V()
 			self.model.soft_update_policy_encoder_targets()
 			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
 				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
@@ -1198,6 +1208,54 @@ class TDMPC2(torch.nn.Module):
 
 			for gname, ss in per_group_ss.items():
 				info.update({f'grad_norm/{lname}/{gname}': (ss ** 0.5)}, non_blocking=True)
+		return info
+
+	@torch._dynamo.disable()
+	def probe_pi_gradients(self, pi_total, info):
+		"""Probe gradient norms from policy loss to all parameter groups.
+
+		This reveals SVG-style gradient flow: policy loss backprops through
+		reward/dynamics models even though only policy params are updated.
+
+		Args:
+			pi_total (Tensor): Scaled policy loss (pi_loss * policy_coef).
+			info (TensorDict): Info dict to update with gradient norms.
+
+		Returns:
+			TensorDict: Updated info dict with grad_norm/pi_loss/{group} entries.
+		"""
+		groups = self._grad_param_groups()
+
+		# Flatten all params (including policy) and remember mapping
+		flat_params = []
+		index = []  # (group_name, param_obj) pairs
+		for gname, params in groups.items():
+			for p in params:
+				flat_params.append(p)
+				index.append((gname, p))
+
+		if (not torch.is_tensor(pi_total)) or (not pi_total.requires_grad):
+			return info
+
+		grads = torch.autograd.grad(
+			pi_total,
+			flat_params,
+			retain_graph=True,  # we'll still do pi_total.backward() after
+			create_graph=False,
+			allow_unused=True,
+		)
+
+		# Accumulate L2 norm per component group
+		per_group_ss = {}
+		for (gname, p), g in zip(index, grads):
+			if g is None:
+				continue
+			ss = (g.detach().float() ** 2).sum()
+			per_group_ss[gname] = per_group_ss.get(gname, 0.0) + ss.item()
+
+		for gname, ss in per_group_ss.items():
+			info.update({f'grad_norm/pi_loss/{gname}': (ss ** 0.5)}, non_blocking=True)
+
 		return info
 
 	def validate(self, buffer, num_batches=1):

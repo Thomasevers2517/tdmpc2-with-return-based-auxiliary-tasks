@@ -1,0 +1,117 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Base task (matches config default). Add more tasks if desired.
+  task:
+    values:
+      - acrobot-swingup
+      - quadruped-walk
+      # - walker-run
+
+  tau:
+    values: [0.003, 0.01, 0.03]
+  critic_type:
+    values: [V]
+  pi_rollout_horizon:
+    values: [1]
+  train_act_std_coeff:
+    values: [0.0]
+
+  temperature:
+    values: [0.5]
+
+  policy_seed_noise_std:
+    values: [0]
+  planner_value_head_reduce:
+    values: [max]
+
+  planner_policy_elites_first_iter_only:
+    values: [false]
+
+
+  iterations:
+    value: 6
+  num_samples:
+    values: [1024]
+  num_elites:
+    values : [64]
+  num_pi_trajs:
+    values: [512]
+  horizon:
+    values: [3]
+  final_rho:
+    value: 0.125
+  min_std:
+    values: [0]
+  max_std:
+    values: [1]
+
+# Hot buffer (recent transitions) for mixed sampling
+  hot_buffer_enabled:          # When true, also store recent transitions in a small buffer
+    value: true         # When true, also store recent transitions in a small buffer
+  hot_buffer_ratio: 
+    value: 0.01      #0.01 is 3 samples     # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
+  hot_buffer_size: 
+    value: 5              # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+
+
+  sac_style_td: 
+    value: false
+
+  n_mc_samples_target:
+    value: 1
+
+  # UTD sweep (align with config key `utd_ratio`)
+  utd_ratio:
+    values: [4]
+
+  # Core: latent disagreement refactor knobs
+  planner_num_dynamics_heads:
+    values: [4]
+  planner_lambda_disagreement:
+    values: [0]
+
+  buffer_update_interval:
+    values: [1]
+
+
+
+  # Common training/eval settings from config
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    values: [state]
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  # Repro and logging
+  seed:
+    values: [101, 202, 303]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: test_auxiliary
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation enabled to test frozen_params removal fix
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

@@ -350,19 +350,19 @@ def clear_optimizer_state(optim: torch.optim.Optimizer, params: Iterable[nn.Para
 
 def sync_auxiliary_detach(model, logger=None) -> None:
 	logger = logger or log
-	if model._aux_joint_Qs is not None:
+	if model._aux_joint_Vs is not None:
 		with torch.no_grad():
-			vector = parameters_to_vector(model._aux_joint_Qs.parameters()).detach()
+			vector = parameters_to_vector(model._aux_joint_Vs.parameters()).detach()
 			model.aux_joint_detach_vec.copy_(vector)
-			vector_to_parameters(model.aux_joint_detach_vec, model._detach_aux_joint_Qs.parameters())
+			vector_to_parameters(model.aux_joint_detach_vec, model._detach_aux_joint_Vs.parameters())
 		logger.info("Synchronized auxiliary joint detach head (%d parameters)", vector.numel())
-	elif model._aux_separate_Qs is not None:
+	elif model._aux_separate_Vs is not None:
 		with torch.no_grad():
-			vectors = [parameters_to_vector(head.parameters()).detach() for head in model._aux_separate_Qs]
+			vectors = [parameters_to_vector(head.parameters()).detach() for head in model._aux_separate_Vs]
 			full_vec = torch.cat(vectors, dim=0)
 			model.aux_separate_detach_vec.copy_(full_vec)
 			offset = 0
-			for head, size in zip(model._detach_aux_separate_Qs, model.aux_separate_sizes):
+			for head, size in zip(model._detach_aux_separate_Vs, model.aux_separate_sizes):
 				vector_to_parameters(model.aux_separate_detach_vec[offset:offset + size], head.parameters())
 				offset += size
 		logger.info("Synchronized auxiliary separate detach heads (%d parameters)", full_vec.numel())

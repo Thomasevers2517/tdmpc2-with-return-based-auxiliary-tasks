@@ -11,11 +11,16 @@ def compute_values(
     head_reduce: str = "mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using all dynamics heads in parallel.
+    
+    With V-function (state-only value), we bootstrap using V(z_last) directly
+    without needing to sample or provide an action.
+    
+    Value = sum(rewards over T steps) + V(z_last)
 
     Args:
         latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all heads.
         actions (Tensor[E, T, A]): Action sequences aligned with latents.
-        world_model: WorldModel exposing reward(), pi(), and Q().
+        world_model: WorldModel exposing reward() and V().
         task: Optional task index for multitask setups.
         head_reduce: Aggregation over heads: 'mean' or 'max'.
 
@@ -40,32 +45,17 @@ def compute_values(
     r_flat = math.two_hot_inv(rew_logits, cfg).squeeze(-1)  # float32[H*E, T]
     r_t = r_flat.view(H, E, T)                              # float32[H, E, T]
 
-    if cfg.fix_value_est:
-        # Fixed-value: sum rewards for steps 0..T-2, bootstrap using provided last action at z_{T-1}.
-        returns_he = r_t[:, :, :-1].sum(dim=2)             # float32[H, E]
-        z_boot = latents_all[:, :, -2, :]                  # float32[H, E, L]
-        # Last action is shared across heads.
-        a_last = actions[:, -1, :]                         # float32[E, A]
-        a_boot = a_last.unsqueeze(0).expand(H, -1, -1)     # float32[H, E, A]
+    # Sum rewards (undiscounted) and bootstrap with V(z_last).
+    # With V-function, no action needed for bootstrapping.
+    returns_he = r_t.sum(dim=2)                             # float32[H, E] sum of rewards
+    z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
+    z_last_flat = z_last.contiguous().view(H * E, L)        # float32[H*E, L]
+    
+    v_boot_flat = world_model.V(z_last_flat, task, return_type=head_reduce, target=True)
+    v_boot_flat = v_boot_flat.squeeze(-1).squeeze(-1)       # float32[H*E]
+    v_boot_he = v_boot_flat.view(H, E)                      # float32[H, E]
 
-        z_boot_flat = z_boot.contiguous().view(H * E, L)   # float32[H*E, L]
-        a_boot_flat = a_boot.contiguous().view(H * E, -1)  # float32[H*E, A]
-
-        q_boot_flat = world_model.Q(z_boot_flat, a_boot_flat, task, return_type=head_reduce, target=True)
-
-    else:
-        # Legacy: sum all rewards and bootstrap with policy action at last latent.
-        returns_he = r_t.sum(dim=2)                        # float32[H, E]
-        z_last = latents_all[:, :, -1, :]                  # float32[H, E, L]
-        z_last_flat = z_last.contiguous().view(H * E, L)   # float32[H*E, L]
-        a_boot_flat, _ = world_model.pi(z_last_flat, task, use_ema=cfg.policy_ema_enabled)
-        q_boot_flat = world_model.Q(z_boot_flat, a_boot_flat, task, return_type=head_reduce, target=True)
-
-
-    q_boot_flat = q_boot_flat.squeeze(-1).squeeze(-1)  # float32[H*E]
-    q_boot_he = q_boot_flat.view(H, E)                 # float32[H, E]
-
-    values_unscaled_he = returns_he + q_boot_he        # float32[H, E]
+    values_unscaled_he = returns_he + v_boot_he             # float32[H, E]
     values_scaled_he = values_unscaled_he * 1.0        # float32[H, E]
 
     # Std across heads (independent of reduction mode).

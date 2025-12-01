@@ -173,47 +173,66 @@ def enc(cfg, out={}):
 def api_model_conversion(target_state_dict, source_state_dict):
 	"""
 	Converts a checkpoint from our old API to the new torch.compile compatible API.
+	Handles both legacy _Qs naming (for backward compatibility with old checkpoints)
+	and new _Vs naming.
 	"""
-	# check whether checkpoint is already in the new format
-	if "_detach_Qs_params.0.weight" in source_state_dict:
+	# check whether checkpoint is already in the new format (check both _Qs and _Vs patterns)
+	if "_detach_Vs_params.0.weight" in source_state_dict or "_detach_Qs_params.0.weight" in source_state_dict:
 		return source_state_dict
 
 	name_map = ['weight', 'bias', 'ln.weight', 'ln.bias']
 	new_state_dict = dict()
 
-	# rename keys
+	# rename keys - handle both _Qs (legacy) and _Vs (new) patterns
 	for key, val in list(source_state_dict.items()):
-		if key.startswith('_Qs.'):
-			num = key[len('_Qs.params.'):]
+		# Handle _Vs patterns (new)
+		if key.startswith('_Vs.'):
+			num = key[len('_Vs.params.'):]
 			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-			new_total_key = "_Qs.params." + new_key
+			new_total_key = "_Vs.params." + new_key
 			del source_state_dict[key]
 			new_state_dict[new_total_key] = val
-			new_total_key = "_detach_Qs_params." + new_key
+			new_total_key = "_detach_Vs_params." + new_key
+			new_state_dict[new_total_key] = val
+		elif key.startswith('_target_Vs.'):
+			num = key[len('_target_Vs.params.'):]
+			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
+			new_total_key = "_target_Vs_params." + new_key
+			del source_state_dict[key]
+			new_state_dict[new_total_key] = val
+		# Handle _Qs patterns (legacy - for loading old checkpoints)
+		elif key.startswith('_Qs.'):
+			num = key[len('_Qs.params.'):]
+			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
+			new_total_key = "_Vs.params." + new_key  # Convert to _Vs
+			del source_state_dict[key]
+			new_state_dict[new_total_key] = val
+			new_total_key = "_detach_Vs_params." + new_key
 			new_state_dict[new_total_key] = val
 		elif key.startswith('_target_Qs.'):
 			num = key[len('_target_Qs.params.'):]
 			new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-			new_total_key = "_target_Qs_params." + new_key
+			new_total_key = "_target_Vs_params." + new_key  # Convert to _Vs
 			del source_state_dict[key]
 			new_state_dict[new_total_key] = val
 
 	# add batch_size and device from target_state_dict to new_state_dict
-	for prefix in ('_Qs.', '_detach_Qs_', '_target_Qs_'):
+	for prefix in ('_Vs.', '_detach_Vs_', '_target_Vs_'):
 		for key in ('__batch_size', '__device'):
 			new_key = prefix + 'params.' + key
-			new_state_dict[new_key] = target_state_dict[new_key]
+			if new_key in target_state_dict:
+				new_state_dict[new_key] = target_state_dict[new_key]
 
 	# check that every key in new_state_dict is in target_state_dict
 	for key in new_state_dict.keys():
 		assert key in target_state_dict, f"key {key} not in target_state_dict"
-	# check that all Qs keys in target_state_dict are in new_state_dict
+	# check that all Vs keys in target_state_dict are in new_state_dict
 	for key in target_state_dict.keys():
-		if 'Qs' in key:
+		if 'Vs' in key:
 			assert key in new_state_dict, f"key {key} not in new_state_dict"
-	# check that source_state_dict contains no Qs keys
+	# check that source_state_dict contains no Vs or Qs keys
 	for key in source_state_dict.keys():
-		assert 'Qs' not in key, f"key {key} contains 'Qs'"
+		assert 'Vs' not in key and 'Qs' not in key, f"key {key} contains 'Vs' or 'Qs'"
 
 	# copy log_std_min and log_std_max from target_state_dict to new_state_dict
 	new_state_dict['log_std_min'] = target_state_dict['log_std_min']

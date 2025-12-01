@@ -12,6 +12,10 @@ checkpoint: ???
 eval_episodes: 5
 eval_freq: 10000
 
+
+critic_type: V  # 'V' (state value) only. 'Q' is not implemented.
+pi_rollout_horizon: 1  # Number of steps to rollout for model-based policy optimization
+
 final_rho: -1 # if set, overrides rho schedule such at the end of the horizon the discount is final_rho
 
 sac_style_td: false
@@ -46,8 +50,6 @@ planner_policy_elites_first_iter_only: false
 # Number of dynamics heads for latent disagreement; currently placeholder duplication of head 0.
 planner_num_dynamics_heads: 1
 
-fix_value_est: true # Ensure no policy used for bootstrapping value estimation at planning
-
 train_act_std_coeff: 1 # multiplier of the noise added to training env actions
 
 
@@ -66,8 +68,7 @@ utd_ratio: 1
 ac_utd_multiplier: 1
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
-pred_from: rollout # rollout, true_state, both (controls reward/termination prediction source)
-split_batch: true # If pred_from == both, split batch evenly between true and rollout predictions
+pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: replay_true # replay_true | replay_rollout | imagine
 imagination_horizon: 1 

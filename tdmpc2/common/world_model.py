@@ -16,11 +16,25 @@ class WorldModel(nn.Module):
 	"""
 	TD-MPC2 implicit world model architecture.
 	Can be used for both single-task and multi-task experiments.
+	
+	This implementation uses State-Value functions V(s) instead of 
+	State-Action Value functions Q(s,a). The value heads take only
+	the latent state z as input, not the action.
 	"""
 
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		
+		# Validate critic_type - only V is supported
+		critic_type = getattr(cfg, 'critic_type', 'V')
+		if critic_type != 'V':
+			raise ValueError(
+				f"critic_type='{critic_type}' is not supported. "
+				"This codebase only implements state-value functions (V). "
+				"Set critic_type='V' in your config."
+			)
+		
 		if self.cfg.dtype == 'float16':
 			self.autocast_dtype = torch.float16
 		elif self.cfg.dtype == 'bfloat16':
@@ -51,7 +65,10 @@ class WorldModel(nn.Module):
 		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
-		self._Qs = layers.Ensemble([layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
+		# V-function ensemble: input is latent only (no action)
+		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
+		v_input_dim = cfg.latent_dim + cfg.task_dim
+		self._Vs = layers.Ensemble([layers.mlp(v_input_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
 		self._target_encoder = None
 		self._target_pi = None
 		self.encoder_target_max_delta = 0.0
@@ -68,7 +85,7 @@ class WorldModel(nn.Module):
 			self._target_pi.eval()
 
 		# ------------------------------------------------------------------
-		# Auxiliary multi-gamma action-value heads (training-only)
+		# Auxiliary multi-gamma state-value heads (training-only)
 		# Simplified (no ensemble dimension) per user request.
 		# We construct either:
 		#   joint: a single MLP outputting (G_aux * K) logits reshaped to (G_aux,K)
@@ -78,29 +95,30 @@ class WorldModel(nn.Module):
 		# target networks or ensembles (min/avg collapse to identity).
 		# ------------------------------------------------------------------
 		self._num_aux_gamma = 0
-		self._aux_joint_Qs = None      # now a single MLP head (not an Ensemble)
-		self._aux_separate_Qs = None   # ModuleList[MLP]
-		self._target_aux_joint_Qs = None
-		self._target_aux_separate_Qs = None
-		self._detach_aux_joint_Qs = None
-		self._detach_aux_separate_Qs = None	
+		self._aux_joint_Vs = None      # single MLP head for joint aux values
+		self._aux_separate_Vs = None   # ModuleList[MLP] for separate aux values
+		self._target_aux_joint_Vs = None
+		self._target_aux_separate_Vs = None
+		self._detach_aux_joint_Vs = None
+		self._detach_aux_separate_Vs = None	
   
 		if getattr(cfg, 'multi_gamma_gammas', None):
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
-			in_dim = cfg.latent_dim + cfg.action_dim + (cfg.task_dim if cfg.multitask else 0)
+			# Auxiliary V heads: input is latent only (no action)
+			aux_in_dim = cfg.latent_dim + (cfg.task_dim if cfg.multitask else 0)
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Qs = layers.mlp(in_dim, 2*[cfg.mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+				self._aux_joint_Vs = layers.mlp(aux_in_dim, 2*[cfg.mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
-				self._aux_separate_Qs = torch.nn.ModuleList([
-					layers.mlp(in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
+				self._aux_separate_Vs = torch.nn.ModuleList([
+					layers.mlp(aux_in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
 					for _ in range(self._num_aux_gamma)
 				])
 			else:
 				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
 
 		self.apply(init.weight_init)
-		init.zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
+		init.zero_([self._reward[-1].weight, self._Vs.params["2", "weight"]])
 		self.reset_policy_encoder_targets()
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
@@ -118,69 +136,69 @@ class WorldModel(nn.Module):
 
 	def init(self):
 		# Create params
-		self._detach_Qs_params = TensorDictParams(self._Qs.params.data, no_convert=True)
-		self._target_Qs_params = TensorDictParams(self._Qs.params.data.clone(), no_convert=True)
+		self._detach_Vs_params = TensorDictParams(self._Vs.params.data, no_convert=True)
+		self._target_Vs_params = TensorDictParams(self._Vs.params.data.clone(), no_convert=True)
   
-		with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
-			self._detach_Qs = deepcopy(self._Qs)
-			self._target_Qs = deepcopy(self._Qs)
+		with self._detach_Vs_params.data.to("meta").to_module(self._Vs.module):
+			self._detach_Vs = deepcopy(self._Vs)
+			self._target_Vs = deepcopy(self._Vs)
 
 		# Assign params to modules
 		# We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
-		delattr(self._detach_Qs, "params")
-		self._detach_Qs.__dict__["params"] = self._detach_Qs_params
-		delattr(self._target_Qs, "params")
-		self._target_Qs.__dict__["params"] = self._target_Qs_params
+		delattr(self._detach_Vs, "params")
+		self._detach_Vs.__dict__["params"] = self._detach_Vs_params
+		delattr(self._target_Vs, "params")
+		self._target_Vs.__dict__["params"] = self._target_Vs_params
 
 		# Auxiliary heads (non-ensemble): vectorized param buffers + target/detach clones
-		if self._aux_joint_Qs is not None:
+		if self._aux_joint_Vs is not None:
 			# Initialize parameter vectors as buffers once
 			if not hasattr(self, 'aux_joint_target_vec'):
-				vec = parameters_to_vector(self._aux_joint_Qs.parameters()).detach().clone()
+				vec = parameters_to_vector(self._aux_joint_Vs.parameters()).detach().clone()
 				self.register_buffer('aux_joint_target_vec', vec)
 				self.register_buffer('aux_joint_detach_vec', vec.clone())
 			# Create frozen clones and load vectors
-			self._target_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
-			self._detach_aux_joint_Qs = deepcopy(self._aux_joint_Qs)
-			for p in self._target_aux_joint_Qs.parameters():
+			self._target_aux_joint_Vs = deepcopy(self._aux_joint_Vs)
+			self._detach_aux_joint_Vs = deepcopy(self._aux_joint_Vs)
+			for p in self._target_aux_joint_Vs.parameters():
 				p.requires_grad_(False)
-			for p in self._detach_aux_joint_Qs.parameters():
+			for p in self._detach_aux_joint_Vs.parameters():
 				p.requires_grad_(False)
-			vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
-			vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Qs.parameters())
-		elif self._aux_separate_Qs is not None:
+			vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Vs.parameters())
+			vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Vs.parameters())
+		elif self._aux_separate_Vs is not None:
 			# Build concatenated vectors and size map once
 			if not hasattr(self, 'aux_separate_sizes'):
-				self.aux_separate_sizes = [sum(p.numel() for p in h.parameters()) for h in self._aux_separate_Qs]
-				vecs = [parameters_to_vector(h.parameters()).detach().clone() for h in self._aux_separate_Qs]
+				self.aux_separate_sizes = [sum(p.numel() for p in h.parameters()) for h in self._aux_separate_Vs]
+				vecs = [parameters_to_vector(h.parameters()).detach().clone() for h in self._aux_separate_Vs]
 				full = torch.cat(vecs, dim=0)
 				self.register_buffer('aux_separate_target_vec', full)
 				self.register_buffer('aux_separate_detach_vec', full.clone())
 			# Create frozen clones and load
-			self._target_aux_separate_Qs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Qs])
-			self._detach_aux_separate_Qs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Qs])
-			for head in list(self._target_aux_separate_Qs) + list(self._detach_aux_separate_Qs):
+			self._target_aux_separate_Vs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Vs])
+			self._detach_aux_separate_Vs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Vs])
+			for head in list(self._target_aux_separate_Vs) + list(self._detach_aux_separate_Vs):
 				for p in head.parameters():
 					p.requires_grad_(False)
 			offset = 0
-			for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):
+			for h, sz in zip(self._target_aux_separate_Vs, self.aux_separate_sizes):
 				vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
 				offset += sz
 			offset = 0
-			for h, sz in zip(self._detach_aux_separate_Qs, self.aux_separate_sizes):
+			for h, sz in zip(self._detach_aux_separate_Vs, self.aux_separate_sizes):
 				vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
 				offset += sz
    
 
 	def __repr__(self):
 		repr = 'TD-MPC2 World Model\n'
-		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', 'Q-functions']
-		# Optionally append auxiliary Q ensembles to representation
+		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', 'V-functions']
+		# Optionally append auxiliary V ensembles to representation
 		aux_modules = []
 		if self._num_aux_gamma > 0:
-			modules.append('Aux Q-functions')
-			aux_modules = [self._aux_joint_Qs if self._aux_joint_Qs is not None else self._aux_separate_Qs]
-		for i, m in enumerate([self._encoder, self._dynamics, self._reward, self._termination, self._pi, self._Qs] + aux_modules):
+			modules.append('Aux V-functions')
+			aux_modules = [self._aux_joint_Vs if self._aux_joint_Vs is not None else self._aux_separate_Vs]
+		for i, m in enumerate([self._encoder, self._dynamics, self._reward, self._termination, self._pi, self._Vs] + aux_modules):
 			if m == self._termination and not self.cfg.episodic:
 				continue
 			repr += f"{modules[i]}: {m}\n"
@@ -198,55 +216,55 @@ class WorldModel(nn.Module):
 
 	def train(self, mode=True):
 		"""
-		Overriding `train` method to keep target Q-networks in eval mode.
+		Overriding `train` method to keep target V-networks in eval mode.
 		"""
 		super().train(mode)
-		self._target_Qs.train(False)
-		if self._target_aux_joint_Qs is not None:
-			self._target_aux_joint_Qs.train(False)
-		if getattr(self, '_detach_aux_joint_Qs', None) is not None:
-			self._detach_aux_joint_Qs.train(False)
-		if getattr(self, '_target_aux_separate_Qs', None) is not None:
-			for h in self._target_aux_separate_Qs:
+		self._target_Vs.train(False)
+		if self._target_aux_joint_Vs is not None:
+			self._target_aux_joint_Vs.train(False)
+		if getattr(self, '_detach_aux_joint_Vs', None) is not None:
+			self._detach_aux_joint_Vs.train(False)
+		if getattr(self, '_target_aux_separate_Vs', None) is not None:
+			for h in self._target_aux_separate_Vs:
 				h.train(False)
-		if getattr(self, '_detach_aux_separate_Qs', None) is not None:
-			for h in self._detach_aux_separate_Qs:
+		if getattr(self, '_detach_aux_separate_Vs', None) is not None:
+			for h in self._detach_aux_separate_Vs:
 				h.train(False)
 		return self
 
-	def soft_update_target_Q(self):
+	def soft_update_target_V(self):
 		"""
-		Soft-update target Q-networks using Polyak averaging.
+		Soft-update target V-networks using Polyak averaging.
 		"""
-		with maybe_range('WM/soft_update_target_Q', self.cfg):
-			self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
+		with maybe_range('WM/soft_update_target_V', self.cfg):
+			self._target_Vs_params.lerp_(self._detach_Vs_params, self.cfg.tau)
 			# Vectorized EMA for aux heads; emit debug checks if enabled
-			if getattr(self, '_aux_joint_Qs', None) is not None:
+			if getattr(self, '_aux_joint_Vs', None) is not None:
 				with torch.no_grad():
-					online = parameters_to_vector(self._aux_joint_Qs.parameters()).detach()
+					online = parameters_to_vector(self._aux_joint_Vs.parameters()).detach()
 					prev = self.aux_joint_target_vec.detach().clone()
 					self.aux_joint_target_vec.lerp_(online, self.cfg.aux_value_tau)
-					vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Qs.parameters())
+					vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Vs.parameters())
 					# Detach mirrors online snapshot
 					self.aux_joint_detach_vec.copy_(online)
-					vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Qs.parameters())
+					vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Vs.parameters())
 					
 	
-			elif getattr(self, '_aux_separate_Qs', None) is not None:
+			elif getattr(self, '_aux_separate_Vs', None) is not None:
 				with torch.no_grad():
-					vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Qs]
+					vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Vs]
 					online = torch.cat(vecs, dim=0)
 					prev = self.aux_separate_target_vec.detach().clone()
 					self.aux_separate_target_vec.lerp_(online, self.cfg.aux_value_tau)
 					# Assign to target heads
 					offset = 0
-					for h, sz in zip(self._target_aux_separate_Qs, self.aux_separate_sizes):
+					for h, sz in zip(self._target_aux_separate_Vs, self.aux_separate_sizes):
 						vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
 						offset += sz
 					# Detach mirrors online
 					self.aux_separate_detach_vec.copy_(online)
 					offset = 0
-					for h, sz in zip(self._detach_aux_separate_Qs, self.aux_separate_sizes):
+					for h, sz in zip(self._detach_aux_separate_Vs, self.aux_separate_sizes):
 						vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
 						offset += sz
 
@@ -433,42 +451,55 @@ class WorldModel(nn.Module):
 			}, device=z.device, non_blocking=True)
 			return action, info
 
-	def Q_aux(self, z, a, task, return_type='all', target=False, detach=False):
-
-		with maybe_range('WM/Q_aux', self.cfg):
+	def V_aux(self, z, task, return_type='all', target=False, detach=False):
+		"""
+		Compute auxiliary state-value predictions for multiple discount factors.
+		
+		Args:
+			z (Tensor[T, B, L]): Latent state embeddings.
+			task: Task identifier for multitask setup.
+			return_type (str): 'all' returns logits, 'min'/'avg' return scalar values.
+			target (bool): Use target network.
+			detach (bool): Use detached (non-gradient) network.
+			
+		Returns:
+			Tensor[G_aux, T, B, K] if return_type='all' (logits).
+			Tensor[G_aux, T, B, 1] otherwise (values).
+		"""
+		with maybe_range('WM/V_aux', self.cfg):
 			if self._num_aux_gamma == 0:
 				return None
 			assert return_type in {'all','min','avg'}
 
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
-			za = torch.cat([z, a], dim=-1)
-			if self._aux_joint_Qs is not None:
-				with maybe_range('WM/Q_aux/joint', self.cfg):
+			# V-function: input is state only (no action concatenation)
+			if self._aux_joint_Vs is not None:
+				with maybe_range('WM/V_aux/joint', self.cfg):
 					with self._autocast_context():
 						if target:
-							raw = self._target_aux_joint_Qs(za)
+							raw = self._target_aux_joint_Vs(z)
 						elif detach:
-							raw = self._detach_aux_joint_Qs(za)
+							raw = self._detach_aux_joint_Vs(z)
 						else:
-							raw = self._aux_joint_Qs(za)  # (T,B,G_aux*K)
+							raw = self._aux_joint_Vs(z)  # (T,B,G_aux*K)
 					out = raw.float()
 					# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
 					T, B = out.shape[0], out.shape[1]
 					G = self._num_aux_gamma
 					K = self.cfg.num_bins
 					if out.shape[-1] != G * K:
-						raise RuntimeError(f"Q_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
+						raise RuntimeError(f"V_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
 					out = out.view(T, B, G, K).permute(2, 0, 1, 3)  # (G,T,B,K)
-			elif self._aux_separate_Qs is not None:
-				with maybe_range('WM/Q_aux/separate', self.cfg):
+			elif self._aux_separate_Vs is not None:
+				with maybe_range('WM/V_aux/separate', self.cfg):
 					with self._autocast_context():
 						if target:
-							raw_list = [head(za) for head in self._target_aux_separate_Qs]
+							raw_list = [head(z) for head in self._target_aux_separate_Vs]
 						elif detach:
-							raw_list = [head(za) for head in self._detach_aux_separate_Qs]
+							raw_list = [head(z) for head in self._detach_aux_separate_Vs]
 						else:
-							raw_list = [head(za) for head in self._aux_separate_Qs]
+							raw_list = [head(z) for head in self._aux_separate_Vs]
 					outs = [rl.float() for rl in raw_list]
 					out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
 	
@@ -477,35 +508,50 @@ class WorldModel(nn.Module):
 			vals = math.two_hot_inv(out, self.cfg)  # (G_aux,T,B,1) 
 			return vals  # 'min'/'avg' identical with single head
 
-	def Q(self, z, a, task, return_type='min', target=False, detach=False):
+	def V(self, z, task, return_type='min', target=False, detach=False):
+		"""
+		Compute state-value predictions.
 		
-		assert return_type in {'min', 'avg',  'max', 'all'}
+		Args:
+			z (Tensor[..., L]): Latent state embeddings.
+			task: Task identifier for multitask setup.
+			return_type (str): 'all' returns logits, 'min'/'max'/'avg'/'mean' return scalar values.
+			target (bool): Use target network.
+			detach (bool): Use detached (non-gradient) network.
+			
+		Returns:
+			Tensor[num_q, ..., K] if return_type='all' (logits).
+			Tensor[..., 1] otherwise (values after two-hot inverse).
+		"""
+		assert return_type in {'min', 'avg', 'mean', 'max', 'all'}
 
-		with maybe_range('WM/Q', self.cfg):
+		with maybe_range('WM/V', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 
-			za = torch.cat([z, a], dim=-1)
+			# V-function: input is state only (no action concatenation)
 			if target:
-				qnet = self._target_Qs
+				vnet = self._target_Vs
 			elif detach:
-				qnet = self._detach_Qs
+				vnet = self._detach_Vs
 			else:
-				qnet = self._Qs
+				vnet = self._Vs
 			with self._autocast_context():
-				out = qnet(za)
+				out = vnet(z)
 			out = out.float()
 
 			if return_type == 'all':
 				return out
 
-			qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
-			Q = math.two_hot_inv(out[qidx], self.cfg)
+			# Random subset of 2 from num_q ensemble members for min/max/avg
+			vidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
+			V = math.two_hot_inv(out[vidx], self.cfg)
 			if return_type == "min":
-				return Q.min(0).values
+				return V.min(0).values
 			if return_type == "max":
-				return Q.max(0).values
-			return Q.sum(0) / 2
+				return V.max(0).values
+			# 'avg' or 'mean' - both compute average
+			return V.sum(0) / 2
 
 	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
