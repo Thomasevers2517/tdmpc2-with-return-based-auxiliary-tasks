@@ -179,7 +179,7 @@ enable_wandb: true
 save_csv: true
 log_gradients_per_loss: true
 log_detail_freq: 5000
-log_freq: 50
+log_freq: 200
 
 # misc
 compile: false

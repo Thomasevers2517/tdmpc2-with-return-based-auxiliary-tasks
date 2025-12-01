@@ -1,0 +1,129 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Two tasks
+  task:
+    values: [acrobot-swingup, quadruped-walk]
+
+  # Extreme scaling: 4 reward heads, 8 dynamics heads
+  num_reward_heads:
+    value: 4
+  planner_num_dynamics_heads:
+    value: 8
+
+  # Sweep policy head reduce
+  policy_head_reduce: 
+    values: [min]
+
+  # Planner settings
+  planner_head_reduce:
+    value: max
+  planner_lambda_disagreement:
+    value: 0
+
+  actor_source:
+    value: replay_rollout
+
+  # Fixed UTD ratio
+  utd_ratio:
+    value: 4
+    
+  tau:
+    value: 0.01
+  critic_type:
+    value: V
+  pi_rollout_horizon:
+    value: 1
+  train_act_std_coeff:
+    value: 0.0
+
+  temperature:
+    value: 0.5
+
+  # Policy seed noise enabled
+  policy_seed_noise_std:
+    value: 0.1
+
+  # Sweep final entropy coefficient (annealing)
+  end_entropy_coeff:
+    values: [1e-6, 1e-8]
+
+  planner_policy_elites_first_iter_only:
+    value: false
+
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Hot buffer
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio: 
+    value: 0.01
+  hot_buffer_size: 
+    value: 5
+
+  sac_style_td: 
+    value: false
+
+  n_mc_samples_target:
+    value: 1
+
+  buffer_update_interval:
+    value: 1
+
+  # Common training/eval settings
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  # Reduced logging frequency to avoid wandb rate limits
+  log_freq:
+    value: 200
+
+  # 4 seeds
+  seed:
+    values: [101, 202, 303, 404]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
