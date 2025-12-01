@@ -10,42 +10,57 @@ def compute_values(
     task=None,
     head_reduce: str = "mean",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute trajectory values using all dynamics heads in parallel.
+    """Compute trajectory values using all dynamics heads and reward heads in parallel.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
     without needing to sample or provide an action.
     
     Value = sum(rewards over T steps) + V(z_last)
+    
+    Reduction is applied to both reward heads (R) and dynamics heads (H) using
+    the same head_reduce mode (typically 'max' for optimistic planning).
 
     Args:
-        latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all heads.
+        latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all dynamics heads.
         actions (Tensor[E, T, A]): Action sequences aligned with latents.
         world_model: WorldModel exposing reward() and V().
         task: Optional task index for multitask setups.
-        head_reduce: Aggregation over heads: 'mean' or 'max'.
+        head_reduce: Aggregation over heads: 'mean' or 'max'. Applied to both R and H.
 
     Returns:
         Tuple[Tensor[E], Tensor[E], Tensor[E]]: (values_unscaled, values_scaled,
         values_std_across_heads).
     """
-    H, E, Tp1, L = latents_all.shape  # H=heads, E=candidates, Tp1=T+1, L=latent_dim
+    H, E, Tp1, L = latents_all.shape  # H=dynamics heads, E=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
     cfg = world_model.cfg
 
-    # Reward computation across all heads in parallel.
+    # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :-1, :]                         # float32[H, E, T, L]
-    # Broadcast actions to all heads.
+    # Broadcast actions to all dynamics heads.
     a_t = actions.unsqueeze(0).expand(H, -1, -1, -1)        # float32[H, E, T, A]
 
-    # Flatten (head, candidate) into batch for reward model.
+    # Flatten (dynamics head, candidate) into batch for reward model.
     z_flat = z_t.contiguous().view(H * E, T, L)             # float32[H*E, T, L]
     a_flat = a_t.contiguous().view(H * E, T, -1)            # float32[H*E, T, A]
 
-    rew_logits = world_model.reward(z_flat, a_flat, task)   # float32[H*E, T, K] or [H*E, T, 1]
-    r_flat = math.two_hot_inv(rew_logits, cfg).squeeze(-1)  # float32[H*E, T]
-    r_t = r_flat.view(H, E, T)                              # float32[H, E, T]
+    # Get reward logits from all reward heads: [R, H*E, T, K]
+    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode='all')
+    R = rew_logits_all.shape[0]  # number of reward heads
+    # Convert to scalar rewards: [R, H*E, T, 1] -> [R, H*E, T]
+    r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*E, T]
+    # Reshape to [R, H, E, T]
+    r_all = r_all.view(R, H, E, T)  # float32[R, H, E, T]
+    
+    # Reduce over reward heads (R) per timestep using head_reduce
+    if head_reduce == "mean":
+        r_t = r_all.mean(dim=0)  # float32[H, E, T]
+    elif head_reduce == "max":
+        r_t = r_all.max(dim=0).values  # float32[H, E, T]
+    else:
+        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
 
-    # Sum rewards (undiscounted) and bootstrap with V(z_last).
+    # Sum rewards (undiscounted) over T and bootstrap with V(z_last).
     # With V-function, no action needed for bootstrapping.
     returns_he = r_t.sum(dim=2)                             # float32[H, E] sum of rewards
     z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
@@ -56,11 +71,12 @@ def compute_values(
     v_boot_he = v_boot_flat.view(H, E)                      # float32[H, E]
 
     values_unscaled_he = returns_he + v_boot_he             # float32[H, E]
-    values_scaled_he = values_unscaled_he * 1.0        # float32[H, E]
+    values_scaled_he = values_unscaled_he * 1.0             # float32[H, E]
 
-    # Std across heads (independent of reduction mode).
+    # Std across dynamics heads (independent of reduction mode).
     values_std = values_unscaled_he.std(dim=0, unbiased=False)  # float32[E]
 
+    # Reduce over dynamics heads (H) using head_reduce
     if head_reduce == "mean":
         values_unscaled = values_unscaled_he.mean(dim=0)        # float32[E]
         values_scaled = values_scaled_he.mean(dim=0)            # float32[E]

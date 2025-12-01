@@ -91,7 +91,7 @@ class TDMPC2(torch.nn.Module):
 		param_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
 			{'params': self.model._dynamics_heads.parameters()},
-			{'params': self.model._reward.parameters()},
+			{'params': self.model._reward_heads.parameters()},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
 			{'params': self.model._Vs.parameters()},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
@@ -281,7 +281,7 @@ class TDMPC2(torch.nn.Module):
 		# dynamics (all heads)
 		groups["dynamics"] = list(self.model._dynamics_heads.parameters())
 		# reward
-		groups["reward"] = list(self.model._reward.parameters())
+		groups["reward"] = list(self.model._reward_heads.parameters())
 		# termination (optional)
 		if self.cfg.episodic:
 			groups["termination"] = list(self.model._termination.parameters())
@@ -350,6 +350,9 @@ class TDMPC2(torch.nn.Module):
 		through dynamics. The dynamics, reward, and value function are frozen
 		during policy optimization (SAC-style backprop through frozen model).
 		
+		Uses policy_head_reduce to aggregate over both reward heads (R) and
+		dynamics heads (H) when computing the Q-estimate.
+		
 		Args:
 			z (Tensor[T, B, L]): Current latent states.
 			task: Task identifier for multitask setup.
@@ -361,6 +364,9 @@ class TDMPC2(torch.nn.Module):
 		
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
+		
+		# Get reduction mode for policy loss
+		policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
 			
 		with maybe_range('Agent/update_pi', self.cfg):
 			# Sample action from policy at current state (policy has gradients)
@@ -378,15 +384,26 @@ class TDMPC2(torch.nn.Module):
 				task_flat = None
 				gamma = self.discount  # scalar
 			
-			# Predict reward r(z, a) - immediate reward from taking action
-			# reward() returns distributional logits [T*B, K], convert to scalar
+			# Predict reward r(z, a) from all reward heads
+			# reward() returns distributional logits [R, T*B, K], convert to scalar
 			# NOTE: Gradients flow through reward/dynamics/V to the action, but only
 			# policy params are updated (pi_optim only contains policy parameters).
-			reward_logits_flat = self.model.reward(z_flat, action_flat, task_flat)  # float32[T*B, K]
-			reward_flat = math.two_hot_inv(reward_logits_flat, self.cfg)  # float32[T*B, 1]
+			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B, K]
+			R = reward_logits_all.shape[0]  # number of reward heads
+			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B, 1]
 			
-			# Roll through ALL dynamics heads to get next states z', then take min V
-			# This adds pessimism to prevent policy from exploiting dynamics errors
+			# Reduce over reward heads using policy_head_reduce
+			if policy_reduce == 'mean':
+				reward_flat = reward_all.mean(dim=0)  # float32[T*B, 1]
+			elif policy_reduce == 'min':
+				reward_flat = reward_all.min(dim=0).values  # float32[T*B, 1]
+			elif policy_reduce == 'max':
+				reward_flat = reward_all.max(dim=0).values  # float32[T*B, 1]
+			else:
+				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
+			
+			# Roll through ALL dynamics heads to get next states z', then reduce V
+			# This adds pessimism/optimism based on policy_head_reduce to prevent policy from exploiting errors
 			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B, L]
 			H = next_z_all.shape[0]  # number of dynamics heads
 			
@@ -398,10 +415,17 @@ class TDMPC2(torch.nn.Module):
 			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B, 1]
 			v_next_all = v_next_all_flat.view(H, T * B, 1)  # float32[H, T*B, 1]
 			
-			# Take minimum over dynamics heads for additional pessimism
-			v_next_flat = v_next_all.min(dim=0).values  # float32[T*B, 1]
+			# Reduce over dynamics heads using policy_head_reduce
+			if policy_reduce == 'mean':
+				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B, 1]
+			elif policy_reduce == 'min':
+				v_next_flat = v_next_all.min(dim=0).values  # float32[T*B, 1]
+			elif policy_reduce == 'max':
+				v_next_flat = v_next_all.max(dim=0).values  # float32[T*B, 1]
+			else:
+				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
-			# Compute Q-like estimate: r(z, a) + γ * min_h V(z'_h)
+			# Compute Q-like estimate: r(z, a) + γ * V(z')
 			# This is what the action "earns" - immediate reward plus discounted future value
 			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B, 1]
 			q_estimate = q_estimate_flat.view(T, B, 1)           # float32[T, B, 1]
@@ -471,18 +495,20 @@ class TDMPC2(torch.nn.Module):
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		For multi-head inputs, computes per-head TD targets then takes min over heads
-		for pessimistic value estimation.
+		for pessimistic value estimation. First reduces over reward heads (R), then
+		over dynamics heads (H).
 
 		Args:
-			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H heads.
-			reward (Tensor[T, H, B, 1]): Rewards (may be head-dependent for imagined rollouts).
-			terminated (Tensor[T, H, B, 1]): Termination signals.
+			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
+			reward (Tensor[T, R, H, B, 1]): Rewards with R reward heads, H dynamics heads.
+			terminated (Tensor[T, H, B, 1]): Termination signals (no R dimension).
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tensor[T, B, 1]: Pessimistic TD-target (min over heads).
+			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across all heads).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
+		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
 		
 		# Merge H and B for V evaluation: [T, H, B, L] -> [T, H*B, L]
 		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
@@ -495,24 +521,32 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Per-head TD targets: r + γ * (1 - done) * V(s')
-		td_per_head = reward + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
+		# Pessimistically reduce over reward heads first: min over R (dim=1)
+		reward_pessimistic = reward.min(dim=1).values  # float32[T, H, B, 1]
 		
-		# Pessimistic aggregation: min over heads
+		# Per-head TD targets: r + γ * (1 - done) * V(s')
+		td_per_head = reward_pessimistic + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
+		
+		# Compute std across dynamics heads before final reduction
+		td_std_across_heads = td_per_head.std(dim=1, unbiased=False).squeeze(-1)  # float32[T, B]
+		td_std_across_heads = td_std_across_heads.unsqueeze(-1)  # float32[T, B, 1]
+		
+		# Pessimistic aggregation: min over dynamics heads
 		td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
 		
-		return td_targets 
+		return td_targets, td_std_across_heads 
   
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
 		"""
 		Compute auxiliary multi-gamma TD targets with multi-head pessimism.
+		First reduces over reward heads (R), then over dynamics heads (H).
 
 		Args:
-			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H heads.
-			reward (Tensor[T, H, B, 1]): Rewards (may be head-dependent).
-			terminated (Tensor[T, H, B, 1]): Termination signals.
+			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
+			reward (Tensor[T, R, H, B, 1]): Rewards with R reward heads, H dynamics heads.
+			terminated (Tensor[T, H, B, 1]): Termination signals (no R dimension).
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
@@ -523,6 +557,7 @@ class TDMPC2(torch.nn.Module):
 			return None
 
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
+		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
 		
 		# Merge H and B for V_aux evaluation: [T, H, B, L] -> [T, H*B, L]
 		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
@@ -536,8 +571,11 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
+		# Pessimistically reduce over reward heads first: min over R (dim=1)
+		reward_pessimistic = reward.min(dim=1).values  # float32[T, H, B, 1]
+		
 		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
-		reward_exp = reward.unsqueeze(0)  # float32[1, T, H, B, 1]
+		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
 		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 		
 		# Compute per-head TD targets for all auxiliary gammas at once
@@ -547,7 +585,7 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Pessimistic aggregation: min over heads (dim=2)
+		# Pessimistic aggregation: min over dynamics heads (dim=2)
 		td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
@@ -626,52 +664,76 @@ class TDMPC2(torch.nn.Module):
 				lat_all = lat_all  # [H,B,1,T+1,L]
 				lat_TBL = lat_all[:, :, 0, :-1, :].permute(0, 2, 1, 3)  # [H,T,B,L]
 				next_TBL = lat_all[:, :, 0, 1:, :].permute(0, 2, 1, 3)  # [H,T,B,L]
-				head_rew_losses = []
-				head_rew_ce = []
-				head_term_losses = []
-				head_reward_pred = []
+				H_dyn = lat_TBL.shape[0]  # number of dynamics heads
+				L_lat = lat_TBL.shape[3]  # latent dimension
+				
 				with maybe_range('WM/reward_term', self.cfg):
-					for h in range(lat_TBL.shape[0]):
-						reward_logits_h = self.model.reward(lat_TBL[h], actions_branch, task)  # float32[T,B,K]
-						rew_ce_h = math.soft_ce(
-							reward_logits_h.view(-1, self.cfg.num_bins),  # float32[T*B,K]
-							reward_target.view(-1, 1),  # float32[T*B,1]
-							self.cfg,
-						).view(latents.shape[0], latents.shape[1], 1).mean(dim=1).squeeze(-1)
-					head_rew_ce.append(rew_ce_h)
-					reward_loss_h = (rho_pows * rew_ce_h).mean()
-					head_rew_losses.append(reward_loss_h)
-					# Expected reward prediction for error logging
-					head_reward_pred.append(math.two_hot_inv(reward_logits_h, self.cfg))  # (T,B,1)
-					if self.cfg.episodic:
-						term_logits_h = self.model.termination(next_TBL[h], task, unnormalized=True)
-						term_loss_h = F.binary_cross_entropy_with_logits(term_logits_h, terminated_target)
-					else:
-						term_logits_h = torch.zeros_like(reward_target)
-						term_loss_h = torch.zeros((), device=device, dtype=dtype)
-					head_term_losses.append(term_loss_h)
-				reward_loss_branch = torch.stack(head_rew_losses).mean()
-				term_loss_branch = torch.stack(head_term_losses).mean()
-				# For per-step logging, average CE across heads
-				rew_ce = torch.stack(head_rew_ce).mean(dim=0)
-				# Average reward prediction across heads for error logging
-				reward_pred = torch.stack(head_reward_pred).mean(dim=0)  # (T,B,1)
-				# Average term logits across heads if episodic (for stats only)
-				term_logits = torch.stack([self.model.termination(next_TBL[h], task, unnormalized=True)
-											  if self.cfg.episodic else torch.zeros_like(reward_target)
-											  for h in range(lat_TBL.shape[0])]).mean(dim=0)
+					# Train all reward heads in parallel using Ensemble
+					# Flatten dynamics heads into batch: [H,T,B,L] -> [T, H*B, L]
+					lat_flat = lat_TBL.permute(1, 0, 2, 3).reshape(T, H_dyn * B, L_lat)  # float32[T, H*B, L]
+					actions_expanded = actions_branch.unsqueeze(1).expand(T, H_dyn, B, -1)  # [T, H, B, A]
+					actions_flat = actions_expanded.reshape(T, H_dyn * B, -1)  # float32[T, H*B, A]
+					
+					# Get all reward head logits: [R, T, H*B, K]
+					reward_logits_all = self.model.reward(lat_flat, actions_flat, task, head_mode='all')
+					R = reward_logits_all.shape[0]  # number of reward heads
+					
+					# Compute soft cross-entropy for all R heads: [R, T, H*B, K] -> [R, T, H, B]
+					reward_target_exp = reward_target.unsqueeze(0).unsqueeze(2).expand(R, T, H_dyn, B, 1)
+					reward_target_flat = reward_target_exp.reshape(R * T * H_dyn * B, 1)  # [R*T*H*B, 1]
+					logits_flat = reward_logits_all.reshape(R * T * H_dyn * B, self.cfg.num_bins)  # [R*T*H*B, K]
+					
+					rew_ce_flat = math.soft_ce(logits_flat, reward_target_flat, self.cfg)  # [R*T*H*B]
+					rew_ce_all = rew_ce_flat.view(R, T, H_dyn, B)  # [R, T, H, B]
+					
+					# Average over reward heads, dynamics heads, and batch; keep T for rho weighting
+					rew_ce = rew_ce_all.mean(dim=(0, 2, 3))  # float32[T]
+					reward_loss_branch = (rho_pows * rew_ce).mean()
+					
+					# Expected reward prediction for error logging: average over R and H
+					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, H*B, 1]
+					reward_pred_all = reward_pred_all.view(R, T, H_dyn, B, 1)  # [R, T, H, B, 1]
+					reward_pred = reward_pred_all.mean(dim=(0, 2))  # [T, B, 1]
+					
+					# Termination loss over dynamics heads
+					head_term_losses = []
+					for h in range(H_dyn):
+						if self.cfg.episodic:
+							term_logits_h = self.model.termination(next_TBL[h], task, unnormalized=True)
+							term_loss_h = F.binary_cross_entropy_with_logits(term_logits_h, terminated_target)
+						else:
+							term_logits_h = torch.zeros_like(reward_target)
+							term_loss_h = torch.zeros((), device=device, dtype=dtype)
+						head_term_losses.append(term_loss_h)
+					term_loss_branch = torch.stack(head_term_losses).mean()
+					
+					# Average term logits across heads if episodic (for stats only)
+					term_logits = torch.stack([self.model.termination(next_TBL[h], task, unnormalized=True)
+												  if self.cfg.episodic else torch.zeros_like(reward_target)
+												  for h in range(H_dyn)]).mean(dim=0)
 			else:
-				# True-state branch uses single (true) latents
-				reward_logits = self.model.reward(latents, actions_branch, task)  # float32[T,B,K]
+				# True-state branch uses single (true) latents, train all reward heads
+				# Get all reward head logits: [R, T, B, K]
+				reward_logits_all = self.model.reward(latents, actions_branch, task, head_mode='all')
+				R = reward_logits_all.shape[0]
+				
 				with maybe_range('WM/reward_term', self.cfg):
-					rew_ce = math.soft_ce(
-						reward_logits.view(-1, self.cfg.num_bins),  # float32[T*B,K]
-						reward_target.view(-1, 1),  # float32[T*B,1]
-						self.cfg,
-					).view(latents.shape[0], latents.shape[1], 1).mean(dim=1).squeeze(-1)
-				reward_loss_branch = rew_ce.mean() * rho_pows.mean()
-				# Expected reward prediction for error logging
-				reward_pred = math.two_hot_inv(reward_logits, self.cfg)
+					# Compute soft cross-entropy for all R heads
+					reward_target_exp = reward_target.unsqueeze(0).expand(R, T, B, 1)  # [R, T, B, 1]
+					reward_target_flat = reward_target_exp.reshape(R * T * B, 1)  # [R*T*B, 1]
+					logits_flat = reward_logits_all.reshape(R * T * B, self.cfg.num_bins)  # [R*T*B, K]
+					
+					rew_ce_flat = math.soft_ce(logits_flat, reward_target_flat, self.cfg)  # [R*T*B]
+					rew_ce_all = rew_ce_flat.view(R, T, B)  # [R, T, B]
+					
+					# Average over reward heads and batch; keep T for rho weighting
+					rew_ce = rew_ce_all.mean(dim=(0, 2))  # float32[T]
+					reward_loss_branch = (rho_pows * rew_ce).mean()
+					
+					# Expected reward prediction for error logging: average over R
+					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, B, 1]
+					reward_pred = reward_pred_all.mean(dim=0)  # [T, B, 1]
+					
 				if self.cfg.episodic:
 					term_logits = self.model.termination(next_latents, task, unnormalized=True)
 					term_loss_branch = F.binary_cross_entropy_with_logits(term_logits, terminated_target)
@@ -748,12 +810,27 @@ class TDMPC2(torch.nn.Module):
 		When rollout_len=1, all heads share the same action since the policy samples
 		from the initial state before any dynamics step.
 
+		Args:
+			start_z (Tensor[S, B_orig, L]): Starting latents where S = pi_rollout_horizon + 1.
+			task: Optional task index for multitask.
+			rollout_len (int): Number of imagination steps (must be 1 when H > 1).
+
 		Returns:
-			Dict with tensors shaped [T, H, B, 1] or [T+1, H, B, L] where:
-			- T = rollout_len (time steps)
-			- H = num dynamics heads
-			- B = S * B_orig * n_rollouts (flattened batch)
-			- L = latent_dim
+			Dict with tensors:
+			- z_seq: float32[T_imag+1, H, B_expanded, L] - latent trajectory
+			- actions: float32[T_imag, 1, B_expanded, A] - actions (shared across H)
+			- rewards: float32[T_imag, R, H, B_expanded, 1] - rewards per reward/dynamics head
+			- terminated: float32[T_imag, H, B_expanded, 1] - termination signals
+
+			Where:
+			- T_imag = rollout_len (imagination horizon, e.g., 1)
+			- H = planner_num_dynamics_heads
+			- R = num_reward_heads
+			- B_expanded = S * B_orig * num_rollouts
+
+			Note: Due to num_rollouts, z_seq[0] contains each starting state duplicated
+			num_rollouts times. When using for policy training (actor_source='ac'),
+			consider skipping t=0 to avoid training on duplicated initial states.
 		"""
 		S, B_orig, L = start_z.shape  # start_z: float32[S, B_orig, L]
 		A = self.cfg.action_dim
@@ -810,9 +887,13 @@ class TDMPC2(torch.nn.Module):
 			z_for_reward = z_seq[:-1].view(rollout_len, H * B, L)  # float32[T, H*B, L]
 			actions_for_reward = actions_expanded.reshape(rollout_len, H * B, A)  # float32[T, H*B, A]
 
-			reward_logits = self.model.reward(z_for_reward, actions_for_reward, task)
-			rewards_flat = math.two_hot_inv(reward_logits, self.cfg)  # float32[T, H*B, 1]
-			rewards = rewards_flat.view(rollout_len, H, B, 1)  # float32[T, H, B, 1]
+			# Get reward logits from all reward heads: [R, T, H*B, K]
+			reward_logits_all = self.model.reward(z_for_reward, actions_for_reward, task, head_mode='all')
+			R = reward_logits_all.shape[0]  # number of reward heads
+			# Convert to scalar rewards: [R, T, H*B, 1]
+			rewards_flat = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T, H*B, 1]
+			# Reshape to [T, R, H, B, 1]
+			rewards = rewards_flat.permute(1, 0, 2, 3).view(rollout_len, R, H, B, 1)  # float32[T, R, H, B, 1]
 
 			if self.cfg.episodic:
 				term_logits_flat = self.model.termination(z_for_reward, task, unnormalized=True)
@@ -820,7 +901,7 @@ class TDMPC2(torch.nn.Module):
 				terminated = (torch.sigmoid(term_logits) > 0.5).float()
 			else:
 				term_logits = torch.zeros(rollout_len, H, B, 1, device=device, dtype=dtype)
-				terminated = torch.zeros_like(rewards)
+				terminated = torch.zeros(rollout_len, H, B, 1, device=device, dtype=dtype)
 
 		# Avoid in-place detach on a view; build a fresh contiguous tensor
 		with maybe_range('Imagined/final_pack', self.cfg):
@@ -829,7 +910,7 @@ class TDMPC2(torch.nn.Module):
 		return {
 			'z_seq': z_seq_out,  # float32[T+1, H, B, L]
 			'actions': actions_seq.detach(),  # float32[T, 1, B, A] (shared across heads)
-			'rewards': rewards.detach(),  # float32[T, H, B, 1]
+			'rewards': rewards.detach(),  # float32[T, R, H, B, 1]
 			'terminated': terminated.detach(),  # float32[T, H, B, 1]
 			'termination_logits': term_logits.detach(),  # float32[T, H, B, 1]
 		}
@@ -867,7 +948,7 @@ class TDMPC2(torch.nn.Module):
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=z_seq.dtype))  # float32[T]
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # z_seq: float32[T+1, H, B, L]
-		rewards = rewards.detach()  # float32[T, H, B, 1]
+		rewards = rewards.detach()  # float32[T, R, H, B, 1]
 		terminated = terminated.detach()  # float32[T, H, B, 1]
 
 		# V-function: input is state only, merge H into B
@@ -881,9 +962,10 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Value/td_target', self.cfg):
 			with torch.no_grad():
 				if z_td is not None:
-					td_targets = self._td_target(z_td, rewards, terminated, task)  # float32[T, B, 1]
+					td_targets, td_std_across_heads = self._td_target(z_td, rewards, terminated, task)
 				else:
-					td_targets = self._td_target(z_seq[1:], rewards, terminated, task)  # float32[T, B, 1]
+					td_targets, td_std_across_heads = self._td_target(z_seq[1:], rewards, terminated, task)
+				# td_targets: float32[T, B, 1], td_std_across_heads: float32[T, B, 1]
 
 		with maybe_range('Value/ce', self.cfg):
 			# TD targets are [T, B, 1] after min over heads
@@ -914,6 +996,7 @@ class TDMPC2(torch.nn.Module):
 				'td_target_std': td_targets.std(),
 				'td_target_min': td_targets.min(),
 				'td_target_max': td_targets.max(),
+				'td_target_std_across_heads': td_std_across_heads.mean(),
 				'value_pred_mean': value_pred.mean(),
 				'value_pred_std': value_pred.std(),
 				'value_pred_min': value_pred.min(),
@@ -940,10 +1023,10 @@ class TDMPC2(torch.nn.Module):
 		For multi-head inputs, TD targets are computed per-head then min'd for pessimism.
 
 		Args:
-			z_seq (Tensor[T+1, H, B, L]): Latent sequences with H heads.
+			z_seq (Tensor[T+1, H, B, L]): Latent sequences with H dynamics heads.
 			actions (Tensor[T, H_a, B, A]): Actions (H_a=1 when shared across heads).
-			rewards (Tensor[T, H, B, 1]): Rewards per head.
-			terminated (Tensor[T, H, B, 1]): Termination signals per head.
+			rewards (Tensor[T, R, H, B, 1]): Rewards with R reward heads, H dynamics heads.
+			terminated (Tensor[T, H, B, 1]): Termination signals (no R dimension).
 			full_detach (bool): Whether to detach z_seq from graph.
 			task: Task index for multitask.
 			z_td (Tensor[T, H, B, L], optional): Override next_z for TD target.
@@ -965,7 +1048,7 @@ class TDMPC2(torch.nn.Module):
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=z_seq.dtype))  # float32[T]
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # z_seq: float32[T+1, H, B, L]
-		rewards = rewards.detach()  # float32[T, H, B, 1]
+		rewards = rewards.detach()  # float32[T, R, H, B, 1]
 		terminated = terminated.detach()  # float32[T, H, B, 1]
 
 		# V_aux: input is state only, merge H into B
@@ -1064,27 +1147,30 @@ class TDMPC2(torch.nn.Module):
 		def fetch_source(name):
 			"""Fetch source data for value loss computation with unified [T, H, B, ...] format.
 			
-			Non-imagined sources (replay_true, replay_rollout) have H=1 added via unsqueeze.
+			Non-imagined sources (replay_true, replay_rollout) have H=1 and R=1 added via unsqueeze.
+			Rewards use format [T, R, H, B, 1] where R=num_reward_heads, H=num_dynamics_heads.
 			The 'imagine' source uses native multi-head output from imagined_rollout.
 			"""
 			if name in source_cache:
 				return source_cache[name]
 			if name == 'replay_true':
 				# Add H=1 dimension: [T, B, ...] -> [T, 1, B, ...]
+				# Add R=1 dimension for rewards: [T, B, 1] -> [T, 1, 1, B, 1]
 				src = {
 					'z_seq': z_true.unsqueeze(1),  # float32[T+1, 1, B, L]
 					'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
-					'rewards': reward.unsqueeze(1),  # float32[T, 1, B, 1]
+					'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
 					'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
 					'full_detach': False,
 					'z_td': None,
 				}
 			elif name == 'replay_rollout':
 				# Add H=1 dimension: [T, B, ...] -> [T, 1, B, ...]
+				# Add R=1 dimension for rewards: [T, B, 1] -> [T, 1, 1, B, 1]
 				src = {
 					'z_seq': z_rollout.unsqueeze(1),  # float32[T+1, 1, B, L]
 					'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
-					'rewards': reward.unsqueeze(1),  # float32[T, 1, B, 1]
+					'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
 					'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
 					'full_detach': False,
 					'z_td': z_true[1:].unsqueeze(1),  # float32[T, 1, B, L]
@@ -1092,11 +1178,11 @@ class TDMPC2(torch.nn.Module):
 			elif name == 'imagine':
 				start_z = z_true.detach() if ac_only else z_true
 				imagined = self.imagined_rollout(start_z, task=task, rollout_len=self.cfg.imagination_horizon)
-				# imagined_rollout already returns [T+1, H, B, L] format
+				# imagined_rollout already returns [T, R, H, B, 1] format for rewards
 				src = {
 					'z_seq': imagined['z_seq'],  # float32[T+1, H, B, L]
 					'actions': imagined['actions'],  # float32[T, 1, B, A] (shared across heads)
-					'rewards': imagined['rewards'],  # float32[T, H, B, 1]
+					'rewards': imagined['rewards'],  # float32[T, R, H, B, 1]
 					'terminated': imagined['terminated'],  # float32[T, H, B, 1]
 					'full_detach': ac_only or self.cfg.detach_imagine_value,
 					'z_td': None,
@@ -1198,10 +1284,15 @@ class TDMPC2(torch.nn.Module):
 			self.optim.zero_grad(set_to_none=True)
 
 			if self.cfg.actor_source == 'ac':
-				# value_inputs['z_seq'] is [T+1, H, B, L]; select head-0 for policy update
-				# TODO(multi-head-policy): Consider alternative head selection strategies
-				# (e.g., random head, mean over heads) for policy training diversity
-				z_for_pi = value_inputs['z_seq'][:, 0].detach()  # float32[T+1, B, L]
+				# value_inputs['z_seq'] is [T_imag+1, H, B_expanded, L] where:
+				#   T_imag = imagination_horizon (e.g., 1)
+				#   B_expanded = S * batch_size * num_rollouts (e.g., 2 * 256 * 4 = 2048)
+				# 
+				# Problem: Due to num_rollouts, the initial states (t=0) are duplicated
+				# num_rollouts times. Training on these duplicates is wasteful.
+				# Solution: Skip t=0 and train only on rolled-out states (t=1+).
+				# Trade-off: Policy never sees true encoded states, only 1-step imagined ones.
+				z_for_pi = value_inputs['z_seq'][1:, 0].detach()  # float32[T_imag, B_expanded, L]
 			elif self.cfg.actor_source == 'replay_rollout':
 				# z_rollout is [T+1, B, L] (no H dimension from world_model_losses)
 				z_for_pi = z_rollout.detach()
@@ -1419,7 +1510,10 @@ class TDMPC2(torch.nn.Module):
 
 					
 					if self.cfg.actor_source == 'ac':
-						z_for_pi = components['value_inputs']['z_seq'].detach()
+						# Same logic as training: skip t=0 to avoid duplicated initial states,
+						# and index H=0 to remove dynamics head dimension.
+						# z_seq shape: [T_imag+1, H, B_expanded, L] -> [T_imag, B_expanded, L]
+						z_for_pi = components['value_inputs']['z_seq'][1:, 0].detach()
 					elif self.cfg.actor_source == 'replay_rollout':
 						z_for_pi = components['z_rollout'].detach()
 					elif self.cfg.actor_source == 'replay_true':

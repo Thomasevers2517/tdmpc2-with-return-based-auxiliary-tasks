@@ -24,7 +24,7 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         noisy_seq.unsqueeze(0),
         world_model,
         task,
-        head_reduce=world_model.cfg.planner_value_head_reduce,
+        head_reduce=world_model.cfg.planner_head_reduce,
     )
     dis = None
     if lat_all.shape[0] > 1:

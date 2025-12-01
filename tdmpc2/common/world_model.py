@@ -62,7 +62,16 @@ class WorldModel(nn.Module):
 		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
 		self._dynamics = self._dynamics_heads[0]
 		
-		self._reward = layers.mlp(cfg.latent_dim + cfg.action_dim + cfg.task_dim, 2*[ cfg.mlp_dim // cfg.reward_dim_div ], max(cfg.num_bins, 1))
+		# Multi-head reward ensemble for pessimistic reward estimation
+		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
+		self._reward_heads = layers.Ensemble([
+			layers.mlp(
+				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+				2 * [cfg.mlp_dim // cfg.reward_dim_div],
+				max(cfg.num_bins, 1),
+			)
+			for _ in range(num_reward_heads)
+		])
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		# V-function ensemble: input is latent only (no action)
@@ -118,7 +127,7 @@ class WorldModel(nn.Module):
 				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
 
 		self.apply(init.weight_init)
-		init.zero_([self._reward[-1].weight, self._Vs.params["2", "weight"]])
+		init.zero_([self._reward_heads.params["2", "weight"], self._Vs.params["2", "weight"]])
 		self.reset_policy_encoder_targets()
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
@@ -198,7 +207,7 @@ class WorldModel(nn.Module):
 		if self._num_aux_gamma > 0:
 			modules.append('Aux V-functions')
 			aux_modules = [self._aux_joint_Vs if self._aux_joint_Vs is not None else self._aux_separate_Vs]
-		for i, m in enumerate([self._encoder, self._dynamics, self._reward, self._termination, self._pi, self._Vs] + aux_modules):
+		for i, m in enumerate([self._encoder, self._dynamics, self._reward_heads, self._termination, self._pi, self._Vs] + aux_modules):
 			if m == self._termination and not self.cfg.episodic:
 				continue
 			repr += f"{modules[i]}: {m}\n"
@@ -378,16 +387,32 @@ class WorldModel(nn.Module):
 			else:
 				raise ValueError(f"Unsupported head_mode: {head_mode}")
 
-	def reward(self, z, a, task):
+	def reward(self, z, a, task, head_mode='single'):
 		"""
-		Predicts instantaneous (single-step) reward.
+		Predicts instantaneous (single-step) reward logits.
+
+		Args:
+			z (Tensor[..., L]): Latent states.
+			a (Tensor[..., A]): Actions.
+			task: Task index for multitask setup.
+			head_mode (str): 'single' returns logits from head 0 [..., K],
+				'all' returns logits from all heads [R, ..., K].
+
+		Returns:
+			Tensor[..., K] if head_mode='single', Tensor[R, ..., K] if head_mode='all'.
 		"""
 		with maybe_range('WM/reward', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			with self._autocast_context():
-				out = self._reward(za)
+				# Always use Ensemble forward (vmap) for proper parameter binding
+				out = self._reward_heads(za)  # [R, ..., K]
+				if head_mode == 'single':
+					# Select head 0 and remove head dimension
+					out = out[0]  # [..., K]
+				elif head_mode != 'all':
+					raise ValueError(f"Unsupported head_mode for reward: {head_mode}")
 			return out.float()
 	
 	def termination(self, z, task, unnormalized=False):

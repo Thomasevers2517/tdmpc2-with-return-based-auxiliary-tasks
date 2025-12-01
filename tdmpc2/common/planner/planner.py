@@ -95,7 +95,7 @@ class Planner(torch.nn.Module):
                 actions_p,
                 self.world_model,
                 task,
-                head_reduce=self.cfg.planner_value_head_reduce,
+                head_reduce=self.cfg.planner_head_reduce,
             )
             dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
@@ -143,7 +143,7 @@ class Planner(torch.nn.Module):
                 actions_s,
                 self.world_model,
                 task,
-                head_reduce=self.cfg.planner_value_head_reduce,
+                head_reduce=self.cfg.planner_head_reduce,
             )
             dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:

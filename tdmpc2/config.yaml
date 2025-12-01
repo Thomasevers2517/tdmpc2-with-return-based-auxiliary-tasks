@@ -35,9 +35,19 @@ n_mc_samples_target: 1
 ###############################################
 
 
-# Aggregation over dynamics heads when computing trajectory values.
-# Options: 'mean' or 'max'.
-planner_value_head_reduce: max
+# Number of reward ensemble heads for pessimistic reward estimation.
+# When > 1, rewards are predicted by multiple heads and reduced via planner_head_reduce (planning)
+# or policy_head_reduce (policy loss). TD targets always use min over reward heads (pessimistic).
+num_reward_heads: 1
+
+# Aggregation over reward and dynamics heads when computing trajectory values for planning.
+# Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
+planner_head_reduce: max
+
+# Aggregation over reward and dynamics heads when computing policy loss.
+# Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
+# it controls how reward/dynamics head predictions are reduced before policy optimization.
+policy_head_reduce: mean
 
 # Std of Gaussian noise added to policy actions when seeding the planner.
 # Applied only when use_policy=True in world_model.rollout_latents.
