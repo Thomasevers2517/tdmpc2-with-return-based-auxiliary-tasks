@@ -63,21 +63,31 @@ class WorldModel(nn.Module):
 		self._dynamics = self._dynamics_heads[0]
 		
 		# Multi-head reward ensemble for pessimistic reward estimation
+		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
+		# Ensemble stores params in TensorDictParams which apply() does not traverse.
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
-		self._reward_heads = layers.Ensemble([
+		reward_mlps = [
 			layers.mlp(
 				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
 				2 * [cfg.mlp_dim // cfg.reward_dim_div],
 				max(cfg.num_bins, 1),
 			)
 			for _ in range(num_reward_heads)
-		])
+		]
+		for mlp in reward_mlps:
+			mlp.apply(init.weight_init)
+		self._reward_heads = layers.Ensemble(reward_mlps)
+		
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		# V-function ensemble: input is latent only (no action)
 		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
+		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
 		v_input_dim = cfg.latent_dim + cfg.task_dim
-		self._Vs = layers.Ensemble([layers.mlp(v_input_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)])
+		v_mlps = [layers.mlp(v_input_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
+		for mlp in v_mlps:
+			mlp.apply(init.weight_init)
+		self._Vs = layers.Ensemble(v_mlps)
 		self._target_encoder = None
 		self._target_pi = None
 		self.encoder_target_max_delta = 0.0

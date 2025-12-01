@@ -32,7 +32,7 @@ parameters:
     values: [mean, max, min]
 
   actor_source: #replay_rollout # ac | replay_rollout | replay_true
-    values: [ac, replay_true]
+    value: replay_rollout
     
   tau:
     values: [0.01]
