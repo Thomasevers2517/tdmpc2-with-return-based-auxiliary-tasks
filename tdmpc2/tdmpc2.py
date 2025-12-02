@@ -816,7 +816,9 @@ class TDMPC2(torch.nn.Module):
 		from the initial state before any dynamics step.
 
 		Args:
-			start_z (Tensor[S, B_orig, L]): Starting latents where S = pi_rollout_horizon + 1.
+			start_z (Tensor[S, B_orig, L]): Starting latents where S is number of starting states
+				(typically T+1 from replay buffer horizon). Each of the S states becomes a
+				separate starting point for imagination.
 			task: Optional task index for multitask.
 			rollout_len (int): Number of imagination steps (must be 1 when H > 1).
 
@@ -870,39 +872,39 @@ class TDMPC2(torch.nn.Module):
 			# Reshape to [T+1, H, B, L] where B = B_total * n_rollouts
 			# latents: [H, B_total, N, T+1, L] -> [T+1, H, B_total*N, L]
 			B = B_total * n_rollouts  # final batch dimension
-			# permute: [H, B_total, N, T+1, L] -> [T+1, H, B_total, N, L]
-			lat_perm = latents.permute(3, 0, 1, 2, 4).contiguous()  # float32[T+1, H, B_total, N, L]
-			z_seq = lat_perm.view(rollout_len + 1, H, B, L)  # float32[T+1, H, B, L]
+			# permute: [H, B_total, N, rollout_len+1, L] -> [rollout_len+1, H, B_total, N, L]
+			lat_perm = latents.permute(3, 0, 1, 2, 4).contiguous()  # float32[rollout_len+1, H, B_total, N, L]
+			z_seq = lat_perm.view(rollout_len + 1, H, B, L)  # float32[rollout_len+1, H, B, L]
 
 		with maybe_range('Imagined/act_seq', self.cfg):
-			# actions: [B_total, N, T, A] -> [T, B_total*N, A] -> [T, 1, B, A]
-			actions_perm = actions.permute(2, 0, 1, 3).contiguous()  # float32[T, B_total, N, A]
-			actions_flat = actions_perm.view(rollout_len, B, A)  # float32[T, B, A]
+			# actions: [B_total, N, rollout_len, A] -> [rollout_len, B_total*N, A] -> [rollout_len, 1, B, A]
+			actions_perm = actions.permute(2, 0, 1, 3).contiguous()  # float32[rollout_len, B_total, N, A]
+			actions_flat = actions_perm.view(rollout_len, B, A)  # float32[rollout_len, B, A]
 			# Add H=1 dim since actions are shared across heads
-			actions_seq = actions_flat.unsqueeze(1)  # float32[T, 1, B, A]
+			actions_seq = actions_flat.unsqueeze(1)  # float32[rollout_len, 1, B, A]
 
 		# Compute rewards and termination logits along imagined trajectories per head
 		# Need to process each head's latents through reward/termination predictors
 		with maybe_range('Imagined/rewards_term', self.cfg):
-			# z_seq[:-1]: [T, H, B, L], actions for reward: need [T, H, B, A]
-			# Expand actions to match heads: [T, 1, B, A] -> [T, H, B, A]
-			actions_expanded = actions_seq.expand(rollout_len, H, B, A)  # float32[T, H, B, A]
+			# z_seq[:-1]: [rollout_len, H, B, L], actions for reward: need [rollout_len, H, B, A]
+			# Expand actions to match heads: [rollout_len, 1, B, A] -> [rollout_len, H, B, A]
+			actions_expanded = actions_seq.expand(rollout_len, H, B, A)  # float32[rollout_len, H, B, A]
 
 			# Flatten H*B for reward/termination calls
-			z_for_reward = z_seq[:-1].view(rollout_len, H * B, L)  # float32[T, H*B, L]
-			actions_for_reward = actions_expanded.reshape(rollout_len, H * B, A)  # float32[T, H*B, A]
+			z_for_reward = z_seq[:-1].view(rollout_len, H * B, L)  # float32[rollout_len, H*B, L]
+			actions_for_reward = actions_expanded.reshape(rollout_len, H * B, A)  # float32[rollout_len, H*B, A]
 
-			# Get reward logits from all reward heads: [R, T, H*B, K]
+			# Get reward logits from all reward heads: [R, rollout_len, H*B, K]
 			reward_logits_all = self.model.reward(z_for_reward, actions_for_reward, task, head_mode='all')
 			R = reward_logits_all.shape[0]  # number of reward heads
-			# Convert to scalar rewards: [R, T, H*B, 1]
-			rewards_flat = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T, H*B, 1]
-			# Reshape to [T, R, H, B, 1]
-			rewards = rewards_flat.permute(1, 0, 2, 3).view(rollout_len, R, H, B, 1)  # float32[T, R, H, B, 1]
+			# Convert to scalar rewards: [R, rollout_len, H*B, 1]
+			rewards_flat = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, rollout_len, H*B, 1]
+			# Reshape to [rollout_len, R, H, B, 1]
+			rewards = rewards_flat.permute(1, 0, 2, 3).view(rollout_len, R, H, B, 1)  # float32[rollout_len, R, H, B, 1]
 
 			if self.cfg.episodic:
 				term_logits_flat = self.model.termination(z_for_reward, task, unnormalized=True)
-				term_logits = term_logits_flat.view(rollout_len, H, B, 1)  # float32[T, H, B, 1]
+				term_logits = term_logits_flat.view(rollout_len, H, B, 1)  # float32[rollout_len, H, B, 1]
 				terminated = (torch.sigmoid(term_logits) > 0.5).float()
 			else:
 				term_logits = torch.zeros(rollout_len, H, B, 1, device=device, dtype=dtype)
@@ -1181,7 +1183,23 @@ class TDMPC2(torch.nn.Module):
 					'z_td': z_true[1:].unsqueeze(1),  # float32[T, 1, B, L]
 				}
 			elif name == 'imagine':
-				start_z = z_true.detach() if ac_only else z_true
+				# Select initial latents for imagination based on config
+				# 'replay_true': use true encoded latents (current behavior)
+				# 'replay_rollout': use dynamics rollout latents from head 0 (exposes value to OOD states)
+				imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
+				if imagine_source == 'replay_true':
+					start_z = z_true.detach() if ac_only else z_true
+				elif imagine_source == 'replay_rollout':
+					# Use rollout latents from head 0 (same shape as z_true: [T+1, B, L])
+					# Partial detach: keep z_rollout[0] attached so value gradients flow to encoder,
+					# but detach z_rollout[1:] to block gradients to dynamics head.
+					# Must be contiguous for view() in imagined_rollout.
+					if ac_only:
+						start_z = z_rollout.detach().contiguous()
+					else:
+						start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
+				else:
+					raise ValueError(f"imagine_initial_source must be 'replay_true' or 'replay_rollout', got '{imagine_source}'")
 				imagined = self.imagined_rollout(start_z, task=task, rollout_len=self.cfg.imagination_horizon)
 				# imagined_rollout already returns [T, R, H, B, 1] format for rewards
 				src = {
@@ -1261,9 +1279,9 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
 			if log_grads:
-				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag.item())
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag)
 			else:
-				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag.item())
+				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag)
     
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
@@ -1274,11 +1292,11 @@ class TDMPC2(torch.nn.Module):
 			value_inputs = components['value_inputs']
       
 			total_loss = info['total_loss']		
-   
+			self.optim.zero_grad(set_to_none=True) # this is crucial since the pi_loss also backprops through the world model, we want to clear those remaining gradients
+
 			if log_grads:
 				info = self.probe_wm_gradients(info)
 
-			self.optim.zero_grad(set_to_none=True)
 			total_loss.backward()
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 			if log_grads:

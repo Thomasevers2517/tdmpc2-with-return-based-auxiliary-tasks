@@ -86,6 +86,7 @@ ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: replay_true # replay_true | replay_rollout | imagine
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
+imagine_initial_source: replay_true  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
 actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
 ema_value_planning: false # if true, use ema critic for mpc planning
