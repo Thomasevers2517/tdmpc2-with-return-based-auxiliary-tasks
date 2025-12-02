@@ -47,10 +47,12 @@ def compute_values(
     z_flat = z_t.contiguous().view(H * E, T, L)             # float32[H*E, T, L]
     a_flat = a_t.contiguous().view(H * E, T, -1)            # float32[H*E, T, A]
 
-    # Get reward logits from reward heads: [R, H*E, T, K] where R depends on reward_head_mode
+    # Get reward logits from reward heads: [R, H*E, T, K]
+    # R=1 if reward_head_mode='single', R=num_reward_heads if 'all'
     rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode=reward_head_mode)
-    R = rew_logits_all.shape[0]  # number of reward heads (1 if 'single', all if 'all')
-    # Convert to scalar rewards: [R, H*E, T, 1] -> [R, H*E, T]
+    R = rew_logits_all.shape[0]  # number of reward heads
+    
+    # Convert to scalar rewards: [R, H*E, T, K] -> [R, H*E, T]
     r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*E, T]
     # Reshape to [R, H, E, T]
     r_all = r_all.view(R, H, E, T)  # float32[R, H, E, T]

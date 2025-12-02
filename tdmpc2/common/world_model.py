@@ -405,11 +405,11 @@ class WorldModel(nn.Module):
 			z (Tensor[..., L]): Latent states.
 			a (Tensor[..., A]): Actions.
 			task: Task index for multitask setup.
-			head_mode (str): 'single' returns logits from head 0 [..., K],
+			head_mode (str): 'single' returns logits from head 0 [1, ..., K],
 				'all' returns logits from all heads [R, ..., K].
 
 		Returns:
-			Tensor[..., K] if head_mode='single', Tensor[R, ..., K] if head_mode='all'.
+			Tensor[R, ..., K] where R=1 if head_mode='single', R=num_heads if 'all'.
 		"""
 		with maybe_range('WM/reward', self.cfg):
 			if self.cfg.multitask:
@@ -419,8 +419,8 @@ class WorldModel(nn.Module):
 				# Always use Ensemble forward (vmap) for proper parameter binding
 				out = self._reward_heads(za)  # [R, ..., K]
 				if head_mode == 'single':
-					# Select head 0 and remove head dimension
-					out = out[0]  # [..., K]
+					# Select head 0, keep head dimension for consistent shape
+					out = out[:1]  # [1, ..., K]
 				elif head_mode != 'all':
 					raise ValueError(f"Unsupported head_mode for reward: {head_mode}")
 			return out.float()

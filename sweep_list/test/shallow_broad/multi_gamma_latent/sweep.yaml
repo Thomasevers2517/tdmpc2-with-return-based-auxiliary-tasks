@@ -18,9 +18,9 @@ parameters:
   latent_dim:
     values: [512, 1024]
 
-  # 2. Auxiliary value source: replay_rollout vs imagine
+  # 2. Auxiliary value source: replay_true vs imagine
   aux_value_source:
-    values: [replay_rollout, imagine]
+    values: [replay_true, imagine]
 
   # Multi-gamma auxiliary heads (4 heads with different gammas)
   # Loss is automatically scaled by num_aux_heads (4x in this case)
@@ -28,6 +28,8 @@ parameters:
     value: [0.97, 0.95, 0.9, 0.8]
   multi_gamma_loss_weight:
     value: 1.0
+  multi_gamma_head:
+    value: separate
 
   # Ensemble config: 1 reward head, 4 dynamics heads
   num_reward_heads:
@@ -59,7 +61,7 @@ parameters:
   planner_policy_elites_first_iter_only:
     value: false
   policy_seed_noise_std:
-    value: 0.1
+    value: 0.01
   temperature:
     value: 0.5
   iterations:
