@@ -1089,11 +1089,11 @@ class TDMPC2(torch.nn.Module):
 			aux_ce = aux_ce_flat.view(G_aux, T, H, B, 1).mean(dim=(2, 3)).squeeze(-1)  # float32[G_aux, T]
 
 		weighted = aux_ce * rho_pows.unsqueeze(0)  # float32[G_aux, T]
-		losses = weighted.mean(dim=1)  # float32[G_aux]
-		loss_mean = losses.mean()
+		losses = weighted.mean(dim=1)  # float32[G_aux] - mean over time per head
+		loss_sum = losses.sum()  # sum over aux heads (not mean)
 
 		info = TensorDict({
-			'aux_value_loss_mean': loss_mean
+			'aux_value_loss_sum': loss_sum
 		}, device=device, non_blocking=True)
 
 		for g, gamma in enumerate(self.cfg.multi_gamma_gammas):
@@ -1109,14 +1109,10 @@ class TDMPC2(torch.nn.Module):
 					f'aux_td_target_std/gamma{gamma:.4f}': aux_td_targets[g].std(),
 				}, non_blocking=True)
 
-		return loss_mean, info
+		return loss_sum, info
 
 	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads, detach_encoder_active):
 		device = self.device
-
-		wm_fn = self.world_model_losses
-		value_fn = self.calculate_value_loss
-		aux_fn = self.calculate_aux_value_loss
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
 			if detach_encoder_active:
@@ -1142,7 +1138,7 @@ class TDMPC2(torch.nn.Module):
 		if not ac_only:
 			z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
 			z_target = encode_obs(obs, use_ema=True, grad_enabled=False) if self.cfg.encoder_ema_enabled else None
-			wm_loss, wm_info, z_rollout = wm_fn(z_true, z_target, action, reward, terminated, task)
+			wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
 		else:
 			z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
 			z_rollout = self.rollout_dynamics(z_start=z_true[0], action=action, task=task).detach()
@@ -1218,7 +1214,7 @@ class TDMPC2(torch.nn.Module):
 		value_inputs = fetch_source(self.cfg.ac_source)
 		
 
-		value_loss, value_info = value_fn(
+		value_loss, value_info = self.calculate_value_loss(
 			value_inputs['z_seq'],
 			value_inputs['actions'],
 			value_inputs['rewards'],
@@ -1233,7 +1229,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
 			aux_inputs = fetch_source(self.cfg.aux_value_source)
 
-			aux_loss, aux_info = aux_fn(
+			aux_loss, aux_info = self.calculate_aux_value_loss(
 				aux_inputs['z_seq'],
 				aux_inputs['actions'],
 				aux_inputs['rewards'],
@@ -1250,7 +1246,7 @@ class TDMPC2(torch.nn.Module):
   
 		critic_weighted = self.cfg.value_coef * value_loss
 		critic_weighted =  critic_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_weighted
-		aux_weighted =  self.cfg.multi_gamma_loss_weight * aux_loss
+		aux_weighted = self.cfg.multi_gamma_loss_weight * aux_loss
 		aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.aux_value_source == 'imagine' else aux_weighted
 
 		total_loss = wm_loss + critic_weighted + aux_weighted
@@ -1420,8 +1416,8 @@ class TDMPC2(torch.nn.Module):
 		}
 		if self.cfg.episodic:
 			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']
-		if 'aux_value_loss_mean' in info and self.cfg.multi_gamma_loss_weight != 0:
-			loss_parts['aux_value_mean'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_mean']
+		if 'aux_value_loss_sum' in info and self.cfg.multi_gamma_loss_weight != 0:
+			loss_parts['aux_value_sum'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_sum']
 
 
 		# Drop existing grad buffers so cudagraph outputs are not mutated in-place
