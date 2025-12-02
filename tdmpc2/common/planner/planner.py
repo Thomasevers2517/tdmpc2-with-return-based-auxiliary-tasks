@@ -96,6 +96,7 @@ class Planner(torch.nn.Module):
                 self.world_model,
                 task,
                 head_reduce=self.cfg.planner_head_reduce,
+                reward_head_mode=head_mode,
             )
             dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
@@ -137,13 +138,14 @@ class Planner(torch.nn.Module):
             latents_s = latents_s[:, 0]
             actions_s = actions_s[0]
 
-            # Values for sampled trajectories using all heads and configured reduction.
+            # Values for sampled trajectories using configured head mode and reduction.
             vals_unscaled_s, vals_scaled_s, vals_std_s = compute_values(
                 latents_s,
                 actions_s,
                 self.world_model,
                 task,
                 head_reduce=self.cfg.planner_head_reduce,
+                reward_head_mode=head_mode,
             )
             dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:

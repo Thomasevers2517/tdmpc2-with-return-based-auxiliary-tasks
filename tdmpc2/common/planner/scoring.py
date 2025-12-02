@@ -9,8 +9,9 @@ def compute_values(
     world_model,
     task=None,
     head_reduce: str = "mean",
+    reward_head_mode: str = "all",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute trajectory values using all dynamics heads and reward heads in parallel.
+    """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
     without needing to sample or provide an action.
@@ -26,6 +27,8 @@ def compute_values(
         world_model: WorldModel exposing reward() and V().
         task: Optional task index for multitask setups.
         head_reduce: Aggregation over heads: 'mean' or 'max'. Applied to both R and H.
+        reward_head_mode: 'single' uses only head 0, 'all' uses all reward heads.
+            During eval, use 'single' to match single dynamics head for fair comparison.
 
     Returns:
         Tuple[Tensor[E], Tensor[E], Tensor[E]]: (values_unscaled, values_scaled,
@@ -44,15 +47,16 @@ def compute_values(
     z_flat = z_t.contiguous().view(H * E, T, L)             # float32[H*E, T, L]
     a_flat = a_t.contiguous().view(H * E, T, -1)            # float32[H*E, T, A]
 
-    # Get reward logits from all reward heads: [R, H*E, T, K]
-    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode='all')
-    R = rew_logits_all.shape[0]  # number of reward heads
+    # Get reward logits from reward heads: [R, H*E, T, K] where R depends on reward_head_mode
+    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode=reward_head_mode)
+    R = rew_logits_all.shape[0]  # number of reward heads (1 if 'single', all if 'all')
     # Convert to scalar rewards: [R, H*E, T, 1] -> [R, H*E, T]
     r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*E, T]
     # Reshape to [R, H, E, T]
     r_all = r_all.view(R, H, E, T)  # float32[R, H, E, T]
     
     # Reduce over reward heads (R) per timestep using head_reduce
+    # When R=1 (single head mode), reduction is a no-op
     if head_reduce == "mean":
         r_t = r_all.mean(dim=0)  # float32[H, E, T]
     elif head_reduce == "max":
