@@ -13,37 +13,56 @@ parameters:
   task:
     value: quadruped-walk
 
-  num_rollouts:
-    value: 1
   # Sweep dimensions
-  # 1. Latent dimension: 512 (default) vs 1024
-  latent_dim:
-    values: [512, 1024]
+  # 1. Number of dynamics heads: 2 or 4
+  planner_num_dynamics_heads:
+    values: [2, 4]
 
-  # 2. Auxiliary value source: replay_true vs imagine
+  # 2. Policy seed noise std: 0 or 0.1
+  policy_seed_noise_std:
+    values: [0, 0.1]
+
+  # 3. Ensemble LR scaling: true or false
+  ensemble_lr_scaling:
+    values: [true, false]
+
+  # Fixed source settings
+  imagine_initial_source:
+    value: replay_rollout
   aux_value_source:
-    values: [replay_true, imagine]
+    value: replay_true
+  actor_source:
+    value: replay_rollout
+  ac_source:
+    value: imagine
 
-  # Multi-gamma auxiliary heads (4 heads with different gammas)
-  # Loss is automatically scaled by num_aux_heads (4x in this case)
+  # Fixed ensemble config
+  policy_head_reduce:
+    value: min
+  planner_head_reduce:
+    value: max
+  num_reward_heads:
+    value: 1
+  num_q:
+    value: 2
+
+  # Fixed settings
+  num_rollouts:
+    value: 4
+  latent_dim:
+    value: 512
+  enc_lr_scale:
+    value: 0.3
+
+  # Multi-gamma auxiliary heads (2 heads)
   multi_gamma_gammas:
-    value: [0.97, 0.95, 0.9, 0.8]
+    value: [0.9, 0.95]
   multi_gamma_loss_weight:
     value: 0.1
   multi_gamma_head:
     value: separate
 
-  # Ensemble config: 1 reward head, 4 dynamics heads
-  num_reward_heads:
-    value: 1
-  planner_num_dynamics_heads:
-    value: 4
-  policy_head_reduce:
-    value: min
-  planner_head_reduce:
-    value: max
-
-  # Fixed settings
+  # Training settings
   utd_ratio:
     value: 4
   tau:
@@ -54,16 +73,12 @@ parameters:
     value: 1
   train_act_std_coeff:
     value: 0.0
-  ac_source:
-    value: imagine
 
   # Planner settings
   planner_lambda_disagreement:
     value: 0
   planner_policy_elites_first_iter_only:
     value: false
-  policy_seed_noise_std:
-    value: 0.01
   temperature:
     value: 0.5
   iterations:

@@ -82,27 +82,75 @@ class TDMPC2(torch.nn.Module):
 
   		# ------------------------------------------------------------------
 		# Optimizer parameter groups
-		# Base groups mirror original implementation; we now optionally append
-		# auxiliary Q ensemble parameters (joint or separate) so they are
-		# trained with identical learning rate / schedule semantics.
-		# NOTE: No auxiliary target networks exist yet; if added later they'd
-		# require their own soft-update call.
 		# ------------------------------------------------------------------
+		# Ensemble-aware LR scaling:
+		# When using ensembles with mean-reduced losses, each head sees 1/N of
+		# the gradient it would see with a single head. To maintain the same
+		# per-head learning dynamics as original TDMPC2 (which had 1 dynamics,
+		# 1 reward, 5 value heads), we scale LRs by ensemble size.
+		#
+		# Formula per component:
+		#   - Dynamics: lr * num_dynamics_heads (baseline had 1)
+		#   - Reward:   lr * num_reward_heads   (baseline had 1)
+		#   - Value:    lr * num_q / 5          (baseline had 5)
+		#   - Aux value: lr * num_aux_heads / 5 (to match original V head gradient)
+		# ------------------------------------------------------------------
+		num_dynamics_heads = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
+		num_reward_heads = int(getattr(self.cfg, 'num_reward_heads', 1))
+		num_q = int(getattr(self.cfg, 'num_q', 5))
+		num_aux_heads = len(self.cfg.multi_gamma_gammas) if getattr(self.cfg, 'multi_gamma_gammas', None) else 0
+		ensemble_lr_scaling = self.cfg.ensemble_lr_scaling
+		
+		lr_encoder = self.cfg.lr * self.cfg.enc_lr_scale
+		if ensemble_lr_scaling:
+			# Scale LRs by ensemble size to compensate for mean-reduced gradients
+			lr_dynamics = self.cfg.lr * num_dynamics_heads
+			lr_reward = self.cfg.lr * num_reward_heads
+			lr_value = self.cfg.lr * num_q / 5
+			lr_aux_value = self.cfg.lr * num_aux_heads / 5 if num_aux_heads > 0 else self.cfg.lr
+		else:
+			# No scaling: all heads use base LR
+			lr_dynamics = self.cfg.lr
+			lr_reward = self.cfg.lr
+			lr_value = self.cfg.lr
+			lr_aux_value = self.cfg.lr
+		
 		param_groups = [
-			{'params': self.model._encoder.parameters(), 'lr': self.cfg.lr*self.cfg.enc_lr_scale},
-			{'params': self.model._dynamics_heads.parameters()},
-			{'params': self.model._reward_heads.parameters()},
-			{'params': self.model._termination.parameters() if self.cfg.episodic else []},
-			{'params': self.model._Vs.parameters()},
-			{'params': self.model._task_emb.parameters() if self.cfg.multitask else []}
+			{'params': self.model._encoder.parameters(), 'lr': lr_encoder},
+			{'params': self.model._dynamics_heads.parameters(), 'lr': lr_dynamics},
+			{'params': self.model._reward_heads.parameters(), 'lr': lr_reward},
+			{'params': self.model._termination.parameters() if self.cfg.episodic else [], 'lr': self.cfg.lr},
+			{'params': self.model._Vs.parameters(), 'lr': lr_value},
+			{'params': self.model._task_emb.parameters() if self.cfg.multitask else [], 'lr': self.cfg.lr}
 		]
-		if getattr(self.cfg, 'multi_gamma_gammas', None) and len(self.cfg.multi_gamma_gammas) > 0:
-			# Append auxiliary head params (single heads, not ensembles)
-			if self.model._aux_joint_Vs is not None:
-				param_groups.append({'params': self.model._aux_joint_Vs.parameters()})
-			elif self.model._aux_separate_Vs is not None:
+		if num_aux_heads > 0:
+			# Deprecation check: joint aux heads are no longer supported
+			if getattr(self.cfg, 'multi_gamma_head', 'separate') == 'joint':
+				raise ValueError(
+					"multi_gamma_head='joint' is deprecated. Use 'separate' instead. "
+					"Joint aux heads are no longer supported."
+				)
+			# Append auxiliary head params (separate heads only)
+			if self.model._aux_separate_Vs is not None:
 				for head in self.model._aux_separate_Vs:
-					param_groups.append({'params': head.parameters()})
+					param_groups.append({'params': head.parameters(), 'lr': lr_aux_value})
+		
+		# Log effective learning rates
+		log.info('Effective learning rates (ensemble_lr_scaling=%s):', ensemble_lr_scaling)
+		log.info('  encoder:    %.6f (base_lr * enc_lr_scale = %.4f * %.2f)', lr_encoder, self.cfg.lr, self.cfg.enc_lr_scale)
+		if ensemble_lr_scaling:
+			log.info('  dynamics:   %.6f (base_lr * %d dynamics heads)', lr_dynamics, num_dynamics_heads)
+			log.info('  reward:     %.6f (base_lr * %d reward heads)', lr_reward, num_reward_heads)
+			log.info('  value:      %.6f (base_lr * %d / 5 value heads)', lr_value, num_q)
+			if num_aux_heads > 0:
+				log.info('  aux_value:  %.6f (base_lr * %d / 5 aux heads)', lr_aux_value, num_aux_heads)
+		else:
+			log.info('  dynamics:   %.6f (base_lr, no scaling)', lr_dynamics)
+			log.info('  reward:     %.6f (base_lr, no scaling)', lr_reward)
+			log.info('  value:      %.6f (base_lr, no scaling)', lr_value)
+			if num_aux_heads > 0:
+				log.info('  aux_value:  %.6f (base_lr, no scaling)', lr_aux_value)
+		
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
 		self.model.eval()
@@ -757,9 +805,9 @@ class TDMPC2(torch.nn.Module):
 		R = int(getattr(self.cfg, 'num_reward_heads', 1))  # reward heads
 
 		wm_total = (
-			self.cfg.consistency_coef * consistency_loss * H
-			+ self.cfg.encoder_consistency_coef * encoder_consistency_loss * H
-			+ self.cfg.reward_coef * reward_loss * R
+			self.cfg.consistency_coef * consistency_loss
+			+ self.cfg.encoder_consistency_coef * encoder_consistency_loss
+			+ self.cfg.reward_coef * reward_loss
 			+ self.cfg.termination_coef * termination_loss
 		)
 
@@ -1090,10 +1138,11 @@ class TDMPC2(torch.nn.Module):
 
 		weighted = aux_ce * rho_pows.unsqueeze(0)  # float32[G_aux, T]
 		losses = weighted.mean(dim=1)  # float32[G_aux] - mean over time per head
-		loss_sum = losses.sum()  # sum over aux heads (not mean)
+		# Mean over aux heads (not sum) - LR scaling compensates for ensemble size
+		loss_mean = losses.mean()  # scalar
 
 		info = TensorDict({
-			'aux_value_loss_sum': loss_sum
+			'aux_value_loss_mean': loss_mean
 		}, device=device, non_blocking=True)
 
 		for g, gamma in enumerate(self.cfg.multi_gamma_gammas):
@@ -1109,7 +1158,7 @@ class TDMPC2(torch.nn.Module):
 					f'aux_td_target_std/gamma{gamma:.4f}': aux_td_targets[g].std(),
 				}, non_blocking=True)
 
-		return loss_sum, info
+		return loss_mean, info
 
 	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads, detach_encoder_active):
 		device = self.device
@@ -1416,8 +1465,8 @@ class TDMPC2(torch.nn.Module):
 		}
 		if self.cfg.episodic:
 			loss_parts['termination'] = self.cfg.termination_coef * info['termination_loss']
-		if 'aux_value_loss_sum' in info and self.cfg.multi_gamma_loss_weight != 0:
-			loss_parts['aux_value_sum'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_sum']
+		if 'aux_value_loss_mean' in info and self.cfg.multi_gamma_loss_weight != 0:
+			loss_parts['aux_value_mean'] = self.cfg.multi_gamma_loss_weight * info['aux_value_loss_mean']
 
 
 		# Drop existing grad buffers so cudagraph outputs are not mutated in-place

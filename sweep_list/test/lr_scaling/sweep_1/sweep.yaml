@@ -13,31 +13,36 @@ parameters:
   task:
     value: quadruped-walk
 
-  num_rollouts:
-    value: 1
   # Sweep dimensions
-  # 1. Latent dimension: 512 (default) vs 1024
-  latent_dim:
-    values: [512, 1024]
+  # 1. Number of dynamics heads: 2 or 4
+  planner_num_dynamics_heads:
+    values: [2, 4]
 
   # 2. Auxiliary value source: replay_true vs imagine
   aux_value_source:
     values: [replay_true, imagine]
 
-  # Multi-gamma auxiliary heads (4 heads with different gammas)
-  # Loss is automatically scaled by num_aux_heads (4x in this case)
+  # Fixed settings
+  num_rollouts:
+    value: 4
+  latent_dim:
+    value: 512
+  enc_lr_scale:
+    value: 0.3
+
+  # Multi-gamma auxiliary heads (2 heads)
   multi_gamma_gammas:
-    value: [0.97, 0.95, 0.9, 0.8]
+    value: [0.9, 0.95]
   multi_gamma_loss_weight:
     value: 0.1
   multi_gamma_head:
     value: separate
 
-  # Ensemble config: 1 reward head, 4 dynamics heads
+  # Ensemble config
   num_reward_heads:
     value: 1
-  planner_num_dynamics_heads:
-    value: 4
+  num_q:
+    value: 2
   policy_head_reduce:
     value: min
   planner_head_reduce:
@@ -63,7 +68,7 @@ parameters:
   planner_policy_elites_first_iter_only:
     value: false
   policy_seed_noise_std:
-    value: 0.01
+    value: 0
   temperature:
     value: 0.5
   iterations:
@@ -99,7 +104,7 @@ parameters:
   obs:
     value: state
   steps:
-    value: 100000
+    value: 60000
   eval_freq:
     value: 10000
   batch_size:

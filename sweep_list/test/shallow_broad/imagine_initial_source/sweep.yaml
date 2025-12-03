@@ -13,6 +13,8 @@ parameters:
   task:
     value: quadruped-walk
 
+  num_rollouts:
+    value: 1
   # Core test: imagine_initial_source with different actor sources
   # replay_true = use true encoded latents (default)
   # replay_rollout = use dynamics rollout latents (exposes value to OOD states)
