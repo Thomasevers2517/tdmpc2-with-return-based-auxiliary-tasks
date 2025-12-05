@@ -118,7 +118,6 @@ pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize t
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
 tau: 0.01
-aux_value_tau: 0.01
 policy_ema_enabled: false
 policy_ema_tau: 0.05
 encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
