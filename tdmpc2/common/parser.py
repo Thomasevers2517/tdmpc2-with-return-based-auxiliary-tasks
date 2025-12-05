@@ -103,12 +103,6 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# NOTE: Actual assertion that gammas[0] == primary discount occurs later
 	# in the agent (where the computed heuristic discount is accessible).
 	# ----------------------------------------------------------------------
-	if not hasattr(cfg, 'multi_gamma_gammas'):
-		cfg.multi_gamma_gammas = []
-	if not hasattr(cfg, 'multi_gamma_head'):
-		cfg.multi_gamma_head = 'joint'
-	if not hasattr(cfg, 'multi_gamma_loss_weight'):
-		cfg.multi_gamma_loss_weight = 0.5
 	if not hasattr(cfg, 'multi_gamma_debug_logging'):
 		cfg.multi_gamma_debug_logging = False
 	if not hasattr(cfg, 'multi_gamma_log_num_examples'):

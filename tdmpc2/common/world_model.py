@@ -84,7 +84,8 @@ class WorldModel(nn.Module):
 		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
 		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
 		v_input_dim = cfg.latent_dim + cfg.task_dim
-		v_mlps = [layers.mlp(v_input_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
+		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div  # Allow smaller V networks via value_dim_div
+		v_mlps = [layers.mlp(v_input_dim, 2*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
 		for mlp in v_mlps:
 			mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
@@ -125,12 +126,14 @@ class WorldModel(nn.Module):
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
 			# Auxiliary V heads: input is latent only (no action)
+			# Use same v_mlp_dim as primary V heads for consistency
 			aux_in_dim = cfg.latent_dim + (cfg.task_dim if cfg.multitask else 0)
+			aux_v_mlp_dim = v_mlp_dim  # Already computed above as cfg.mlp_dim // cfg.value_dim_div
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Vs = layers.mlp(aux_in_dim, 2*[cfg.mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+				self._aux_joint_Vs = layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
 				self._aux_separate_Vs = torch.nn.ModuleList([
-					layers.mlp(aux_in_dim, 2*[cfg.mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
+					layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
 					for _ in range(self._num_aux_gamma)
 				])
 			else:
@@ -556,7 +559,7 @@ class WorldModel(nn.Module):
 			
 		Returns:
 			Tensor[num_q, ..., K] if return_type='all' (logits).
-			Tensor[..., 1] otherwise (values after two-hot inverse).
+			Tensor[..., 1] otherwise (values after two-hot inverse, reduced over all num_q heads).
 		"""
 		assert return_type in {'min', 'avg', 'mean', 'max', 'all'}
 
@@ -573,20 +576,19 @@ class WorldModel(nn.Module):
 				vnet = self._Vs
 			with self._autocast_context():
 				out = vnet(z)
-			out = out.float()
+			out = out.float()  # float32[num_q, ..., K]
 
 			if return_type == 'all':
 				return out
 
-			# Random subset of 2 from num_q ensemble members for min/max/avg
-			vidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
-			V = math.two_hot_inv(out[vidx], self.cfg)
+			# Use ALL num_q ensemble members for reduction (no subsampling)
+			V = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
 			if return_type == "min":
 				return V.min(0).values
 			if return_type == "max":
 				return V.max(0).values
-			# 'avg' or 'mean' - both compute average
-			return V.sum(0) / 2
+			# 'avg' or 'mean' - compute average over all heads
+			return V.mean(0)
 
 	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).

@@ -1,0 +1,156 @@
+# Sweep to compare current V-based implementation with 6d17a50 Q-based
+#
+# ===== POLICY GRADIENT FLOW (IMPORTANT) =====
+# The policy loss computes: maximize [r(z, a) + γ * V(dynamics(z, a))]
+# where a = pi(z) comes from the policy.
+#
+# ONLY pi_optim updates policy parameters. The dynamics and reward models
+# are NOT in pi_optim, so they are effectively frozen during policy updates.
+# However, gradients still flow through them in the computational graph:
+#   ∂L/∂θ_policy = [∂r/∂a + γ * ∂V/∂z' * ∂dynamics/∂a] * ∂a/∂θ_policy
+#
+# This is structurally different from old Q-based approach where:
+#   ∂L/∂θ_policy = ∂Q(z,a)/∂a * ∂a/∂θ_policy
+#
+# The Q-network learns to approximate r + γV implicitly and can correct for
+# dynamics/reward model errors. With r+γV, policy gradients directly use the
+# learned dynamics/reward Jacobians, so model errors affect policy learning.
+#
+# Note: The gradient magnitudes to θ_policy are NOT affected by whether
+# dynamics/reward will be updated - backprop computes the same ∂L/∂θ_policy
+# regardless. But the gradient SIGNAL is different because it's computed
+# through different function approximators.
+# ============================================
+#
+# Goal: Compare UTD [4, 8] × policy_head_reduce [min, mean]
+# with settings matching choosemaxvalue6_highutd as closely as possible.
+
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Task (match 6d17a50)
+  task:
+    values:
+      - quadruped-walk
+
+  # ===== KEY SWEEP DIMENSIONS =====
+  # UTD ratio: fixed at 4
+  utd_ratio:
+    value: 4
+
+  # policy_head_reduce: fixed to min (pessimistic)
+  policy_head_reduce:
+    value: min
+
+  # value_dim_div: scale down V network hidden dim (mlp_dim // value_dim_div)
+  # 1 = full size (512), 4 = 128, 16 = 32
+  value_dim_div:
+    values: [1, 4, 16]
+
+  # multi_gamma_head: joint (matches 6d17a50 default)
+  multi_gamma_head:
+    value: joint
+
+  # ===== MATCH 6d17a50 SETTINGS =====
+  # Planner settings (exact match)
+  planner_head_reduce:
+    values: [max]
+  iterations:
+    value: 6
+  num_samples:
+    values: [1024]
+  num_elites:
+    values: [64]
+  num_pi_trajs:
+    values: [512]
+  horizon:
+    values: [3]
+  final_rho:
+    value: 0.125
+  min_std:
+    values: [0]
+  max_std:
+    values: [1]
+
+  # Noise settings (exact match)
+  train_act_std_coeff:
+    values: [0.0]
+  temperature:
+    values: [0.5]
+  policy_seed_noise_std:
+    values: [0]
+
+  # Hot buffer settings (exact match)
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # Dynamics/reward heads
+  planner_num_dynamics_heads:
+    values: [4]
+  planner_lambda_disagreement:
+    values: [0]
+
+  # SAC-style TD target (match 6d17a50)
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+
+  # Evaluation and planner settings
+  planner_policy_elites_first_iter_only:
+    values: [false]
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+
+  # ===== NEW SETTINGS (need explicit values) =====
+  # Disable ensemble LR scaling to match 6d17a50 (no scaling)
+  ensemble_lr_scaling:
+    value: false
+
+  # Use replay_true for initial imagination states (matches 6d17a50 implicitly)
+  imagine_initial_source:
+    value: replay_true
+
+  # ===== TRAINING SETTINGS =====
+  obs:
+    values: [state]
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+  buffer_update_interval:
+    values: [1]
+
+  # Repro and logging
+  seed:
+    values: [101, 202, 303, 404, 505, 606, 707, 808]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

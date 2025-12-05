@@ -1,0 +1,4 @@
+wandb: Creating sweep from: sweep_list/test/value_disagreement_exploration/sweep.yaml
+wandb: Creating sweep with ID: 2uc2arjl
+wandb: View sweep at: https://wandb.ai/thomasevers9/tdmpc2-tdmpc2/sweeps/2uc2arjl
+wandb: Run sweep agent with: wandb agent thomasevers9/tdmpc2-tdmpc2/2uc2arjl

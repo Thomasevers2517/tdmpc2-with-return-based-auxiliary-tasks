@@ -1,0 +1,139 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Test task
+  task:
+    value: quadruped-walk
+
+  # Fixed: 4 dynamics heads
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Sweep dimension: UTD ratio
+  utd_ratio:
+    values: [8, 16]
+
+  # Fixed: no LR scaling, no policy seed noise
+  ensemble_lr_scaling:
+    value: false
+  policy_seed_noise_std:
+    value: 0
+
+  # Fixed source settings - using replay_rollout for imagination
+  imagine_initial_source:
+    value: replay_rollout
+  aux_value_source:
+    value: replay_true
+  actor_source:
+    value: replay_rollout
+  ac_source:
+    value: imagine
+
+  # Fixed ensemble config
+  policy_head_reduce:
+    value: min
+  planner_head_reduce:
+    value: max
+  num_reward_heads:
+    value: 1
+  num_q:
+    value: 2
+
+  # Fixed settings
+  num_rollouts:
+    value: 4
+  latent_dim:
+    value: 512
+  enc_lr_scale:
+    value: 0.3
+
+  # Multi-gamma auxiliary heads (2 heads)
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_loss_weight:
+    value: 0.1
+  multi_gamma_head:
+    value: separate
+
+  # Training settings
+  tau:
+    value: 0.01
+  critic_type:
+    value: V
+  pi_rollout_horizon:
+    value: 1
+  train_act_std_coeff:
+    value: 0.0
+
+  # Planner settings
+  planner_lambda_disagreement:
+    value: 0
+  planner_policy_elites_first_iter_only:
+    value: false
+  temperature:
+    value: 0.5
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Hot buffer
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # Common training/eval settings
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+  log_freq:
+    value: 200
+
+  # 5 seeds
+  seed:
+    values: [101, 202, 303, 404, 505]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

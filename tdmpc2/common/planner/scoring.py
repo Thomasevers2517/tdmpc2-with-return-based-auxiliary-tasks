@@ -10,7 +10,7 @@ def compute_values(
     task=None,
     head_reduce: str = "mean",
     reward_head_mode: str = "all",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
@@ -20,6 +20,10 @@ def compute_values(
     
     Reduction is applied to both reward heads (R) and dynamics heads (H) using
     the same head_reduce mode (typically 'max' for optimistic planning).
+    
+    Value disagreement is computed as std across all (dynamics head × V head) 
+    combinations, capturing joint uncertainty from both sources. This is most
+    meaningful when planner_num_dynamics_heads > 1 and/or num_q > 1.
 
     Args:
         latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all dynamics heads.
@@ -31,12 +35,14 @@ def compute_values(
             During eval, use 'single' to match single dynamics head for fair comparison.
 
     Returns:
-        Tuple[Tensor[E], Tensor[E], Tensor[E]]: (values_unscaled, values_scaled,
-        values_std_across_heads).
+        Tuple[Tensor[E], Tensor[E], Tensor[E], Tensor[E]]: 
+            (values_unscaled, values_scaled, values_std_across_dynamics_heads, value_disagreement).
+            value_disagreement is std across all (H × Q) value estimates per candidate.
     """
     H, E, Tp1, L = latents_all.shape  # H=dynamics heads, E=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
     cfg = world_model.cfg
+    Q = cfg.num_q  # number of V ensemble heads
 
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :-1, :]                         # float32[H, E, T, L]
@@ -72,9 +78,24 @@ def compute_values(
     z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
     z_last_flat = z_last.contiguous().view(H * E, L)        # float32[H*E, L]
     
-    v_boot_flat = world_model.V(z_last_flat, task, return_type=head_reduce, target=True)
-    v_boot_flat = v_boot_flat.squeeze(-1).squeeze(-1)       # float32[H*E]
-    v_boot_he = v_boot_flat.view(H, E)                      # float32[H, E]
+    # Get V logits for ALL ensemble heads to compute value disagreement
+    v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=True)  # float32[Q, H*E, K]
+    v_all_qhe = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Q, H*E]
+    
+    # Reshape to [Q, H, E] then flatten to [Q*H, E] for disagreement computation
+    v_all_qhe = v_all_qhe.view(Q, H, E)  # float32[Q, H, E]
+    v_all_flat = v_all_qhe.view(Q * H, E)  # float32[Q*H, E]
+    
+    # Value disagreement: std across all Q*H estimates per candidate
+    value_disagreement = v_all_flat.std(dim=0, unbiased=False)  # float32[E]
+    
+    # Bootstrap value: reduce over Q (V heads) using head_reduce, keep H dimension
+    if head_reduce == "mean":
+        v_boot_he = v_all_qhe.mean(dim=0)  # float32[H, E]
+    elif head_reduce == "max":
+        v_boot_he = v_all_qhe.max(dim=0).values  # float32[H, E]
+    else:
+        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
 
     values_unscaled_he = returns_he + v_boot_he             # float32[H, E]
     values_scaled_he = values_unscaled_he * 1.0             # float32[H, E]
@@ -92,7 +113,7 @@ def compute_values(
     else:
         raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
 
-    return values_unscaled, values_scaled, values_std
+    return values_unscaled, values_scaled, values_std, value_disagreement
 
 
 def compute_disagreement(final_latents_all: torch.Tensor) -> torch.Tensor:
@@ -108,17 +129,34 @@ def compute_disagreement(final_latents_all: torch.Tensor) -> torch.Tensor:
     return var.mean(dim=1)                             # float32[E]
 
 
-def combine_scores(values_scaled: torch.Tensor, disagreements: Optional[torch.Tensor], lambda_coeff: float) -> torch.Tensor:
-    """Combine scaled values and (optional) disagreement into final score.
+def combine_scores(
+    values_scaled: torch.Tensor,
+    latent_disagreement: Optional[torch.Tensor],
+    value_disagreement: Optional[torch.Tensor],
+    lambda_latent: float,
+    lambda_value: float,
+) -> torch.Tensor:
+    """Combine scaled values with optional disagreement signals into final score.
+    
+    score = values_scaled + lambda_latent * latent_disagreement + lambda_value * value_disagreement
+    
+    Latent disagreement captures uncertainty from dynamics model (different predicted 
+    latent states). Value disagreement captures uncertainty from value estimates across 
+    all dynamics×V head combinations.
 
     Args:
         values_scaled (Tensor[E]): Scaled values.
-        disagreements (Tensor[E] or None): Disagreement signal.
-        lambda_coeff (float): Weight for disagreement term.
+        latent_disagreement (Tensor[E] or None): Latent disagreement signal (variance of latents).
+        value_disagreement (Tensor[E] or None): Value disagreement signal (std of V estimates).
+        lambda_latent (float): Weight for latent disagreement term.
+        lambda_value (float): Weight for value disagreement term.
 
     Returns:
         Tensor[E]: Combined scores.
     """
-    if disagreements is None or lambda_coeff == 0.0:
-        return values_scaled  # float32[E]
-    return values_scaled + lambda_coeff * disagreements  # float32[E]
+    score = values_scaled  # float32[E]
+    if latent_disagreement is not None and lambda_latent != 0.0:
+        score = score + lambda_latent * latent_disagreement
+    if value_disagreement is not None and lambda_value != 0.0:
+        score = score + lambda_value * value_disagreement
+    return score

@@ -1,0 +1,25 @@
+# Sweep: Value disagreement exploration bonus with varying ensemble sizes
+# Purpose: Test how num_q (V-heads) and planner_num_dynamics_heads interact
+#          with the value disagreement exploration term.
+# Grid: num_q ∈ {2,4} × dynamics_heads ∈ {2,4} × lambda_value ∈ {0,1,3}
+# Total: 2 × 2 × 3 = 12 runs
+
+# num_q=2, dynamics_heads=2
+num_q=2 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=0
+num_q=2 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=1
+num_q=2 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=3
+
+# num_q=2, dynamics_heads=4
+num_q=2 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=0
+num_q=2 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=1
+num_q=2 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=3
+
+# num_q=4, dynamics_heads=2
+num_q=4 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=0
+num_q=4 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=1
+num_q=4 planner_num_dynamics_heads=2 planner_lambda_value_disagreement=3
+
+# num_q=4, dynamics_heads=4
+num_q=4 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=0
+num_q=4 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=1
+num_q=4 planner_num_dynamics_heads=4 planner_lambda_value_disagreement=3

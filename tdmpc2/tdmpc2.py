@@ -124,14 +124,10 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else [], 'lr': self.cfg.lr}
 		]
 		if num_aux_heads > 0:
-			# Deprecation check: joint aux heads are no longer supported
-			if getattr(self.cfg, 'multi_gamma_head', 'separate') == 'joint':
-				raise ValueError(
-					"multi_gamma_head='joint' is deprecated. Use 'separate' instead. "
-					"Joint aux heads are no longer supported."
-				)
-			# Append auxiliary head params (separate heads only)
-			if self.model._aux_separate_Vs is not None:
+			# Append auxiliary head params (joint or separate)
+			if getattr(self.model, '_aux_joint_Vs', None) is not None:
+				param_groups.append({'params': self.model._aux_joint_Vs.parameters(), 'lr': lr_aux_value})
+			elif getattr(self.model, '_aux_separate_Vs', None) is not None:
 				for head in self.model._aux_separate_Vs:
 					param_groups.append({'params': head.parameters(), 'lr': lr_aux_value})
 		
@@ -152,7 +148,9 @@ class TDMPC2(torch.nn.Module):
 				log.info('  aux_value:  %.6f (base_lr, no scaling)', lr_aux_value)
 		
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
-		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=self.cfg.lr, eps=1e-5, capturable=True)
+		lr_pi = self.cfg.lr * getattr(self.cfg, 'pi_lr_scale', 1.0)
+		log.info('  policy:     %.6f (base_lr * pi_lr_scale = %.4f * %.2f)', lr_pi, self.cfg.lr, getattr(self.cfg, 'pi_lr_scale', 1.0))
+		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=lr_pi, eps=1e-5, capturable=True)
 		self.model.eval()
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
@@ -544,7 +542,7 @@ class TDMPC2(torch.nn.Module):
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		For multi-head inputs, computes per-head TD targets then takes min over heads
 		for pessimistic value estimation. First reduces over reward heads (R), then
-		over dynamics heads (H).
+		over a random subset of dynamics heads (td_num_dynamics_heads).
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -553,7 +551,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across all heads).
+			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across sampled heads).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -575,12 +573,21 @@ class TDMPC2(torch.nn.Module):
 		# Per-head TD targets: r + γ * (1 - done) * V(s')
 		td_per_head = reward_pessimistic + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
 		
-		# Compute std across dynamics heads before final reduction
+		# Compute std across ALL dynamics heads before subsampling (for logging)
 		td_std_across_heads = td_per_head.std(dim=1, unbiased=False).squeeze(-1)  # float32[T, B]
 		td_std_across_heads = td_std_across_heads.unsqueeze(-1)  # float32[T, B, 1]
 		
-		# Pessimistic aggregation: min over dynamics heads
-		td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
+		# Randomly sample td_num_dynamics_heads for pessimistic aggregation
+		# This reduces over-pessimism when H is large
+		td_heads = int(self.cfg.td_num_dynamics_heads)
+		if td_heads <= 0 or td_heads >= H:
+			# Use all heads
+			td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
+		else:
+			# Randomly sample td_heads indices from [0, H)
+			idx = torch.randperm(H, device=next_z.device)[:td_heads]  # int64[td_heads]
+			td_sampled = td_per_head[:, idx, :, :]  # float32[T, td_heads, B, 1]
+			td_targets = td_sampled.min(dim=1).values  # float32[T, B, 1]
 		
 		return td_targets, td_std_across_heads 
   
@@ -633,8 +640,17 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Pessimistic aggregation: min over dynamics heads (dim=2)
-		td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
+		# Randomly sample td_num_dynamics_heads for pessimistic aggregation
+		# This reduces over-pessimism when H is large
+		td_heads = int(self.cfg.td_num_dynamics_heads)
+		if td_heads <= 0 or td_heads >= H:
+			# Use all heads
+			td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
+		else:
+			# Randomly sample td_heads indices from [0, H) - same indices for all gammas
+			idx = torch.randperm(H, device=next_z.device)[:td_heads]  # int64[td_heads]
+			td_sampled = td_per_head[:, :, idx, :, :]  # float32[G_aux, T, td_heads, B, 1]
+			td_targets_aux = td_sampled.min(dim=2).values  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 

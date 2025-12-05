@@ -1,0 +1,142 @@
+# Sweep: Value disagreement exploration with reduced TD pessimism
+#
+# Hypothesis: Current code may be too pessimistic by taking min over many heads.
+# The original good sweep (6d17a50) used Q-values with only 2 heads for TD targets.
+# Now we take min over H dynamics heads × Q V-heads, which compounds pessimism.
+#
+# This sweep tests:
+# 1. num_q ∈ {1, 2}: Reduce V-head pessimism (original TDMPC2 used 2)
+# 2. planner_num_dynamics_heads ∈ {2, 4}: Control dynamics head count
+# 3. planner_lambda_value_disagreement ∈ {0, 1, 3}: Add optimism via value disagreement
+#
+# Grid: 2 × 2 × 3 = 12 configurations × 4 seeds = 48 runs
+
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Task
+  task:
+    values:
+      - quadruped-walk
+
+  # ===== KEY SWEEP DIMENSIONS =====
+  # V-head ensemble size: 1 or 2 (reduce TD pessimism)
+  num_q:
+    values: [1, 2]
+
+  # Dynamics heads: fixed at 2
+  planner_num_dynamics_heads:
+    values: [ 2, 4 ]
+
+  # Value disagreement exploration bonus
+  planner_lambda_value_disagreement:
+    values: [0, 1, 3]
+
+  # ===== FIXED SETTINGS (match 6d17a50 / choosemaxvalue6_highutd) =====
+  # UTD ratio
+  utd_ratio:
+    value: 4
+
+  # Planner settings
+  planner_head_reduce:
+    value: max
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Noise settings
+  train_act_std_coeff:
+    value: 0.0
+  temperature:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+
+  # Hot buffer settings
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # Latent disagreement (disabled - testing value disagreement instead)
+  planner_lambda_disagreement:
+    value: 0
+
+  # TD/SAC settings
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+
+  # Planner behavior
+  planner_policy_elites_first_iter_only:
+    value: false
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+
+  # Multi-gamma heads: separate (not joint)
+  multi_gamma_head:
+    value: separate
+
+  # Disable ensemble LR scaling (match 6d17a50 behavior)
+  ensemble_lr_scaling:
+    value: false
+
+  # Use true encoded latents for imagination (match 6d17a50)
+  imagine_initial_source:
+    value: replay_true
+
+  # ===== TRAINING SETTINGS =====
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+  buffer_update_interval:
+    value: 1
+
+  # Repro and logging
+  seed:
+    values: [101, 202, 303, 404, 505]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

@@ -65,7 +65,8 @@ class Planner(torch.nn.Module):
 
         temp = float(self.cfg.temperature)
 
-        lambda_d = 0.0 if eval_mode else self.cfg.planner_lambda_disagreement
+        lambda_latent = 0.0 if eval_mode else float(self.cfg.planner_lambda_disagreement)
+        lambda_value = 0.0 if eval_mode else float(self.cfg.planner_lambda_value_disagreement)
         # Std bounds: prefer std_min/std_max; fallback to legacy min_std/max_std
 
 
@@ -90,7 +91,7 @@ class Planner(torch.nn.Module):
             # Squeeze singleton batch dim: latents [H,1,S,T+1,L] -> [H,S,T+1,L], actions [1,S,T,A] -> [S,T,A]
             latents_p = latents_p[:, 0]
             actions_p = actions_p[0]
-            vals_unscaled_p, vals_scaled_p, vals_std_p = compute_values(
+            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p = compute_values(
                 latents_p,
                 actions_p,
                 self.world_model,
@@ -98,32 +99,36 @@ class Planner(torch.nn.Module):
                 head_reduce=self.cfg.planner_head_reduce,
                 reward_head_mode=head_mode,
             )
-            dis_p = None
+            latent_dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
                 final_policy = latents_p[:, :, -1, :]
-                dis_p = compute_disagreement(final_policy)
-            scores_p = combine_scores(vals_scaled_p, dis_p, lambda_d)
-            weighted_dis_p = (lambda_d * dis_p) if dis_p is not None else None
+                latent_dis_p = compute_disagreement(final_policy)
+            scores_p = combine_scores(vals_scaled_p, latent_dis_p, val_dis_p, lambda_latent, lambda_value)
+            weighted_latent_dis_p = (lambda_latent * latent_dis_p) if latent_dis_p is not None else None
+            weighted_val_dis_p = (lambda_value * val_dis_p) if val_dis_p is not None else None
             policy_cache = dict(
                 latents=latents_p,
                 actions=actions_p,
                 vals_unscaled=vals_unscaled_p,
                 vals_scaled=vals_scaled_p,
                 vals_std=vals_std_p,
-                disagreement=dis_p,
-                weighted_dis=weighted_dis_p,
+                latent_disagreement=latent_dis_p,
+                value_disagreement=val_dis_p,
+                weighted_latent_dis=weighted_latent_dis_p,
+                weighted_val_dis=weighted_val_dis_p,
                 scores=scores_p,
             )
 
         # Containers for per-iteration histories (for advanced logging)
         # actions_hist: float32[I, E, T, A]; E varies only after concat (policy + sampled)
         # latents_hist: float32[I, H_used, E, T+1, L]
-        # values_unscaled_hist / values_scaled_hist / disagreement_hist / scores_hist: float32[I, E]
+        # values_unscaled_hist / values_scaled_hist / latent_disagreement_hist / value_disagreement_hist / scores_hist: float32[I, E]
         actions_hist = []
         latents_hist = []
         values_unscaled_hist = []
         values_scaled_hist = []
-        disagreement_hist = []  # may remain empty if not computed
+        latent_disagreement_hist = []  # may remain empty if not computed
+        value_disagreement_hist = []
         scores_hist = []
 
         # Iterative refinement
@@ -139,7 +144,7 @@ class Planner(torch.nn.Module):
             actions_s = actions_s[0]
 
             # Values for sampled trajectories using configured head mode and reduction.
-            vals_unscaled_s, vals_scaled_s, vals_std_s = compute_values(
+            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s = compute_values(
                 latents_s,
                 actions_s,
                 self.world_model,
@@ -147,13 +152,14 @@ class Planner(torch.nn.Module):
                 head_reduce=self.cfg.planner_head_reduce,
                 reward_head_mode=head_mode,
             )
-            dis_s = None
+            latent_dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:
                 # Multiple dynamics heads are present; measure disagreement at final latent state.
                 final_s = latents_s[:, :, -1, :]
-                dis_s = compute_disagreement(final_s)
-            scores_s = combine_scores(vals_scaled_s, dis_s, lambda_d)
-            weighted_dis_s = (lambda_d * dis_s) if dis_s is not None else None
+                latent_dis_s = compute_disagreement(final_s)
+            scores_s = combine_scores(vals_scaled_s, latent_dis_s, val_dis_s, lambda_latent, lambda_value)
+            weighted_latent_dis_s = (lambda_latent * latent_dis_s) if latent_dis_s is not None else None
+            weighted_val_dis_s = (lambda_value * val_dis_s) if val_dis_s is not None else None
 
             include_policy = (
                 (policy_cache is not None) and
@@ -165,26 +171,43 @@ class Planner(torch.nn.Module):
                 actions_cat = torch.cat([policy_cache['actions'], actions_s], dim=0)
                 vals_unscaled = torch.cat([policy_cache['vals_unscaled'], vals_unscaled_s], dim=0)
                 vals_scaled = torch.cat([policy_cache['vals_scaled'], vals_scaled_s], dim=0)
-                if policy_cache['disagreement'] is not None and dis_s is not None:
-                    dis = torch.cat([policy_cache['disagreement'], dis_s], dim=0)
-                elif policy_cache['disagreement'] is not None:
-                    dis = policy_cache['disagreement']
+                # Latent disagreement concatenation
+                if policy_cache['latent_disagreement'] is not None and latent_dis_s is not None:
+                    latent_dis = torch.cat([policy_cache['latent_disagreement'], latent_dis_s], dim=0)
+                elif policy_cache['latent_disagreement'] is not None:
+                    latent_dis = policy_cache['latent_disagreement']
                 else:
-                    dis = dis_s
-                if policy_cache['weighted_dis'] is not None and weighted_dis_s is not None:
-                    weighted_dis_all = torch.cat([policy_cache['weighted_dis'], weighted_dis_s], dim=0)
-                elif policy_cache['weighted_dis'] is not None:
-                    weighted_dis_all = policy_cache['weighted_dis']
+                    latent_dis = latent_dis_s
+                # Value disagreement concatenation
+                if policy_cache['value_disagreement'] is not None and val_dis_s is not None:
+                    val_dis = torch.cat([policy_cache['value_disagreement'], val_dis_s], dim=0)
+                elif policy_cache['value_disagreement'] is not None:
+                    val_dis = policy_cache['value_disagreement']
                 else:
-                    weighted_dis_all = weighted_dis_s
+                    val_dis = val_dis_s
+                # Weighted disagreement concatenation
+                if policy_cache['weighted_latent_dis'] is not None and weighted_latent_dis_s is not None:
+                    weighted_latent_dis_all = torch.cat([policy_cache['weighted_latent_dis'], weighted_latent_dis_s], dim=0)
+                elif policy_cache['weighted_latent_dis'] is not None:
+                    weighted_latent_dis_all = policy_cache['weighted_latent_dis']
+                else:
+                    weighted_latent_dis_all = weighted_latent_dis_s
+                if policy_cache['weighted_val_dis'] is not None and weighted_val_dis_s is not None:
+                    weighted_val_dis_all = torch.cat([policy_cache['weighted_val_dis'], weighted_val_dis_s], dim=0)
+                elif policy_cache['weighted_val_dis'] is not None:
+                    weighted_val_dis_all = policy_cache['weighted_val_dis']
+                else:
+                    weighted_val_dis_all = weighted_val_dis_s
                 scores = torch.cat([policy_cache['scores'], scores_s], dim=0)
             else:
                 latents_cat = latents_s
                 actions_cat = actions_s
                 vals_unscaled = vals_unscaled_s
                 vals_scaled = vals_scaled_s
-                dis = dis_s
-                weighted_dis_all = weighted_dis_s
+                latent_dis = latent_dis_s
+                val_dis = val_dis_s
+                weighted_latent_dis_all = weighted_latent_dis_s
+                weighted_val_dis_all = weighted_val_dis_s
                 scores = scores_s
 
             elite_scores, elite_indices = torch.topk(scores, K, largest=True, sorted=True)
@@ -201,8 +224,10 @@ class Planner(torch.nn.Module):
             values_unscaled_hist.append(vals_unscaled.detach())# [E]
             values_scaled_hist.append(vals_scaled.detach())    # [E]
             scores_hist.append(scores.detach())                # [E]
-            if dis is not None:
-                disagreement_hist.append(dis.detach())         # [E]
+            if latent_dis is not None:
+                latent_disagreement_hist.append(latent_dis.detach())  # [E]
+            if val_dis is not None:
+                value_disagreement_hist.append(val_dis.detach())      # [E]
 
         # Final selection
         if eval_mode:
@@ -229,34 +254,52 @@ class Planner(torch.nn.Module):
         value_elite_std = elite_scores.std(unbiased=False) if K > 1 else elite_scores.new_zeros(())
         value_elite_max = elite_scores.max()
 
-        disagreement_chosen = None
-        disagreement_elite_mean = None
-        disagreement_elite_std = None
-        disagreement_elite_max = None
-        if dis is not None:
-            # Tensor-safe selections and stats
-            disagreement_chosen = dis.index_select(0, chosen_idx).squeeze(0)
-            elite_dis = dis.index_select(0, elite_indices)
-            disagreement_elite_mean = elite_dis.mean()
-            disagreement_elite_std = elite_dis.std(unbiased=False) if K > 1 else elite_dis.new_zeros(())
-            disagreement_elite_max = elite_dis.max()
+        # Latent disagreement stats
+        latent_disagreement_chosen = None
+        latent_disagreement_elite_mean = None
+        latent_disagreement_elite_std = None
+        latent_disagreement_elite_max = None
+        if latent_dis is not None:
+            latent_disagreement_chosen = latent_dis.index_select(0, chosen_idx).squeeze(0)
+            elite_latent_dis = latent_dis.index_select(0, elite_indices)
+            latent_disagreement_elite_mean = elite_latent_dis.mean()
+            latent_disagreement_elite_std = elite_latent_dis.std(unbiased=False) if K > 1 else elite_latent_dis.new_zeros(())
+            latent_disagreement_elite_max = elite_latent_dis.max()
+
+        # Value disagreement stats
+        value_disagreement_chosen = None
+        value_disagreement_elite_mean = None
+        value_disagreement_elite_std = None
+        value_disagreement_elite_max = None
+        if val_dis is not None:
+            value_disagreement_chosen = val_dis.index_select(0, chosen_idx).squeeze(0)
+            elite_val_dis = val_dis.index_select(0, elite_indices)
+            value_disagreement_elite_mean = elite_val_dis.mean()
+            value_disagreement_elite_std = elite_val_dis.std(unbiased=False) if K > 1 else elite_val_dis.new_zeros(())
+            value_disagreement_elite_max = elite_val_dis.max()
 
         info_basic = PlannerBasicInfo(
             value_chosen=vals_scaled.index_select(0, chosen_idx).squeeze(0),
-            disagreement_chosen=disagreement_chosen,
+            latent_disagreement_chosen=latent_disagreement_chosen,
+            value_disagreement_chosen=value_disagreement_chosen,
             score_chosen=scores.index_select(0, chosen_idx).squeeze(0),
-            weighted_disagreement_chosen=(weighted_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_dis_all is not None else None,
+            weighted_latent_disagreement_chosen=(weighted_latent_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_latent_dis_all is not None else None,
+            weighted_value_disagreement_chosen=(weighted_val_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_val_dis_all is not None else None,
             value_elite_mean=value_elite_mean,
             value_elite_std=value_elite_std,
             value_elite_max=value_elite_max,
-            disagreement_elite_mean=disagreement_elite_mean,
-            disagreement_elite_std=disagreement_elite_std,
-            disagreement_elite_max=disagreement_elite_max,
+            latent_disagreement_elite_mean=latent_disagreement_elite_mean,
+            latent_disagreement_elite_std=latent_disagreement_elite_std,
+            latent_disagreement_elite_max=latent_disagreement_elite_max,
+            value_disagreement_elite_mean=value_disagreement_elite_mean,
+            value_disagreement_elite_std=value_disagreement_elite_std,
+            value_disagreement_elite_max=value_disagreement_elite_max,
             num_elites=K,
             elite_indices=elite_indices.to(torch.long),
             scores_all=scores,
             values_scaled_all=vals_scaled,
-            weighted_disagreements_all=weighted_dis_all,
+            weighted_latent_disagreements_all=weighted_latent_dis_all,
+            weighted_value_disagreements_all=weighted_val_dis_all,
         )
 
 
@@ -269,7 +312,8 @@ class Planner(torch.nn.Module):
             values_all_unscaled = torch.stack(values_unscaled_hist, dim=0)  # [I,E]
             values_all_scaled = torch.stack(values_scaled_hist, dim=0)      # [I,E]
             raw_scores = torch.stack(scores_hist, dim=0)                  # [I,E]
-            disagreements_all = torch.stack(disagreement_hist, dim=0) if len(disagreement_hist) > 0 else None  # [I,E]
+            latent_disagreements_all = torch.stack(latent_disagreement_hist, dim=0) if len(latent_disagreement_hist) > 0 else None  # [I,E]
+            value_disagreements_all = torch.stack(value_disagreement_hist, dim=0) if len(value_disagreement_hist) > 0 else None  # [I,E]
 
             # Build advanced info (includes context for post-noise analysis)
             info_adv = PlannerAdvancedInfo(
@@ -278,7 +322,8 @@ class Planner(torch.nn.Module):
                 latents_all=latents_all,
                 values_all_unscaled=values_all_unscaled,
                 values_all_scaled=values_all_scaled,
-                disagreements_all=disagreements_all,
+                latent_disagreements_all=latent_disagreements_all,
+                value_disagreements_all=value_disagreements_all,
                 raw_scores=raw_scores,
                 # Context for analysis
                 action_seq_chosen=chosen_seq.detach(),
@@ -286,7 +331,8 @@ class Planner(torch.nn.Module):
                 std_first_action=std_first.detach(),
                 z0=z0.detach() if z0.dim() == 1 else z0.squeeze(0).detach(),
                 task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
-                lambda_d=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
+                lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
+                lambda_value=float(self.cfg.planner_lambda_value_disagreement) if not eval_mode else 0.0,
                 head_mode=('single' if eval_mode else 'all'),
                 T=T,
             )
