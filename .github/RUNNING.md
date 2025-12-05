@@ -51,6 +51,8 @@ python utils/create_sweep.py sweep_list/test/YOUR_SWEEP_NAME --wandb-project tdm
 
 This reads `sweep.yaml` from the sweep folder, creates a W&B sweep, and writes the sweep ID to `id.txt` and project to `project.txt` in that folder.
 
+**Note:** Always use `--wandb-project tdmpc2-tdmpc2` for consistency.
+
 ### 2. Submit to SLURM
 
 ```bash

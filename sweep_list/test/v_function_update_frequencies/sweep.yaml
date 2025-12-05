@@ -1,0 +1,168 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  # Tasks - single task for focused comparison
+  task:
+    values:
+      - quadruped-walk
+
+  # V-heads: 2 for pessimism
+  num_q:
+    value: 2
+  
+  td_num_dynamics_heads:
+    value: 2  # Take min over 2 dynamics heads for TD
+  
+  planner_num_dynamics_heads:
+    value: 4  # Keep 4 for planning optimism
+
+  # Policy uses mean over heads
+  policy_head_reduce:
+    value: mean
+
+  # Planner settings from good sweep
+  planner_head_reduce:
+    value: max
+  train_act_std_coeff:
+    value: 0.0
+  temperature:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+  planner_policy_elites_first_iter_only:
+    value: false
+  planner_lambda_disagreement:
+    value: 0
+  planner_lambda_value_disagreement:
+    values: [0, 1]
+
+  # Planning params from good sweep
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Hot buffer from good sweep
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # TD settings
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+
+  # UTD from good sweep
+  utd_ratio:
+    value: 4
+
+  buffer_update_interval:
+    value: 1
+
+  # Common training/eval settings
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  #############################################
+  # KEY SWEEP: Relative Update Frequencies
+  # Goal: Fast initial learning + stable performance
+  # Hypothesis: "Model leads, policy/value follow"
+  #############################################
+
+  # Policy update frequency (per env step)
+  # 0.25 = 1 policy update every 4 env steps
+  # 1.0 = 1 policy update per env step (= UTD gradient updates)
+  pi_update_freq:
+    values: [0.25, 1.0]
+
+  # Value update frequency (per env step)
+  value_update_freq:
+    values: [1, -1]
+
+  # Target network update rate
+  tau:
+    values: [0.01, 0.003]
+
+  # Fixed: Policy LR scale
+  pi_lr_scale:
+    value: 1.0
+
+  # Fixed: Entropy schedule
+  start_entropy_coeff:
+    value: 1e-4
+  end_entropy_coeff:
+    value: 1e-5
+
+  # Fixed: Auxiliary V-function settings (critical for performance)
+  aux_value_source:
+    value: imagine
+  multi_gamma_loss_weight:
+    value: 0.01
+
+  # Fixed: Encoder detach ratio
+  detach_encoder_ratio:
+    value: 0.5
+
+  #############################################
+
+  # Seeds - 6 for statistical significance
+  seed:
+    values: [101, 202, 303, 404, 505, 606]
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
+
+  # Auxiliary multi-gamma settings
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_head:
+    value: joint
+  auxiliary_value_ema:
+    value: true

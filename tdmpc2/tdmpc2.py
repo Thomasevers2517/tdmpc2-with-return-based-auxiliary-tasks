@@ -1176,7 +1176,12 @@ class TDMPC2(torch.nn.Module):
 
 		return loss_mean, info
 
-	def _compute_loss_components(self, obs, action, reward, terminated, task, ac_only, log_grads, detach_encoder_active):
+	def _compute_loss_components(self, obs, action, reward, terminated, task, update_value, log_grads, detach_encoder_active):
+		"""Compute world model, value, and auxiliary value losses.
+		
+		Args:
+			update_value: If False, skip value/aux losses (zero tensors) but still compute WM losses.
+		"""
 		device = self.device
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
@@ -1200,15 +1205,10 @@ class TDMPC2(torch.nn.Module):
 				latents_flat = latents_flat.detach()
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])  # float32[steps,batch,L]
 
-		if not ac_only:
-			z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
-			z_target = encode_obs(obs, use_ema=True, grad_enabled=False) if self.cfg.encoder_ema_enabled else None
-			wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
-		else:
-			z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
-			z_rollout = self.rollout_dynamics(z_start=z_true[0], action=action, task=task).detach()
-			wm_loss = torch.zeros((), device=device)
-			wm_info = TensorDict({}, device=device)
+		# Always compute WM losses (world model updates every step)
+		z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
+		z_target = encode_obs(obs, use_ema=True, grad_enabled=False) if self.cfg.encoder_ema_enabled else None
+		wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
 
 		source_cache = {}
 
@@ -1249,13 +1249,14 @@ class TDMPC2(torch.nn.Module):
 				# 'replay_rollout': use dynamics rollout latents from head 0 (exposes value to OOD states)
 				imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
 				if imagine_source == 'replay_true':
-					start_z = z_true.detach() if ac_only else z_true
+					# Detach if not updating value (no gradients needed for value loss)
+					start_z = z_true.detach() if not update_value else z_true
 				elif imagine_source == 'replay_rollout':
 					# Use rollout latents from head 0 (same shape as z_true: [T+1, B, L])
 					# Partial detach: keep z_rollout[0] attached so value gradients flow to encoder,
 					# but detach z_rollout[1:] to block gradients to dynamics head.
 					# Must be contiguous for view() in imagined_rollout.
-					if ac_only:
+					if not update_value:
 						start_z = z_rollout.detach().contiguous()
 					else:
 						start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
@@ -1268,7 +1269,7 @@ class TDMPC2(torch.nn.Module):
 					'actions': imagined['actions'],  # float32[T, 1, B, A] (shared across heads)
 					'rewards': imagined['rewards'],  # float32[T, R, H, B, 1]
 					'terminated': imagined['terminated'],  # float32[T, H, B, 1]
-					'full_detach': ac_only or self.cfg.detach_imagine_value,
+					'full_detach': (not update_value) or self.cfg.detach_imagine_value,
 					'z_td': None,
 				}
 			else:
@@ -1276,33 +1277,39 @@ class TDMPC2(torch.nn.Module):
 			source_cache[name] = src
 			return src
 
-		value_inputs = fetch_source(self.cfg.ac_source)
-		
-
-		value_loss, value_info = self.calculate_value_loss(
-			value_inputs['z_seq'],
-			value_inputs['actions'],
-			value_inputs['rewards'],
-			value_inputs['terminated'],
-			value_inputs['full_detach'],
-			z_td=value_inputs['z_td'],
-			task=task,
-		)
-
-		aux_loss = torch.zeros((), device=device)
-		aux_info = TensorDict({}, device=device)
-		if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
-			aux_inputs = fetch_source(self.cfg.aux_value_source)
-
-			aux_loss, aux_info = self.calculate_aux_value_loss(
-				aux_inputs['z_seq'],
-				aux_inputs['actions'],
-				aux_inputs['rewards'],
-				aux_inputs['terminated'],
-				aux_inputs['full_detach'],
-				z_td=aux_inputs['z_td'],
+		# Only compute value losses if update_value is True
+		if update_value:
+			value_inputs = fetch_source(self.cfg.ac_source)
+			value_loss, value_info = self.calculate_value_loss(
+				value_inputs['z_seq'],
+				value_inputs['actions'],
+				value_inputs['rewards'],
+				value_inputs['terminated'],
+				value_inputs['full_detach'],
+				z_td=value_inputs['z_td'],
 				task=task,
 			)
+
+			aux_loss = torch.zeros((), device=device)
+			aux_info = TensorDict({}, device=device)
+			if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
+				aux_inputs = fetch_source(self.cfg.aux_value_source)
+				aux_loss, aux_info = self.calculate_aux_value_loss(
+					aux_inputs['z_seq'],
+					aux_inputs['actions'],
+					aux_inputs['rewards'],
+					aux_inputs['terminated'],
+					aux_inputs['full_detach'],
+					z_td=aux_inputs['z_td'],
+					task=task,
+				)
+		else:
+			# Skip value/aux losses when not updating value
+			value_inputs = {'z_seq': z_rollout.unsqueeze(1)}  # Minimal for actor_source fallback
+			value_loss = torch.zeros((), device=device)
+			value_info = TensorDict({}, device=device)
+			aux_loss = torch.zeros((), device=device)
+			aux_info = TensorDict({}, device=device)
 
 		info = TensorDict({}, device=device)
 		info.update(wm_info, non_blocking=True)
@@ -1333,16 +1340,21 @@ class TDMPC2(torch.nn.Module):
 
 		}
 
-	def _update(self, obs, action, reward, terminated, ac_only, task=None):
-		"""Single gradient update step over world model, critic, and policy."""
+	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, task=None):
+		"""Single gradient update step over world model, critic, and policy.
+		
+		Args:
+			update_value: If True, compute and apply value/aux losses. If False, skip value losses.
+			update_pi: If True, update policy. If False, skip policy update.
+		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
 			if log_grads:
-				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag)
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag)
 			else:
-				components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only, log_grads, self.detach_encoder_flag)
+				components = self._compute_loss_components(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag)
     
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
@@ -1367,37 +1379,45 @@ class TDMPC2(torch.nn.Module):
 
 			self.optim.zero_grad(set_to_none=True)
 
-			if self.cfg.actor_source == 'ac':
-				# value_inputs['z_seq'] is [T_imag+1, H, B_expanded, L] where:
-				#   T_imag = imagination_horizon (e.g., 1)
-				#   B_expanded = S * batch_size * num_rollouts (e.g., 2 * 256 * 4 = 2048)
-				# 
-				# Problem: Due to num_rollouts, the initial states (t=0) are duplicated
-				# num_rollouts times. Training on these duplicates is wasteful.
-				# Solution: Skip t=0 and train only on rolled-out states (t=1+).
-				# Trade-off: Policy never sees true encoded states, only 1-step imagined ones.
-				z_for_pi = value_inputs['z_seq'][1:, 0].detach()  # float32[T_imag, B_expanded, L]
-			elif self.cfg.actor_source == 'replay_rollout':
-				# z_rollout is [T+1, B, L] (no H dimension from world_model_losses)
-				z_for_pi = z_rollout.detach()
-			elif self.cfg.actor_source == 'replay_true':
-				# z_true is [T+1, B, L] (no H dimension from encoder)
-				z_for_pi = z_true.detach()
+			# Policy update (conditional on update_pi)
+			pi_grad_norm = torch.zeros((), device=self.device)
+			pi_info = TensorDict({}, device=self.device)
+			if update_pi:
+				if self.cfg.actor_source == 'ac':
+					# value_inputs['z_seq'] is [T_imag+1, H, B_expanded, L] where:
+					#   T_imag = imagination_horizon (e.g., 1)
+					#   B_expanded = S * batch_size * num_rollouts (e.g., 2 * 256 * 4 = 2048)
+					# 
+					# Problem: Due to num_rollouts, the initial states (t=0) are duplicated
+					# num_rollouts times. Training on these duplicates is wasteful.
+					# Solution: Skip t=0 and train only on rolled-out states (t=1+).
+					# Trade-off: Policy never sees true encoded states, only 1-step imagined ones.
+					z_for_pi = value_inputs['z_seq'][1:, 0].detach()  # float32[T_imag, B_expanded, L]
+				elif self.cfg.actor_source == 'replay_rollout':
+					# z_rollout is [T+1, B, L] (no H dimension from world_model_losses)
+					z_for_pi = z_rollout.detach()
+				elif self.cfg.actor_source == 'replay_true':
+					# z_true is [T+1, B, L] (no H dimension from encoder)
+					z_for_pi = z_true.detach()
     
-			pi_loss, pi_info = self.update_pi(z_for_pi, task)
-			pi_total = pi_loss * self.cfg.policy_coef
-			if log_grads:
-				info = self.probe_pi_gradients(pi_total, info)
-			pi_total.backward()
-			pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
-			if self.cfg.compile and log_grads:
-				self.pi_optim.step()
-			else:
-				self.pi_optim_step()
-			self.pi_optim.zero_grad(set_to_none=True)
+				pi_loss, pi_info = self.update_pi(z_for_pi, task)
+				pi_total = pi_loss * self.cfg.policy_coef
+				if log_grads:
+					info = self.probe_pi_gradients(pi_total, info)
+				pi_total.backward()
+				pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+				if self.cfg.compile and log_grads:
+					self.pi_optim.step()
+				else:
+					self.pi_optim_step()
+				self.pi_optim.zero_grad(set_to_none=True)
 
-			self.model.soft_update_target_V()
-			self.model.soft_update_policy_encoder_targets()
+			# Soft updates: only update targets when corresponding component is updated
+			if update_value:
+				self.model.soft_update_target_V()
+			if update_pi:
+				self.model.soft_update_policy_encoder_targets()
+
 			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
 				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
 			else:
@@ -1428,12 +1448,15 @@ class TDMPC2(torch.nn.Module):
 		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
 		return info.detach().mean()
   
-	def update(self, buffer, step=0, ac_only=False):
+	def update(self, buffer, step=0, update_value=True, update_pi=True):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
 		Args:
 			buffer (common.buffer.Buffer): Replay buffer.
+			step: Current training step.
+			update_value: If True, compute and apply value/aux losses.
+			update_pi: If True, update policy.
 
 		Returns:
 			dict: Dictionary of training statistics.
@@ -1442,7 +1465,8 @@ class TDMPC2(torch.nn.Module):
 			obs, action, reward, terminated, task = buffer.sample()
 
 		self._step = step
-		if (((self._step // self.cfg.ac_utd_multiplier) * self.cfg.ac_utd_multiplier) % self.cfg.log_detail_freq == 0) and not ac_only:
+		# Log detailed info when updating value and at log_detail_freq intervals
+		if (self._step % self.cfg.log_detail_freq == 0) and update_value:
 			self.log_detailed = True
 		else:
 			self.log_detailed = False
@@ -1457,15 +1481,8 @@ class TDMPC2(torch.nn.Module):
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
-		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
   
-		return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
-
-		# if log_grads:
-			
-		# 	return self._update_eager(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
-		# else:
-		# 	return self._update(obs, action, reward, terminated, ac_only=ac_only, **kwargs)
+		return self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, **kwargs)
 
 
 	@torch._dynamo.disable()
@@ -1589,7 +1606,7 @@ class TDMPC2(torch.nn.Module):
 				obs, action, reward, terminated, task = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
-					components = self._compute_loss_components(obs, action, reward, terminated, task, ac_only=False, log_grads=False, detach_encoder_active=False)
+					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False, detach_encoder_active=False)
 					val_info = components['info']
 
 					

@@ -147,18 +147,15 @@ class Buffer():
 			#  * Each env step adds one new transition (ignoring buffer_update_interval discretization)
 			#  * Item remains in hot buffer for ~hot_buffer_size steps (FIFO)
 			#  * At each update, probability a particular item is drawn ≈ hot_slices / hot_buffer_size
-			#  * Updates per env step: model = utd_ratio; actor-critic = utd_ratio * ac_utd_multiplier
+			#  * Updates per env step: utd_ratio
 			#  => Expected draws while item stays hot:
 			#     E_model ≈ hot_slices * utd_ratio
-			#     E_actor_critic ≈ hot_slices * utd_ratio * ac_utd_multiplier
 			p_update_hot = self._hot_slices / self._hot_size
 			updates_per_step_model = float(self.cfg.utd_ratio)
-			updates_per_step_ac = float(self.cfg.utd_ratio) * float(self.cfg.ac_utd_multiplier)
 			expected_model_hits = self._hot_slices * updates_per_step_model
-			expected_ac_hits = self._hot_slices * updates_per_step_ac
 			log.info(
-				"Hot buffer sampling (expected per new item while hot): p(update|hot)=%.4f, E_model≈%.2f, E_actor_critic≈%.2f",
-				p_update_hot, expected_model_hits, expected_ac_hits,
+				"Hot buffer sampling (expected per new item while hot): p(update|hot)=%.4f, E_model≈%.2f",
+				p_update_hot, expected_model_hits,
 			)
 		else:
 			self._hot_buffer = None

@@ -21,6 +21,15 @@ class OnlineTrainer(Trainer):
 		self._ep_rew = torch.tensor(0.0)
 		self._ep_len = 0
 		self._start_time = time()
+		
+		# Total gradient updates counter for frequency-based update control
+		self._total_updates = 0
+		
+		# Validate pi_update_freq
+		if self.cfg.pi_update_freq <= 0:
+			raise ValueError(f"pi_update_freq must be > 0, got {self.cfg.pi_update_freq}")
+		if self.cfg.value_update_freq <= 0 and self.cfg.value_update_freq != -1:
+			raise ValueError(f"value_update_freq must be > 0 or -1, got {self.cfg.value_update_freq}")
 
 		self.validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
 		self.recent_validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
@@ -176,17 +185,31 @@ class OnlineTrainer(Trainer):
 					log.info('Pretraining agent on seed data...')
 				else:
 					num_updates = self.cfg.utd_ratio
+				
 				for update_idx in range(num_updates):
-
-					for ac_idx in range(self.cfg.ac_utd_multiplier-1):
-						_train_metrics = self.agent.update(self.buffer, step=self._step, ac_only=True)
-						train_metrics.update(_train_metrics)
-						if self.cfg.debug:
-							log.info('update step=%d inner_ac=%d/%d (ac_only)', self._step, ac_idx+1, self.cfg.ac_utd_multiplier-1)
-					_train_metrics = self.agent.update(self.buffer, step=self._step, ac_only=False)
+					self._total_updates += 1
+					
+					# Value update: every step if -1, else check interval
+					if self.cfg.value_update_freq == -1:
+						update_value = True
+					else:
+						update_value = self._total_updates % (num_updates//self.cfg.value_update_freq) == 0
+					
+					# Policy update: pi_update_freq is ratio of updates per environment step
+					# 0.25 means 1 update every 4 env steps, 1.0 means 1 update per env step (= UTD updates)
+					if self.cfg.pi_update_freq >= 1.0:
+						update_pi = True  # Update every gradient step
+					else:
+						update_pi = self._total_updates % int(num_updates / self.cfg.pi_update_freq) == 0
+					
+					_train_metrics = self.agent.update(
+						self.buffer, step=self._step,
+						update_value=update_value, update_pi=update_pi
+					)
 					train_metrics.update(_train_metrics)
 					if self.cfg.debug:
-						log.info('update step=%d main_update=%d/%d', self._step, update_idx+1, num_updates)
+						log.info('update step=%d update_idx=%d/%d update_value=%s update_pi=%s',
+								 self._step, update_idx+1, num_updates, update_value, update_pi)
 
 
 			# Network reset removed per refactor; maintain steady training without periodic resets.
