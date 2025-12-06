@@ -108,7 +108,7 @@ parameters:
 
   # Encoder detachment
   detach_encoder_ratio:
-    value: 0
+    value: 0.5
 
   # Training/eval settings
   eval_mpc:
