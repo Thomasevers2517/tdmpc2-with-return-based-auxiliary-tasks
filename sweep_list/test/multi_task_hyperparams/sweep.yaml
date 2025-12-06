@@ -28,12 +28,12 @@ parameters:
 
   # Target network update rate (unified for main and aux values)
   tau:
-    values: [0.01, 0.001]
+    values: [0.003, 0.001]
 
   # Encoder detachment ratio
   # 0 = never detach, 0.5 = detach last 50% of training
   detach_encoder_ratio:
-    values: [0, 0.5]
+    values: [0]
 
   #############################################
   # FIXED PARAMETERS (from good sweep results)
