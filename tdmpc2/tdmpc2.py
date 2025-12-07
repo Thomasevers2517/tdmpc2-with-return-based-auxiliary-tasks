@@ -928,6 +928,7 @@ class TDMPC2(torch.nn.Module):
 				horizon=rollout_len,
 				num_rollouts=n_rollouts,
 				head_mode='all',
+				num_random_heads=int(self.cfg.td_num_dynamics_heads),
 				task=task,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
@@ -1506,14 +1507,16 @@ class TDMPC2(torch.nn.Module):
 		self.optim.zero_grad(set_to_none=True)
 
 		# Flatten all params once for grad calls and remember mapping
+		# Filter out frozen params (e.g., dynamics prior) that don't require grad
 		flat_params = []
 		index = []  # (group_name, param_obj) pairs
 		for gname, params in groups.items():
 			if gname == 'policy':  # skip policy here
 				continue
 			for p in params:
-				flat_params.append(p)
-				index.append((gname, p))
+				if p.requires_grad:
+					flat_params.append(p)
+					index.append((gname, p))
 
 		for lname, lval in loss_parts.items():
 			if (not torch.is_tensor(lval)) or (not lval.requires_grad):
@@ -1556,12 +1559,14 @@ class TDMPC2(torch.nn.Module):
 		groups = self._grad_param_groups()
 
 		# Flatten all params (including policy) and remember mapping
+		# Filter out frozen params (e.g., dynamics prior) that don't require grad
 		flat_params = []
 		index = []  # (group_name, param_obj) pairs
 		for gname, params in groups.items():
 			for p in params:
-				flat_params.append(p)
-				index.append((gname, p))
+				if p.requires_grad:
+					flat_params.append(p)
+					index.append((gname, p))
 
 		if (not torch.is_tensor(pi_total)) or (not pi_total.requires_grad):
 			return info

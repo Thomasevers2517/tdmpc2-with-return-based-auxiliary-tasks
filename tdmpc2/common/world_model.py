@@ -50,12 +50,19 @@ class WorldModel(nn.Module):
 		self._encoder = layers.enc(cfg)
 		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
 		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
+		# Prior network config for ensemble diversity
+		prior_enabled = cfg.dynamics_prior_enabled
+		prior_hidden_dim = cfg.dynamics_prior_hidden_dim
+		prior_scale = cfg.dynamics_prior_scale
 		self._dynamics_heads = nn.ModuleList([
-			layers.mlp(
-				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				2 * [cfg.mlp_dim],
-				cfg.latent_dim,
-				act=layers.SimNorm(cfg),
+			layers.DynamicsHeadWithPrior(
+				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+				mlp_dims=2 * [cfg.mlp_dim],
+				out_dim=cfg.latent_dim,
+				cfg=cfg,
+				prior_enabled=prior_enabled,
+				prior_hidden_dim=prior_hidden_dim,
+				prior_scale=prior_scale,
 			)
 			for _ in range(h_total)
 		])
@@ -590,7 +597,7 @@ class WorldModel(nn.Module):
 			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0):
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', num_random_heads: int = 1, task=None, policy_action_noise_std: float = 0.0):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
 
 		Args:
@@ -600,12 +607,15 @@ class WorldModel(nn.Module):
 			horizon (int, optional): Number of steps `T` when `use_policy=True`.
 			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
 			head_mode (str): 'single' | 'all' | 'random'.
+			num_random_heads (int): Number of heads to randomly sample when `head_mode='random'`.
+				Defaults to 1. If >= total heads, uses all heads. Ignored for other head_modes.
 			task: Optional task id for multitask.
 			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
 				when `use_policy=True`. Ignored when `use_policy=False`.
 
 		Returns:
 			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
+				H_sel is 1 for 'single', H_total for 'all', or min(num_random_heads, H_total) for 'random'.
 		"""
 		if use_policy:
 			if actions is not None:
@@ -638,9 +648,13 @@ class WorldModel(nn.Module):
 			H_sel = H_total
 			head_indices = list(range(H_total))
 		elif head_mode == 'random':
-			H_sel = 1
-			idx = int(torch.randint(low=0, high=H_total, size=(1,), device=z0.device))
-			head_indices = [idx]
+			# Sample num_random_heads from available heads; fall back to all if >= H_total
+			H_sel = min(num_random_heads, H_total)
+			if H_sel >= H_total:
+				head_indices = list(range(H_total))
+			else:
+				idx = torch.randperm(H_total, device=z0.device)[:H_sel]
+				head_indices = idx.tolist()
 		else:
 			raise ValueError(f'Unsupported head_mode: {head_mode}')
 

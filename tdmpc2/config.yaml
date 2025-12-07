@@ -46,7 +46,7 @@ planner_head_reduce: max
 # Aggregation over reward and dynamics heads when computing policy loss.
 # Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
 # it controls how reward/dynamics head predictions are reduced before policy optimization.
-policy_head_reduce: mean
+policy_head_reduce: min
 
 # Std of Gaussian noise added to policy actions when seeding the planner.
 # Applied only when use_policy=True in world_model.rollout_latents.
@@ -73,6 +73,12 @@ planner_num_dynamics_heads: 4
 # Set to 0 to use all planner_num_dynamics_heads.
 td_num_dynamics_heads: 2
 
+# Frozen random prior network for dynamics heads to encourage ensemble diversity.
+# The prior is added BEFORE SimNorm so the main network can learn to compensate.
+dynamics_prior_enabled: false      # If true, add frozen prior to each dynamics head
+dynamics_prior_hidden_dim: 32      # Hidden dimension for prior MLP (small for efficiency)
+dynamics_prior_scale: 1.0          # Scale factor for prior output (prior uses Tanh, so in [-1, 1])
+
 train_act_std_coeff: 0 # multiplier of the noise added to training env actions
 
 best_eval: true
@@ -91,7 +97,7 @@ pi_update_freq: 1.0  # ratio of policy updates per gradient step; 0.25 means eve
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
-aux_value_source: replay_true # replay_true | replay_rollout | imagine
+aux_value_source: imagine # replay_true | replay_rollout | imagine
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
@@ -117,7 +123,7 @@ enc_lr_scale: 0.3
 pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize training.
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
-tau: 0.01
+tau: 0.003
 policy_ema_enabled: false
 policy_ema_tau: 0.05
 encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB

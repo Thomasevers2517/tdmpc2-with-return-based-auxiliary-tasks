@@ -133,6 +133,86 @@ def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
 	return nn.Sequential(*mlp)
 
 
+class DynamicsHeadWithPrior(nn.Module):
+	"""
+	Dynamics head with an optional frozen random prior for ensemble diversity.
+
+	Combines a trainable main MLP with a frozen prior network. The prior output
+	is added BEFORE SimNorm, allowing the main network to learn to compensate.
+	This encourages diverse representations across ensemble members.
+
+	Args:
+		in_dim (int): Input dimension (latent_dim + action_dim + task_dim).
+		mlp_dims (list[int]): Hidden dimensions for the main MLP.
+		out_dim (int): Output dimension (latent_dim).
+		cfg: Config object with simnorm_dim and prior settings.
+		prior_enabled (bool): Whether to add the frozen prior network.
+		prior_hidden_dim (int): Hidden dimension for prior MLP.
+		prior_scale (float): Scale factor for prior output.
+		dropout (float): Dropout probability for first layer.
+	"""
+
+	def __init__(
+		self,
+		in_dim: int,
+		mlp_dims: list,
+		out_dim: int,
+		cfg,
+		prior_enabled: bool = False,
+		prior_hidden_dim: int = 32,
+		prior_scale: float = 1.0,
+		dropout: float = 0.,
+	):
+		super().__init__()
+		self.prior_enabled = prior_enabled
+		self.prior_scale = prior_scale
+
+		# Main trainable MLP (without final activation - SimNorm applied after sum)
+		self.main_mlp = mlp(in_dim, mlp_dims, out_dim, act=None, dropout=dropout)
+
+		# Frozen prior network: small MLP with Tanh to bound outputs to [-1, 1]
+		if prior_enabled:
+			self.prior_mlp = nn.Sequential(
+				nn.Linear(in_dim, prior_hidden_dim),
+				nn.ReLU(),
+				nn.Linear(prior_hidden_dim, prior_hidden_dim),
+				nn.ReLU(),
+				nn.Linear(prior_hidden_dim, out_dim),
+				nn.Tanh(),  # Bound to [-1, 1]
+			)
+			# Freeze prior parameters
+			for param in self.prior_mlp.parameters():
+				param.requires_grad = False
+		else:
+			self.prior_mlp = None
+
+		# SimNorm applied after summing main + prior
+		self.simnorm = SimNorm(cfg)
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		"""
+		Forward pass: main_mlp(x) + prior_scale * prior_mlp(x), then SimNorm.
+
+		Args:
+			x (Tensor[..., in_dim]): Input tensor.
+
+		Returns:
+			Tensor[..., out_dim]: Normalized dynamics prediction.
+		"""
+		out = self.main_mlp(x)  # float32[..., out_dim]
+
+		if self.prior_enabled and self.prior_mlp is not None:
+			# Prior output is in [-1, 1] due to Tanh, scaled by prior_scale
+			prior_out = self.prior_mlp(x)  # float32[..., out_dim]
+			out = out + self.prior_scale * prior_out
+
+		return self.simnorm(out)
+
+	def __repr__(self):
+		prior_info = f", prior_enabled={self.prior_enabled}, prior_scale={self.prior_scale}" if self.prior_enabled else ""
+		return f"DynamicsHeadWithPrior(main_mlp={self.main_mlp}{prior_info})"
+
+
 def conv(in_shape, num_channels, out_dim, act=None):
 	"""
 	Basic convolutional encoder for TD-MPC2 with raw image observations.
