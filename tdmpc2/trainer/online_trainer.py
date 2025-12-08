@@ -181,39 +181,41 @@ class OnlineTrainer(Trainer):
 			# Update agent
 			if self._step >= self.cfg.seed_steps:
 				if self._step == self.cfg.seed_steps:
-					num_updates = self.cfg.seed_steps
+					base_updates = self.cfg.seed_steps
 					log.info('Pretraining agent on seed data...')
 				else:
-					num_updates = self.cfg.utd_ratio
+					base_updates = self.cfg.utd_ratio
 				
-				for update_idx in range(num_updates):
+				# All frequencies are in units of "updates per environment step":
+				# - utd_ratio (base_updates): WM updates per env step
+				# - value_update_freq: value updates per env step (-1 means same as UTD)
+				# - pi_update_freq: policy updates per env step
+				wm_updates_per_step = base_updates
+				value_updates_per_step = base_updates if self.cfg.value_update_freq == -1 else self.cfg.value_update_freq
+				pi_updates_per_step = self.cfg.pi_update_freq
+				
+				# num_updates = max updates needed for any component
+				num_updates = int(max(wm_updates_per_step, value_updates_per_step, pi_updates_per_step))
+				
+				for _ in range(num_updates):
 					self._total_updates += 1
 					
-					# Value update: every step if -1, else check interval
-					if self.cfg.value_update_freq == -1:
-						update_value = True
-					else:
-						update_value = self._total_updates % (num_updates//self.cfg.value_update_freq) == 0
-					
-					# Policy update: pi_update_freq is ratio of updates per environment step
-					# 0.25 means 1 update every 4 env steps, 1.0 means 1 update per env step (= UTD updates)
-					if self.cfg.pi_update_freq >= 1.0:
-						update_pi = True  # Update every gradient step
-					else:
-						update_pi = self._total_updates % int(num_updates / self.cfg.pi_update_freq) == 0
+					# Each component updates when: total_updates % (num_updates / component_freq) == 0
+					# This ensures exactly component_freq updates per env step, evenly spaced.
+					update_world_model = (self._total_updates % int(num_updates / wm_updates_per_step) == 0)
+					update_value = (self._total_updates % int(num_updates / value_updates_per_step) == 0)
+					update_pi = (self._total_updates % int(num_updates / pi_updates_per_step) == 0)
 					
 					_train_metrics = self.agent.update(
 						self.buffer, step=self._step,
-						update_value=update_value, update_pi=update_pi
+						update_value=update_value, update_pi=update_pi,
+						update_world_model=update_world_model
 					)
 					train_metrics.update(_train_metrics)
 					if self.cfg.debug:
-						log.info('update step=%d update_idx=%d/%d update_value=%s update_pi=%s',
-								 self._step, update_idx+1, num_updates, update_value, update_pi)
-
-
-			# Network reset removed per refactor; maintain steady training without periodic resets.
-					
+						log.info('update step=%d total=%d wm=%s val=%s pi=%s',
+								 self._step, self._total_updates,
+								 update_world_model, update_value, update_pi)
 
 			self._step += 1
 

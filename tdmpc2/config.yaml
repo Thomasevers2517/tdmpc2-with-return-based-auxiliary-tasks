@@ -90,9 +90,9 @@ buffer_update_interval: 1  # number of env steps between buffer additions when n
 # per_alpha: 0 # 0 means uniform sampling, >0 means prioritized experience replay
 # per_priority: recency # recency | consistency
 
-utd_ratio: 4
-value_update_freq: -1  # -1 means same as WM (every gradient step), else update every N gradient steps
-pi_update_freq: 1.0  # ratio of policy updates per gradient step; 0.25 means every 4 steps, 1.0 means every step
+utd_ratio: 4  # World model updates per environment step
+value_update_freq: -1  # Value updates per env step. -1 means same as utd_ratio.
+pi_update_freq: 4  # Policy updates per env step.
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)

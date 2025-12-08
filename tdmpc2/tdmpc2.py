@@ -868,7 +868,7 @@ class TDMPC2(torch.nn.Module):
 			last_logits = torch.stack([logits[-1] for logits in termination_logits_cache]).mean(dim=0)
 			info.update(math.termination_statistics(torch.sigmoid(last_logits), terminated[-1]), non_blocking=True)
 
-		return wm_total, info, z_rollout
+		return wm_total, info, z_rollout, lat_all
 
 	# rollout_dynamics removed; world_model.rollout_latents handles vectorized rollouts
 
@@ -1177,11 +1177,20 @@ class TDMPC2(torch.nn.Module):
 
 		return loss_mean, info
 
-	def _compute_loss_components(self, obs, action, reward, terminated, task, update_value, log_grads, detach_encoder_active):
+	def _compute_loss_components(self, obs, action, reward, terminated, task, update_value, log_grads, detach_encoder_active, update_world_model=True):
 		"""Compute world model, value, and auxiliary value losses.
 		
 		Args:
-			update_value: If False, skip value/aux losses (zero tensors) but still compute WM losses.
+			obs: Observation sequence, float32[T+1, B, ...].
+			action: Action sequence, float32[T, B, A].
+			reward: Reward sequence, float32[T, B, 1].
+			terminated: Termination flags, float32[T, B, 1].
+			task: Task indices for multitask, or None.
+			update_value: If False, skip value/aux losses (return zeros).
+			log_grads: Whether to log gradient statistics.
+			detach_encoder_active: Whether to detach encoder outputs.
+			update_world_model: If False, skip WM losses (return zeros), set z_rollout=None,
+				and block encoder gradients from value loss.
 		"""
 		device = self.device
 
@@ -1206,10 +1215,19 @@ class TDMPC2(torch.nn.Module):
 				latents_flat = latents_flat.detach()
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])  # float32[steps,batch,L]
 
-		# Always compute WM losses (world model updates every step)
+		# Encode observations (needed for value computation even when not updating WM)
 		z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
 		z_target = encode_obs(obs, use_ema=True, grad_enabled=False) if self.cfg.encoder_ema_enabled else None
-		wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
+		
+		# Compute WM losses if updating world model, otherwise zero loss and skip rollout
+		if update_world_model:
+			wm_loss, wm_info, z_rollout, lat_all = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
+		else:
+			# Skip WM losses: no rollout available, empty info (don't log zeros)
+			wm_loss = torch.zeros((), device=device)
+			wm_info = TensorDict({}, device=device)  # Empty - don't log anything for WM
+			z_rollout = None  # No rollout available
+			lat_all = None  # No multi-head rollout available
 
 		source_cache = {}
 
@@ -1234,10 +1252,42 @@ class TDMPC2(torch.nn.Module):
 					'z_td': None,
 				}
 			elif name == 'replay_rollout':
-				# Add H=1 dimension: [T, B, ...] -> [T, 1, B, ...]
-				# Add R=1 dimension for rewards: [T, B, 1] -> [T, 1, 1, B, 1]
+				# Interleaved head selection: split batch B across H heads diagonally.
+				# lat_all: [H, B, 1, T+1, L] - each head has its own rollout for all B samples.
+				# We select: samples 0:chunk_size from head 0, chunk_size:2*chunk_size from head 1, etc.
+				# This ensures uniform training across all dynamics heads.
+				# When lat_all is None (WM not updated), fall back to z_true with H=1 dimension.
+				if lat_all is None:
+					# No rollout available, use z_true instead
+					src = {
+						'z_seq': z_true.unsqueeze(1),  # float32[T+1, 1, B, L]
+						'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
+						'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
+						'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
+						'full_detach': False,
+						'z_td': None,
+					}
+					source_cache[name] = src
+					return src
+				H_dyn, B_dyn, _, T_plus_1, L_lat = lat_all.shape  # lat_all: [H, B, 1, T+1, L]
+				assert B_dyn % H_dyn == 0, (
+					f"Batch size must be divisible by number of dynamics heads for interleaved selection. "
+					f"Got B={B_dyn}, H={H_dyn}."
+				)
+				chunk_size = B_dyn // H_dyn
+				
+				# Build interleaved z_seq: select chunk from each head
+				# Samples [0:chunk] from head 0, [chunk:2*chunk] from head 1, etc.
+				z_interleaved_parts = [
+					lat_all[h, h * chunk_size:(h + 1) * chunk_size, 0]  # [chunk_size, T+1, L]
+					for h in range(H_dyn)
+				]
+				z_interleaved = torch.cat(z_interleaved_parts, dim=0)  # [B, T+1, L]
+				z_interleaved = z_interleaved.permute(1, 0, 2)  # [T+1, B, L]
+				
+				# Add H=1 dimension for compatibility with multi-head format
 				src = {
-					'z_seq': z_rollout.unsqueeze(1),  # float32[T+1, 1, B, L]
+					'z_seq': z_interleaved.unsqueeze(1),  # float32[T+1, 1, B, L]
 					'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
 					'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
 					'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
@@ -1245,20 +1295,29 @@ class TDMPC2(torch.nn.Module):
 					'z_td': z_true[1:].unsqueeze(1),  # float32[T, 1, B, L]
 				}
 			elif name == 'imagine':
-				# Select initial latents for imagination based on config
-				# 'replay_true': use true encoded latents (current behavior)
-				# 'replay_rollout': use dynamics rollout latents from head 0 (exposes value to OOD states)
+				# Imagination starts from encoded/rollout latents and rolls forward with policy.
+				# imagine_initial_source controls starting point:
+				#   'replay_true': start from true encoded latents z_true
+				#   'replay_rollout': start from dynamics rollout z_rollout (head 0)
+				# 
+				# Gradient flow logic:
+				#   - If update_world_model=False: fully detach start_z (no encoder gradients from value)
+				#   - If update_world_model=True and replay_true: keep attached (encoder gradients flow)
+				#   - If update_world_model=True and replay_rollout: partial detach (z[0] attached, z[1:] detached)
 				imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
+				# When z_rollout is None (WM not updated), force replay_true
+				if z_rollout is None:
+					imagine_source = 'replay_true'
 				if imagine_source == 'replay_true':
-					# Detach if not updating value (no gradients needed for value loss)
-					start_z = z_true.detach() if not update_value else z_true
+					# When WM not updated: no WM gradients to encoder, so also block value gradients.
+					start_z = z_true.detach() if not update_world_model else z_true
 				elif imagine_source == 'replay_rollout':
-					# Use rollout latents from head 0 (same shape as z_true: [T+1, B, L])
-					# Partial detach: keep z_rollout[0] attached so value gradients flow to encoder,
-					# but detach z_rollout[1:] to block gradients to dynamics head.
-					# Must be contiguous for view() in imagined_rollout.
-					if not update_value:
-						start_z = z_rollout.detach().contiguous()
+					# z_rollout[0] = encoder output (same as z_true[0]), z_rollout[1:] = dynamics predictions.
+					# When WM updated: keep z_rollout[0] attached for encoder gradients, detach z_rollout[1:]
+					# to block gradients to dynamics (already trained via consistency loss).
+					# When WM not updated: fully detach (no encoder gradients from value).
+					if not update_world_model:
+						start_z = z_rollout.detach()
 					else:
 						start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
 				else:
@@ -1341,21 +1400,22 @@ class TDMPC2(torch.nn.Module):
 
 		}
 
-	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, task=None):
+	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, update_world_model=True, task=None):
 		"""Single gradient update step over world model, critic, and policy.
 		
 		Args:
 			update_value: If True, compute and apply value/aux losses. If False, skip value losses.
 			update_pi: If True, update policy. If False, skip policy update.
+			update_world_model: If True, compute WM losses. If False, skip WM losses and use replay_true for imagination.
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
 			if log_grads:
-				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag)
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag, update_world_model)
 			else:
-				components = self._compute_loss_components(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag)
+				components = self._compute_loss_components(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag, update_world_model)
     
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
@@ -1368,7 +1428,7 @@ class TDMPC2(torch.nn.Module):
 			total_loss = info['total_loss']		
 			self.optim.zero_grad(set_to_none=True) # this is crucial since the pi_loss also backprops through the world model, we want to clear those remaining gradients
 
-			if log_grads:
+			if log_grads and update_world_model:
 				info = self.probe_wm_gradients(info)
 
 			total_loss.backward()
@@ -1449,7 +1509,7 @@ class TDMPC2(torch.nn.Module):
 		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging
 		return info.detach().mean()
   
-	def update(self, buffer, step=0, update_value=True, update_pi=True):
+	def update(self, buffer, step=0, update_value=True, update_pi=True, update_world_model=True):
 		"""
 		Main update function. Corresponds to one iteration of model learning.
 
@@ -1458,6 +1518,7 @@ class TDMPC2(torch.nn.Module):
 			step: Current training step.
 			update_value: If True, compute and apply value/aux losses.
 			update_pi: If True, update policy.
+			update_world_model: If True, compute WM losses. If False, skip WM losses.
 
 		Returns:
 			dict: Dictionary of training statistics.
@@ -1483,7 +1544,7 @@ class TDMPC2(torch.nn.Module):
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
   
-		return self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, **kwargs)
+		return self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
 
 
 	@torch._dynamo.disable()

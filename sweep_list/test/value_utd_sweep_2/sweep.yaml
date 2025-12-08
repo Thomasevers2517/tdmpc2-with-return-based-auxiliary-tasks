@@ -1,0 +1,184 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Value UTD Sweep 2
+  # Goal: Test value update frequency with fixed UTD and pi_freq
+  # - UTD: 4 (WM updates per env step)
+  # - value_update_freq: 4, 8, 12 (value updates per env step)
+  # - pi_update_freq: 1 (policy updates per env step)
+  # Total: 1 task × 3 value_freq × 8 seeds = 24 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  #############################################
+  # KEY SWEEP PARAMETERS
+  #############################################
+
+  # UTD ratio: WM updates per env step
+  utd_ratio:
+    value: 4
+
+  # Value updates per env step
+  value_update_freq:
+    values: [4, 8, 12]
+
+  # Policy updates per env step
+  pi_update_freq:
+    value: 1
+
+  #############################################
+  # FIXED PARAMETERS (best config)
+  #############################################
+
+  # Dynamics prior enabled
+  dynamics_prior_enabled:
+    value: true
+
+  # Policy head reduce: min (pessimistic)
+  policy_head_reduce:
+    value: min
+
+  # Tau
+  tau:
+    value: 0.003
+
+  # V-heads
+  num_q:
+    value: 2
+  td_num_dynamics_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Dynamics prior fixed params
+  dynamics_prior_hidden_dim:
+    value: 32
+  dynamics_prior_scale:
+    value: 1.0
+
+  # Planner settings
+  planner_head_reduce:
+    value: max
+  train_act_std_coeff:
+    value: 0.0
+  temperature:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+  planner_policy_elites_first_iter_only:
+    value: false
+  planner_lambda_disagreement:
+    value: 0
+  planner_lambda_value_disagreement:
+    value: 0
+
+  # Planning params
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  num_elites:
+    value: 64
+  num_pi_trajs:
+    value: 512
+  horizon:
+    value: 3
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+
+  # Hot buffer
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # TD settings
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+  buffer_update_interval:
+    value: 1
+
+  # Encoder detachment
+  detach_encoder_ratio:
+    value: 0.5
+
+  # Training/eval settings
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  obs:
+    value: state
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  batch_size:
+    value: 256
+
+  # Policy LR scale
+  pi_lr_scale:
+    value: 1.0
+
+  # Entropy schedule (decay enabled)
+  start_entropy_coeff:
+    value: 1e-4
+  end_entropy_coeff:
+    value: 1e-5
+
+  # Auxiliary V-function settings
+  aux_value_source:
+    value: imagine
+  ac_source:
+    value: imagine
+  multi_gamma_loss_weight:
+    value: 0.01
+
+  #############################################
+
+  # Seeds (8 seeds)
+  seed:
+    values: [101, 202, 303, 404, 505, 606, 707, 808]
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
+
+  # Auxiliary multi-gamma settings
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_head:
+    value: joint
+  auxiliary_value_ema:
+    value: true
