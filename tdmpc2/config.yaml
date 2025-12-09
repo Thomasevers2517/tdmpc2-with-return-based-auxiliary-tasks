@@ -170,6 +170,11 @@ hinge_power: 4
 hinge_tau: 2.5
 hinge_coef: 0.01
 
+# dual policy (optimistic + pessimistic)
+dual_policy_enabled: false        # If true, create pessimistic + optimistic policies
+optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
+optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
+
 # critic
 num_bins: 101
 vmin: -10

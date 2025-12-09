@@ -79,6 +79,8 @@ class Planner(torch.nn.Module):
         # Prepare policy-seeded candidates (frozen across iterations)
         policy_cache = None
         if S > 0:
+            # Use optimistic policy for seeding during training if dual_policy_enabled
+            use_optimistic = (not eval_mode) and self.cfg.dual_policy_enabled
             latents_p, actions_p = self.world_model.rollout_latents(
                 z0,
                 use_policy=True,
@@ -87,6 +89,7 @@ class Planner(torch.nn.Module):
                 head_mode=head_mode,
                 task=task,
                 policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
+                use_optimistic_policy=use_optimistic,
             )
             # Squeeze singleton batch dim: latents [H,1,S,T+1,L] -> [H,S,T+1,L], actions [1,S,T,A] -> [S,T,A]
             latents_p = latents_p[:, 0]

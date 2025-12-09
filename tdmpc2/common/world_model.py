@@ -87,6 +87,8 @@ class WorldModel(nn.Module):
 		
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
+		# Optimistic policy for dual-policy architecture (same architecture as _pi)
+		self._pi_optimistic = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim) if cfg.dual_policy_enabled else None
 		# V-function ensemble: input is latent only (no action)
 		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
 		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
@@ -450,17 +452,26 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(logits)
 		
 
-	def pi(self, z, task, use_ema=False, search_noise=False):
+	def pi(self, z, task, use_ema=False, search_noise=False, optimistic=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
 		mean and (log) std predicted by a neural network.
+		
+		Args:
+			z: Latent state tensor.
+			task: Task identifier for multitask setup.
+			use_ema: If True, use target (EMA) policy.
+			search_noise: Unused (legacy parameter).
+			optimistic: If True and dual_policy_enabled, use optimistic policy.
 		"""
 		with maybe_range('WM/pi', self.cfg):
 			if use_ema:
 				if self._target_pi is None:
 					raise RuntimeError('Policy target requested but not initialized')
 				module = self._target_pi
+			elif optimistic and self.cfg.dual_policy_enabled:
+				module = self._pi_optimistic
 			else:
 				module = self._pi
 			if self.cfg.multitask:
@@ -597,7 +608,7 @@ class WorldModel(nn.Module):
 			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', num_random_heads: int = 1, task=None, policy_action_noise_std: float = 0.0):
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', num_random_heads: int = 1, task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
 
 		Args:
@@ -612,6 +623,8 @@ class WorldModel(nn.Module):
 			task: Optional task id for multitask.
 			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
 				when `use_policy=True`. Ignored when `use_policy=False`.
+			use_optimistic_policy (bool): If True and dual_policy_enabled, use optimistic policy
+				for action sampling. Ignored when `use_policy=False`.
 
 		Returns:
 			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
@@ -680,7 +693,7 @@ class WorldModel(nn.Module):
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False))
+							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)

@@ -150,7 +150,13 @@ class TDMPC2(torch.nn.Module):
 		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
 		lr_pi = self.cfg.lr * getattr(self.cfg, 'pi_lr_scale', 1.0)
 		log.info('  policy:     %.6f (base_lr * pi_lr_scale = %.4f * %.2f)', lr_pi, self.cfg.lr, getattr(self.cfg, 'pi_lr_scale', 1.0))
-		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=lr_pi, eps=1e-5, capturable=True)
+		# Dual policy: combine both policies' params into single optimizer
+		if self.cfg.dual_policy_enabled:
+			pi_params = list(self.model._pi.parameters()) + list(self.model._pi_optimistic.parameters())
+			log.info('  dual_policy: enabled (pessimistic + optimistic)')
+		else:
+			pi_params = self.model._pi.parameters()
+		self.pi_optim = torch.optim.Adam(pi_params, lr=lr_pi, eps=1e-5, capturable=True)
 		self.model.eval()
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
@@ -387,7 +393,7 @@ class TDMPC2(torch.nn.Module):
 			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))
 			return hinge_t.mean() * rho_pows.mean()
 
-	def calc_pi_losses(self, z, task):
+	def calc_pi_losses(self, z, task, optimistic=False):
 		"""
 		Compute policy loss using state-value function V(s).
 		
@@ -402,6 +408,9 @@ class TDMPC2(torch.nn.Module):
 		Args:
 			z (Tensor[T, B, L]): Current latent states.
 			task: Task identifier for multitask setup.
+			optimistic: If True, use optimistic policy with max reduction and
+				scaled entropy. If False, use pessimistic policy with configured
+				reduction (default min).
 			
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
@@ -411,12 +420,17 @@ class TDMPC2(torch.nn.Module):
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
 		
-		# Get reduction mode for policy loss
-		policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
+		# Select reduction mode and entropy coefficient based on optimistic flag
+		if optimistic:
+			policy_reduce = self.cfg.optimistic_head_reduce  # 'max' or 'mean' for optimistic
+			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+		else:
+			policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
+			entropy_coeff = self.dynamic_entropy_coeff
 			
 		with maybe_range('Agent/update_pi', self.cfg):
 			# Sample action from policy at current state (policy has gradients)
-			action, info = self.model.pi(z, task)  # action: float32[T, B, A]
+			action, info = self.model.pi(z, task, optimistic=optimistic)  # action: float32[T, B, A]
 			
 			# Flatten for model calls
 			z_flat = z.view(T * B, L)              # float32[T*B, L]
@@ -477,7 +491,10 @@ class TDMPC2(torch.nn.Module):
 			q_estimate = q_estimate_flat.view(T, B, 1)           # float32[T, B, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
-			self.scale.update(q_estimate[0])
+			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
+			# when computing both policies in a single backward pass.
+			if not optimistic:
+				self.scale.update(q_estimate[0])
 			q_scaled = self.scale(q_estimate)  # float32[T, B, 1]
 			
 			# Temporal weighting
@@ -488,7 +505,7 @@ class TDMPC2(torch.nn.Module):
 			
 			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
 			# Apply rho weighting across time
-			objective = q_scaled + self.dynamic_entropy_coeff * scaled_entropy  # float32[T, B, 1]
+			objective = q_scaled + entropy_coeff * scaled_entropy  # float32[T, B, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -512,6 +529,7 @@ class TDMPC2(torch.nn.Module):
 				"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
 				"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
 				"entropy_coeff": self.dynamic_entropy_coeff,
+				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate.mean(),
 				"pi_reward_mean": reward_flat.mean(),
 				"pi_v_next_mean": v_next_flat.mean(),
@@ -522,16 +540,33 @@ class TDMPC2(torch.nn.Module):
 	def update_pi(self, zs, task):
 		"""
 		Update policy using a sequence of latent states.
+		
+		If dual_policy_enabled, computes losses for both pessimistic and optimistic
+		policies and sums them with equal weight.
 
 		Args:
 			zs (torch.Tensor): Sequence of latent states.
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			float: Loss of the policy update.
+			Tuple[float, TensorDict]: Total policy loss and info dict.
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
-		pi_loss, info = self.calc_pi_losses(zs, task) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+		
+		# Pessimistic policy loss
+		pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+		
+		# Optimistic policy loss (if dual policy enabled)
+		if self.cfg.dual_policy_enabled:
+			opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
+			
+			# Prefix optimistic info keys with 'opti_'
+			for k, v in opti_info.items():
+				info[f'opti_{k}'] = v
+			
+			# Sum losses with equal weight
+			pi_loss = pi_loss + opti_pi_loss
+		
 		return pi_loss, info
 
 	@torch.no_grad()
@@ -1463,10 +1498,15 @@ class TDMPC2(torch.nn.Module):
     
 				pi_loss, pi_info = self.update_pi(z_for_pi, task)
 				pi_total = pi_loss * self.cfg.policy_coef
-				if log_grads:
-					info = self.probe_pi_gradients(pi_total, info)
 				pi_total.backward()
-				pi_grad_norm = torch.nn.utils.clip_grad_norm_(self.model._pi.parameters(), self.cfg.grad_clip_norm)
+				if log_grads:
+					info = self.probe_pi_gradients(info)
+				# Clip gradients for all policy params (both _pi and _pi_optimistic if dual policy)
+				if self.cfg.dual_policy_enabled:
+					pi_params = list(self.model._pi.parameters()) + list(self.model._pi_optimistic.parameters())
+				else:
+					pi_params = self.model._pi.parameters()
+				pi_grad_norm = torch.nn.utils.clip_grad_norm_(pi_params, self.cfg.grad_clip_norm)
 				if self.cfg.compile and log_grads:
 					self.pi_optim.step()
 				else:
@@ -1604,14 +1644,14 @@ class TDMPC2(torch.nn.Module):
 		return info
 
 	@torch._dynamo.disable()
-	def probe_pi_gradients(self, pi_total, info):
+	def probe_pi_gradients(self, info):
 		"""Probe gradient norms from policy loss to all parameter groups.
 
+		Must be called AFTER backward() so that .grad attributes are populated.
 		This reveals SVG-style gradient flow: policy loss backprops through
 		reward/dynamics models even though only policy params are updated.
 
 		Args:
-			pi_total (Tensor): Scaled policy loss (pi_loss * policy_coef).
 			info (TensorDict): Info dict to update with gradient norms.
 
 		Returns:
@@ -1619,34 +1659,13 @@ class TDMPC2(torch.nn.Module):
 		"""
 		groups = self._grad_param_groups()
 
-		# Flatten all params (including policy) and remember mapping
-		# Filter out frozen params (e.g., dynamics prior) that don't require grad
-		flat_params = []
-		index = []  # (group_name, param_obj) pairs
+		# Accumulate L2 norm per component group from .grad attributes
+		per_group_ss = {}
 		for gname, params in groups.items():
 			for p in params:
-				if p.requires_grad:
-					flat_params.append(p)
-					index.append((gname, p))
-
-		if (not torch.is_tensor(pi_total)) or (not pi_total.requires_grad):
-			return info
-
-		grads = torch.autograd.grad(
-			pi_total,
-			flat_params,
-			retain_graph=True,  # we'll still do pi_total.backward() after
-			create_graph=False,
-			allow_unused=True,
-		)
-
-		# Accumulate L2 norm per component group
-		per_group_ss = {}
-		for (gname, p), g in zip(index, grads):
-			if g is None:
-				continue
-			ss = (g.detach().float() ** 2).sum()
-			per_group_ss[gname] = per_group_ss.get(gname, 0.0) + ss.item()
+				if p.requires_grad and p.grad is not None:
+					ss = (p.grad.detach().float() ** 2).sum()
+					per_group_ss[gname] = per_group_ss.get(gname, 0.0) + ss.item()
 
 		for gname, ss in per_group_ss.items():
 			info.update({f'grad_norm/pi_loss/{gname}': (ss ** 0.5)}, non_blocking=True)
