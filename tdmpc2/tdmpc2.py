@@ -608,21 +608,13 @@ class TDMPC2(torch.nn.Module):
 		# Per-head TD targets: r + γ * (1 - done) * V(s')
 		td_per_head = reward_pessimistic + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
 		
-		# Compute std across ALL dynamics heads before subsampling (for logging)
+		# Compute std across sampled dynamics heads (for logging)
 		td_std_across_heads = td_per_head.std(dim=1, unbiased=False).squeeze(-1)  # float32[T, B]
 		td_std_across_heads = td_std_across_heads.unsqueeze(-1)  # float32[T, B, 1]
 		
-		# Randomly sample td_num_dynamics_heads for pessimistic aggregation
-		# This reduces over-pessimism when H is large
-		td_heads = int(self.cfg.td_num_dynamics_heads)
-		if td_heads <= 0 or td_heads >= H:
-			# Use all heads
-			td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
-		else:
-			# Randomly sample td_heads indices from [0, H)
-			idx = torch.randperm(H, device=next_z.device)[:td_heads]  # int64[td_heads]
-			td_sampled = td_per_head[:, idx, :, :]  # float32[T, td_heads, B, 1]
-			td_targets = td_sampled.min(dim=1).values  # float32[T, B, 1]
+		# Heads already subsampled at rollout time (imagined_rollout uses head_mode='random'
+		# with num_random_heads=td_num_dynamics_heads), so just take min over all available heads
+		td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
 		
 		return td_targets, td_std_across_heads 
   
@@ -675,17 +667,9 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Randomly sample td_num_dynamics_heads for pessimistic aggregation
-		# This reduces over-pessimism when H is large
-		td_heads = int(self.cfg.td_num_dynamics_heads)
-		if td_heads <= 0 or td_heads >= H:
-			# Use all heads
-			td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
-		else:
-			# Randomly sample td_heads indices from [0, H) - same indices for all gammas
-			idx = torch.randperm(H, device=next_z.device)[:td_heads]  # int64[td_heads]
-			td_sampled = td_per_head[:, :, idx, :, :]  # float32[G_aux, T, td_heads, B, 1]
-			td_targets_aux = td_sampled.min(dim=2).values  # float32[G_aux, T, B, 1]
+		# Heads already subsampled at rollout time (imagined_rollout uses head_mode='random'
+		# with num_random_heads=td_num_dynamics_heads), so just take min over all available heads
+		td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
@@ -962,7 +946,7 @@ class TDMPC2(torch.nn.Module):
 				use_policy=True,
 				horizon=rollout_len,
 				num_rollouts=n_rollouts,
-				head_mode='all',
+				head_mode='random',
 				num_random_heads=int(self.cfg.td_num_dynamics_heads),
 				task=task,
 			)
