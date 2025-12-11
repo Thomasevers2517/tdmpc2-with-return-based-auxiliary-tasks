@@ -10,34 +10,41 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Planner Head Reduce Sweep
-  # Goal: Test planner head reduction strategies (train & eval)
-  #       with new eval-specific config (planner_num_heads_eval, planner_head_reduce_eval)
+  # 4 Dynamics Heads + 2 Value Heads Test
+  # Goal: Test 4 dynamics heads with 2 value heads on two tasks
+  #       with different starting entropy coefficients
   # 
-  # Sweep: planner_head_reduce × planner_head_reduce_eval
-  # Total: 1 task × 2 train_reduce × 3 eval_reduce × 8 seeds = 48 runs
+  # Sweep: 2 tasks × 2 start_entropy × 8 seeds = 32 runs
   #############################################
 
   task:
-    value: quadruped-walk
+    values: [quadruped-walk, acrobot-swingup]
 
   #############################################
-  # KEY SWEEP PARAMETERS
+  # KEY PARAMETERS
   #############################################
+
+  # 4 dynamics heads
+  planner_num_dynamics_heads:
+    value: 4
+
+  # 2 value heads
+  num_q:
+    value: 2
 
   # Train-time planner head reduction
   planner_head_reduce:
-    values: [max, mean]
+    value: max
 
-  # Eval-time planner head configuration
-  planner_num_heads_eval:
-    value: 2
+  # Eval-time: use all heads with min reduction
+  planner_use_all_heads_eval:
+    value: true
 
   planner_head_reduce_eval:
-    values: [min, max, mean]
+    value: min
 
   start_entropy_coeff:
-    value: 3e-5
+    values: [3e-5, 1e-4]
 
   end_entropy_coeff:
     value: 1e-6
@@ -76,13 +83,6 @@ parameters:
 
   tau:
     value: 0.003
-
-  num_q:
-    value: 2
-  td_num_dynamics_heads:
-    value: 2
-  planner_num_dynamics_heads:
-    value: 4
 
   dynamics_prior_hidden_dim:
     value: 32
@@ -154,7 +154,7 @@ parameters:
   #############################################
 
   seed:
-    values: [101, 202, 303, 404, 505]
+    values: [101, 202, 303, 404, 505, 606, 707, 808]
 
   enable_wandb:
     value: true

@@ -43,6 +43,12 @@ num_reward_heads: 1
 # Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
 planner_head_reduce: max
 
+# Evaluation-specific planner head configuration.
+# If true, eval uses all dynamics heads and reduces via planner_head_reduce_eval.
+# If false, eval uses only head 0 (single head, no reduction needed).
+planner_use_all_heads_eval: true
+planner_head_reduce_eval: min  # Reduction over heads during eval: 'min' | 'max' | 'mean'
+
 # Aggregation over reward and dynamics heads when computing policy loss.
 # Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
 # it controls how reward/dynamics head predictions are reduced before policy optimization.
@@ -64,14 +70,10 @@ planner_lambda_value_disagreement: 0
 # the first MPPI iteration; subsequent iterations rely solely on sampled rollouts.
 planner_policy_elites_first_iter_only: false
 
-# Number of dynamics heads for latent disagreement; currently placeholder duplication of head 0.
+# Number of dynamics heads for multi-head dynamics ensemble.
+# All heads are used during training for TD targets and imagination.
+# During eval, uses all heads or single head based on planner_use_all_heads_eval.
 planner_num_dynamics_heads: 4
-
-# Number of dynamics heads to randomly sample for TD target computation.
-# When < planner_num_dynamics_heads, randomly samples this many heads per batch,
-# reducing pessimism compared to taking min over all heads.
-# Set to 0 to use all planner_num_dynamics_heads.
-td_num_dynamics_heads: 2
 
 # Frozen random prior network for dynamics heads to encourage ensemble diversity.
 # The prior is added BEFORE SimNorm so the main network can learn to compensate.
@@ -92,7 +94,7 @@ buffer_update_interval: 1  # number of env steps between buffer additions when n
 
 utd_ratio: 4  # World model updates per environment step
 value_update_freq: -1  # Value updates per env step. -1 means same as utd_ratio.
-pi_update_freq: 4  # Policy updates per env step.
+pi_update_freq: 1  # Policy updates per env step.
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
@@ -171,7 +173,7 @@ hinge_tau: 2.5
 hinge_coef: 0.01
 
 # dual policy (optimistic + pessimistic)
-dual_policy_enabled: false        # If true, create pessimistic + optimistic policies
+dual_policy_enabled: true        # If true, create pessimistic + optimistic policies
 optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
 optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
 

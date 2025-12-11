@@ -10,37 +10,46 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Planner Head Reduce Sweep
-  # Goal: Test planner head reduction strategies (train & eval)
-  #       with new eval-specific config (planner_num_heads_eval, planner_head_reduce_eval)
+  # Single Value Head + Dynamics Ensemble Sweep
+  # Goal: Test single Q-function (num_q=1) with dynamics ensemble pessimism.
+  #       No value ensemble - uncertainty comes from dynamics heads only.
+  #       Also testing entropy coefficient sensitivity.
   # 
-  # Sweep: planner_head_reduce × planner_head_reduce_eval
-  # Total: 1 task × 2 train_reduce × 3 eval_reduce × 8 seeds = 48 runs
+  # Sweep: task × start_entropy_coeff
+  # Total: 2 tasks × 2 entropy × 5 seeds = 20 runs
   #############################################
 
   task:
-    value: quadruped-walk
+    values: [quadruped-walk, acrobot-swingup]
 
   #############################################
   # KEY SWEEP PARAMETERS
   #############################################
 
-  # Train-time planner head reduction
-  planner_head_reduce:
-    values: [max, mean]
+  # Single value head - no value ensemble, dynamics ensemble provides pessimism
+  num_q:
+    value: 1
 
-  # Eval-time planner head configuration
-  planner_num_heads_eval:
+  # 2 dynamics heads for pessimistic min reduction
+  planner_num_dynamics_heads:
     value: 2
 
+  # Train-time planner head reduction
+  planner_head_reduce:
+    value: max
+
+  # Eval-time: use all heads with min reduction
+  planner_use_all_heads_eval:
+    value: true
+
   planner_head_reduce_eval:
-    values: [min, max, mean]
+    value: min
 
   start_entropy_coeff:
-    value: 3e-5
+    values: [3e-5, 1e-4]
 
   end_entropy_coeff:
-    value: 1e-6
+    value: 5e-6
 
   # Dual policy on
   dual_policy_enabled:
@@ -76,13 +85,6 @@ parameters:
 
   tau:
     value: 0.003
-
-  num_q:
-    value: 2
-  td_num_dynamics_heads:
-    value: 2
-  planner_num_dynamics_heads:
-    value: 4
 
   dynamics_prior_hidden_dim:
     value: 32

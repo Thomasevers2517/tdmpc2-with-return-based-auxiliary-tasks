@@ -68,9 +68,11 @@ def compute_values(
     if head_reduce == "mean":
         r_t = r_all.mean(dim=0)  # float32[H, E, T]
     elif head_reduce == "max":
-        r_t = r_all.max(dim=0).values  # float32[H, E, T]
+        r_t = torch.amax(r_all, dim=0)  # float32[H, E, T]
+    elif head_reduce == "min":
+        r_t = torch.amin(r_all, dim=0)  # float32[H, E, T]
     else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
+        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
 
     # Sum rewards (undiscounted) over T and bootstrap with V(z_last).
     # With V-function, no action needed for bootstrapping.
@@ -93,9 +95,11 @@ def compute_values(
     if head_reduce == "mean":
         v_boot_he = v_all_qhe.mean(dim=0)  # float32[H, E]
     elif head_reduce == "max":
-        v_boot_he = v_all_qhe.max(dim=0).values  # float32[H, E]
+        v_boot_he = torch.amax(v_all_qhe, dim=0)  # float32[H, E]
+    elif head_reduce == "min":
+        v_boot_he = torch.amin(v_all_qhe, dim=0)  # float32[H, E]
     else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
+        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
 
     values_unscaled_he = returns_he + v_boot_he             # float32[H, E]
     values_scaled_he = values_unscaled_he * 1.0             # float32[H, E]
@@ -108,10 +112,13 @@ def compute_values(
         values_unscaled = values_unscaled_he.mean(dim=0)        # float32[E]
         values_scaled = values_scaled_he.mean(dim=0)            # float32[E]
     elif head_reduce == "max":
-        values_unscaled = values_unscaled_he.max(dim=0).values  # float32[E]
-        values_scaled = values_scaled_he.max(dim=0).values      # float32[E]
+        values_unscaled = torch.amax(values_unscaled_he, dim=0)  # float32[E]
+        values_scaled = torch.amax(values_scaled_he, dim=0)      # float32[E]
+    elif head_reduce == "min":
+        values_unscaled = torch.amin(values_unscaled_he, dim=0)  # float32[E]
+        values_scaled = torch.amin(values_scaled_he, dim=0)      # float32[E]
     else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean' or 'max'.")
+        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
 
     return values_unscaled, values_scaled, values_std, value_disagreement
 

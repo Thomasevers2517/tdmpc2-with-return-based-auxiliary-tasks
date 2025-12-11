@@ -204,7 +204,7 @@ class TDMPC2(torch.nn.Module):
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=False)
 
-			@torch.compile(mode=self.cfg.compile_type, fullgraph=False)
+			@torch.compile(mode=self.cfg.compile_type, fullgraph=False )
 			def optim_step():
 				self.optim.step()
 				return
@@ -456,9 +456,9 @@ class TDMPC2(torch.nn.Module):
 			if policy_reduce == 'mean':
 				reward_flat = reward_all.mean(dim=0)  # float32[T*B, 1]
 			elif policy_reduce == 'min':
-				reward_flat = reward_all.min(dim=0).values  # float32[T*B, 1]
+				reward_flat = torch.amin(reward_all, dim=0)  # float32[T*B, 1]
 			elif policy_reduce == 'max':
-				reward_flat = reward_all.max(dim=0).values  # float32[T*B, 1]
+				reward_flat = torch.amax(reward_all, dim=0)  # float32[T*B, 1]
 			else:
 				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
@@ -479,9 +479,9 @@ class TDMPC2(torch.nn.Module):
 			if policy_reduce == 'mean':
 				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B, 1]
 			elif policy_reduce == 'min':
-				v_next_flat = v_next_all.min(dim=0).values  # float32[T*B, 1]
+				v_next_flat = torch.amin(v_next_all, dim=0)  # float32[T*B, 1]
 			elif policy_reduce == 'max':
-				v_next_flat = v_next_all.max(dim=0).values  # float32[T*B, 1]
+				v_next_flat = torch.amax(v_next_all, dim=0)  # float32[T*B, 1]
 			else:
 				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
@@ -577,7 +577,7 @@ class TDMPC2(torch.nn.Module):
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		For multi-head inputs, computes per-head TD targets then takes min over heads
 		for pessimistic value estimation. First reduces over reward heads (R), then
-		over a random subset of dynamics heads (td_num_dynamics_heads).
+		takes min over all dynamics heads (H).
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -586,7 +586,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across sampled heads).
+			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across heads).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -603,7 +603,7 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
 		# Pessimistically reduce over reward heads first: min over R (dim=1)
-		reward_pessimistic = reward.min(dim=1).values  # float32[T, H, B, 1]
+		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
 		# Per-head TD targets: r + γ * (1 - done) * V(s')
 		td_per_head = reward_pessimistic + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
@@ -612,9 +612,8 @@ class TDMPC2(torch.nn.Module):
 		td_std_across_heads = td_per_head.std(dim=1, unbiased=False).squeeze(-1)  # float32[T, B]
 		td_std_across_heads = td_std_across_heads.unsqueeze(-1)  # float32[T, B, 1]
 		
-		# Heads already subsampled at rollout time (imagined_rollout uses head_mode='random'
-		# with num_random_heads=td_num_dynamics_heads), so just take min over all available heads
-		td_targets = td_per_head.min(dim=1).values  # float32[T, B, 1]
+		# Take min over all dynamics heads for pessimistic TD target
+		td_targets = torch.amin(td_per_head, dim=1)  # float32[T, B, 1]
 		
 		return td_targets, td_std_across_heads 
   
@@ -654,7 +653,7 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
 		# Pessimistically reduce over reward heads first: min over R (dim=1)
-		reward_pessimistic = reward.min(dim=1).values  # float32[T, H, B, 1]
+		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
 		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
 		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
@@ -667,9 +666,8 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Heads already subsampled at rollout time (imagined_rollout uses head_mode='random'
-		# with num_random_heads=td_num_dynamics_heads), so just take min over all available heads
-		td_targets_aux = td_per_head.min(dim=2).values  # float32[G_aux, T, B, 1]
+		# Take min over all dynamics heads for pessimistic auxiliary TD target
+		td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
@@ -925,10 +923,8 @@ class TDMPC2(torch.nn.Module):
 		S, B_orig, L = start_z.shape  # start_z: float32[S, B_orig, L]
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
-		H = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
-		device = start_z.device
-		dtype = start_z.dtype
-
+		# Use all dynamics heads for imagination (no random sampling to avoid CUDA graph issues)
+		H = int(self.cfg.planner_num_dynamics_heads)
 		# Multi-head imagination requires rollout_len=1 so all heads share the same action
 		# (policy samples at z[0] before dynamics step)
 		if H > 1:
@@ -946,11 +942,12 @@ class TDMPC2(torch.nn.Module):
 				use_policy=True,
 				horizon=rollout_len,
 				num_rollouts=n_rollouts,
-				head_mode='random',
-				num_random_heads=int(self.cfg.td_num_dynamics_heads),
+				head_mode='all',  # Use all dynamics heads (avoids torch.randperm issues with CUDA graphs)
 				task=task,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
+		# H equals planner_num_dynamics_heads when head_mode='all'
+		assert latents.shape[0] == H, f"Expected {H} heads, got {latents.shape[0]}"
 
 		with maybe_range('Imagined/permute_view', self.cfg):
 			# Reshape to [T+1, H, B, L] where B = B_total * n_rollouts
@@ -991,8 +988,8 @@ class TDMPC2(torch.nn.Module):
 				term_logits = term_logits_flat.view(rollout_len, H, B, 1)  # float32[rollout_len, H, B, 1]
 				terminated = (torch.sigmoid(term_logits) > 0.5).float()
 			else:
-				term_logits = torch.zeros(rollout_len, H, B, 1, device=device, dtype=dtype)
-				terminated = torch.zeros(rollout_len, H, B, 1, device=device, dtype=dtype)
+				term_logits = torch.zeros(rollout_len, H, B, 1, device=z_seq.device, dtype=z_seq.dtype)
+				terminated = torch.zeros(rollout_len, H, B, 1, device=z_seq.device, dtype=z_seq.dtype)
 
 		# Avoid in-place detach on a view; build a fresh contiguous tensor
 		with maybe_range('Imagined/final_pack', self.cfg):

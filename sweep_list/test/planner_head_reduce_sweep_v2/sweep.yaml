@@ -10,12 +10,12 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Planner Head Reduce Sweep
-  # Goal: Test planner head reduction strategies (train & eval)
-  #       with new eval-specific config (planner_num_heads_eval, planner_head_reduce_eval)
+  # Planner Head Reduce Sweep v2
+  # Goal: Test planner head reduction strategies with new simplified config
+  #       (planner_use_all_heads_eval replaces planner_num_heads_eval)
   # 
-  # Sweep: planner_head_reduce × planner_head_reduce_eval
-  # Total: 1 task × 2 train_reduce × 3 eval_reduce × 8 seeds = 48 runs
+  # Sweep: planner_head_reduce × planner_num_dynamics_heads × planner_head_reduce_eval
+  # Total: 1 task × 2 reduce × 2 heads × 3 eval_reduce × 5 seeds = 60 runs
   #############################################
 
   task:
@@ -25,14 +25,19 @@ parameters:
   # KEY SWEEP PARAMETERS
   #############################################
 
-  # Train-time planner head reduction
+  # Train-time planner head reduction (mean or max over all dynamics heads)
   planner_head_reduce:
-    values: [max, mean]
+    values: [max]
 
-  # Eval-time planner head configuration
-  planner_num_heads_eval:
-    value: 2
+  # Number of dynamics heads (all used for training and optionally eval)
+  planner_num_dynamics_heads:
+    values: [2, 4]
 
+  # Eval-time: use all heads (true) or single head 0 (false)
+  planner_use_all_heads_eval:
+    value: true
+
+  # Eval-time head reduction (only applies when planner_use_all_heads_eval=true)
   planner_head_reduce_eval:
     values: [min, max, mean]
 
@@ -79,10 +84,6 @@ parameters:
 
   num_q:
     value: 2
-  td_num_dynamics_heads:
-    value: 2
-  planner_num_dynamics_heads:
-    value: 4
 
   dynamics_prior_hidden_dim:
     value: 32

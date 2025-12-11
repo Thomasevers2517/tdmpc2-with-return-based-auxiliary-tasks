@@ -73,17 +73,16 @@ class WorldModel(nn.Module):
 		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
 		# Ensemble stores params in TensorDictParams which apply() does not traverse.
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
-		reward_mlps = [
+		self._reward_heads = nn.ModuleList([
 			layers.mlp(
 				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
 				2 * [cfg.mlp_dim // cfg.reward_dim_div],
 				max(cfg.num_bins, 1),
 			)
 			for _ in range(num_reward_heads)
-		]
-		for mlp in reward_mlps:
+		])
+		for mlp in self._reward_heads:
 			mlp.apply(init.weight_init)
-		self._reward_heads = layers.Ensemble(reward_mlps)
 		
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
@@ -149,7 +148,8 @@ class WorldModel(nn.Module):
 				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
 
 		self.apply(init.weight_init)
-		init.zero_([self._reward_heads.params["2", "weight"], self._Vs.params["2", "weight"]])
+		reward_weights = [head[-1].weight for head in self._reward_heads]
+		init.zero_(reward_weights + [self._Vs.params["2", "weight"]])
 		self.reset_policy_encoder_targets()
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
@@ -395,11 +395,6 @@ class WorldModel(nn.Module):
 				with self._autocast_context():
 					out = self._dynamics_heads[0](za)
 				return out.float().unsqueeze(0)
-			elif head_mode == 'random':
-				idx = int(torch.randint(low=0, high=H, size=(1,), device=za.device))
-				with self._autocast_context():
-					out = self._dynamics_heads[idx](za)
-				return out.float().unsqueeze(0)
 			elif head_mode == 'all':
 				outs = []
 				with self._autocast_context():
@@ -407,7 +402,7 @@ class WorldModel(nn.Module):
 						outs.append(head(za)) 
 				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
 			else:
-				raise ValueError(f"Unsupported head_mode: {head_mode}")
+				raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
 
 	def reward(self, z, a, task, head_mode='single'):
 		"""
@@ -428,13 +423,12 @@ class WorldModel(nn.Module):
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			with self._autocast_context():
-				# Always use Ensemble forward (vmap) for proper parameter binding
-				out = self._reward_heads(za)  # [R, ..., K]
 				if head_mode == 'single':
-					# Select head 0, keep head dimension for consistent shape
-					out = out[:1]  # [1, ..., K]
-				elif head_mode != 'all':
-					raise ValueError(f"Unsupported head_mode for reward: {head_mode}")
+					out = self._reward_heads[0](za).unsqueeze(0)
+				elif head_mode == 'all':
+					out = torch.stack([head(za) for head in self._reward_heads], dim=0)
+				else:
+					raise ValueError(f"Unsupported head_mode for reward: {head_mode}. Use 'single' or 'all'.")
 			return out.float()
 	
 	def termination(self, z, task, unnormalized=False):
@@ -602,13 +596,13 @@ class WorldModel(nn.Module):
 			# Use ALL num_q ensemble members for reduction (no subsampling)
 			V = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
 			if return_type == "min":
-				return V.min(0).values
+				return torch.amin(V, dim=0)
 			if return_type == "max":
-				return V.max(0).values
+				return torch.amax(V, dim=0)
 			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', num_random_heads: int = 1, task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False):
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
 
 		Args:
@@ -617,9 +611,7 @@ class WorldModel(nn.Module):
 			use_policy (bool): If True, ignore `actions` and sample actions from policy using head-0 latents.
 			horizon (int, optional): Number of steps `T` when `use_policy=True`.
 			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
-			head_mode (str): 'single' | 'all' | 'random'.
-			num_random_heads (int): Number of heads to randomly sample when `head_mode='random'`.
-				Defaults to 1. If >= total heads, uses all heads. Ignored for other head_modes.
+			head_mode (str): 'single' uses head 0 only; 'all' uses all dynamics heads.
 			task: Optional task id for multitask.
 			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
 				when `use_policy=True`. Ignored when `use_policy=False`.
@@ -628,7 +620,7 @@ class WorldModel(nn.Module):
 
 		Returns:
 			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
-				H_sel is 1 for 'single', H_total for 'all', or min(num_random_heads, H_total) for 'random'.
+				H_sel is 1 for 'single', H_total for 'all'.
 		"""
 		if use_policy:
 			if actions is not None:
@@ -653,23 +645,15 @@ class WorldModel(nn.Module):
 		B = z0.shape[0]
 		L = z0.shape[-1]
 
-		H_total = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
+		H_total = len(self._dynamics_heads)
 		if head_mode == 'single':
 			H_sel = 1
 			head_indices = [0]
 		elif head_mode == 'all':
 			H_sel = H_total
 			head_indices = list(range(H_total))
-		elif head_mode == 'random':
-			# Sample num_random_heads from available heads; fall back to all if >= H_total
-			H_sel = min(num_random_heads, H_total)
-			if H_sel >= H_total:
-				head_indices = list(range(H_total))
-			else:
-				idx = torch.randperm(H_total, device=z0.device)[:H_sel]
-				head_indices = idx.tolist()
 		else:
-			raise ValueError(f'Unsupported head_mode: {head_mode}')
+			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
 
 		# Determine action dim
 		if not use_policy:
@@ -704,9 +688,11 @@ class WorldModel(nn.Module):
 
 					# Advance each selected head independently
 					next_heads = []  # will hold float32[B,N,L] per head
-					for hi, h in enumerate(head_indices):
+					for h in range(H_sel):
+						# h indexes into latents_steps (0..H_sel-1)
+						# head_indices[h] gives the actual dynamics head to use
 						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
-							z_curr = latents_steps[t][hi].view(B * N, L)  # float32[B*N,L]
+							z_curr = latents_steps[t][h].view(B * N, L)  # float32[B*N,L]
 							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
 							if self.cfg.multitask:
 								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
@@ -714,7 +700,7 @@ class WorldModel(nn.Module):
 								z_cat = z_curr
 							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
 							with self._autocast_context():
-								next_flat = self._dynamics_heads[h](za)  # float32[B*N,L]
+								next_flat = self._dynamics_heads[head_indices[h]](za)  # float32[B*N,L]
 							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
 							next_heads.append(next_bn)
 

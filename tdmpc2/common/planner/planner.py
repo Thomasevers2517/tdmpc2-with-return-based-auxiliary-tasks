@@ -69,8 +69,19 @@ class Planner(torch.nn.Module):
         lambda_value = 0.0 if eval_mode else float(self.cfg.planner_lambda_value_disagreement)
         # Std bounds: prefer std_min/std_max; fallback to legacy min_std/max_std
 
+        # Head mode and reduction depend on eval vs train
+        # Train: always use all heads with planner_head_reduce
+        # Eval: use all heads or single head based on planner_use_all_heads_eval
+        if eval_mode:
+            use_all_heads_eval = bool(self.cfg.planner_use_all_heads_eval)
+            head_mode = 'all' if use_all_heads_eval else 'single'
+            head_reduce = self.cfg.planner_head_reduce_eval if use_all_heads_eval else 'mean'
+            reward_head_mode = head_mode  # Match dynamics head mode
+        else:
+            head_mode = 'all'
+            head_reduce = self.cfg.planner_head_reduce
+            reward_head_mode = 'all'
 
-        head_mode = 'single' if eval_mode else 'all'
         policy_elites_first_iter_only = bool(self.cfg.planner_policy_elites_first_iter_only)
 
         mean = self.shifted_prev_mean()  # float32[T,A]
@@ -99,8 +110,8 @@ class Planner(torch.nn.Module):
                 actions_p,
                 self.world_model,
                 task,
-                head_reduce=self.cfg.planner_head_reduce,
-                reward_head_mode=head_mode,
+                head_reduce=head_reduce,
+                reward_head_mode=reward_head_mode,
             )
             latent_dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
@@ -152,8 +163,8 @@ class Planner(torch.nn.Module):
                 actions_s,
                 self.world_model,
                 task,
-                head_reduce=self.cfg.planner_head_reduce,
-                reward_head_mode=head_mode,
+                head_reduce=head_reduce,
+                reward_head_mode=reward_head_mode,
             )
             latent_dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:
@@ -336,7 +347,8 @@ class Planner(torch.nn.Module):
                 task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
                 lambda_value=float(self.cfg.planner_lambda_value_disagreement) if not eval_mode else 0.0,
-                head_mode=('single' if eval_mode else 'all'),
+                head_mode=head_mode,
+                head_reduce=head_reduce,
                 T=T,
             )
             # Compute post-noise effects once (no-grad), available for logger + wandb
