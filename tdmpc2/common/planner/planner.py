@@ -259,9 +259,20 @@ class Planner(torch.nn.Module):
         # Prepare first-step std for potential noise (planner-owned)
         std_first = std[0]  # [A]
         noise_vec_first = None
+        # Legacy: std-scaled noise via train_noise_multiplier (train_act_std_coeff)
         if (not eval_mode) and (train_noise_multiplier is not None) and (float(train_noise_multiplier) > 0.0):
             noise_vec_first = torch.randn_like(chosen_action) * std_first * float(train_noise_multiplier)
             chosen_action = (chosen_action + noise_vec_first).clamp(-1.0, 1.0)
+        # Fixed-std action noise for ablation (planner_action_noise_std)
+        fixed_action_noise_std = float(getattr(self.cfg, 'planner_action_noise_std', 0.0))
+        if (not eval_mode) and fixed_action_noise_std > 0.0:
+            fixed_noise = torch.randn_like(chosen_action) * fixed_action_noise_std
+            chosen_action = (chosen_action + fixed_noise).clamp(-1.0, 1.0)
+            # Merge into noise_vec_first for logging/info if needed
+            if noise_vec_first is None:
+                noise_vec_first = fixed_noise
+            else:
+                noise_vec_first = noise_vec_first + fixed_noise
 
         # Build info
         value_elite_mean = elite_scores.mean()

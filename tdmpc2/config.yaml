@@ -58,6 +58,11 @@ policy_head_reduce: min
 # Applied only when use_policy=True in world_model.rollout_latents.
 policy_seed_noise_std: 0.05
 
+# Fixed std of Gaussian noise added to the planner's chosen action during training.
+# This is additive exploration noise (like epsilon-greedy but Gaussian).
+# Set to 0.0 to disable. Used for ablation studies comparing optimistic planning vs noise-based exploration.
+planner_action_noise_std: 0.0
+
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0
 
