@@ -1,0 +1,148 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Unscaled Entropy Sweep - Dog Run (500k)
+  # 
+  # Goal: Test unscaled entropy on high-dim task (38 action dims)
+  #       With proper D scaling, should avoid stagnation at value ~150
+  # 
+  # Sweep: start_entropy_coeff × seed
+  # - start_entropy_coeff: 1e-4, 5e-4
+  # 
+  # Total: 2 entropy × 3 seeds = 6 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  # Unscaled entropy (proper D scaling instead of D²)
+  use_scaled_entropy:
+    value: false
+
+  start_entropy_coeff:
+    values: [1e-4, 5e-4]
+
+  end_entropy_coeff:
+    value: 1e-6
+
+  # Never decay entropy: start at 100% of training = never starts
+  start_dynamic_entropy_ratio:
+    value: 1.0
+
+  seed:
+    values: [101, 202, 303]
+
+  #############################################
+  # FIXED PARAMETERS
+  #############################################
+
+  steps:
+    value: 500000
+
+  planner_num_dynamics_heads:
+    value: 4
+  num_q:
+    value: 2
+  planner_head_reduce:
+    value: max
+  planner_use_all_heads_eval:
+    value: true
+  planner_head_reduce_eval:
+    value: min
+  dual_policy_enabled:
+    value: true
+  horizon:
+    value: 3
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 4
+  pi_update_freq:
+    value: 1
+  dynamics_prior_enabled:
+    value: true
+  policy_head_reduce:
+    value: min
+  tau:
+    value: 0.003
+  dynamics_prior_hidden_dim:
+    value: 32
+  dynamics_prior_scale:
+    value: 1.0
+  train_act_std_coeff:
+    value: 0.0
+  temperature:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+  planner_policy_elites_first_iter_only:
+    value: false
+  planner_lambda_disagreement:
+    value: 0
+  planner_lambda_value_disagreement:
+    value: 0
+  planner_action_noise_std:
+    value: 0.0
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+  buffer_update_interval:
+    value: 1
+  detach_encoder_ratio:
+    value: 0.0
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  eval_freq:
+    value: 5000
+  batch_size:
+    value: 256
+  pi_lr_scale:
+    value: 1.0
+  aux_value_source:
+    value: imagine
+  ac_source:
+    value: imagine
+  multi_gamma_loss_weight:
+    value: 0.01
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_head:
+    value: joint
+  auxiliary_value_ema:
+    value: true
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

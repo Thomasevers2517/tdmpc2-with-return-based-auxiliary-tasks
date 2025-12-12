@@ -94,14 +94,14 @@ TIME_DIR="$(date +%H%M%S)"
 OUT_DIR="${REPO_ROOT}/slurm_logs/${DATE_DIR}/${TIME_DIR}"
 mkdir -p "$OUT_DIR"
 
-# Make a job-local scratch dir on a fast FS
-export TMPDIR=/scratch-local/$USER/$DATE_DIR/$TIME_DIR  # or $SNIC_TMP, $WRKDIR, etc. depending on cluster
-mkdir -p $TMPDIR/{inductor,triton,cuda}
+# # Make a job-local scratch dir on a fast FS
+# export TMPDIR=/scratch-local/$USER/$DATE_DIR/$TIME_DIR  # or $SNIC_TMP, $WRKDIR, etc. depending on cluster
+# mkdir -p $TMPDIR/{inductor,triton,cuda}
 
-# Point all the JIT/compile caches there
-export TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
-export TRITON_CACHE_DIR=$TMPDIR/triton
-export CUDA_CACHE_PATH=$TMPDIR/cuda
+# # Point all the JIT/compile caches there
+# export TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor
+# export TRITON_CACHE_DIR=$TMPDIR/triton
+# export CUDA_CACHE_PATH=$TMPDIR/cuda
 
 # Validate inputs
 if [[ ! -s "$ID_FILE" ]]; then

@@ -500,12 +500,17 @@ class TDMPC2(torch.nn.Module):
 			# Temporal weighting
 			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
 			
-			# Entropy from policy (already scaled by action_dim in model.pi)
-			scaled_entropy = info["scaled_entropy"]  # float32[T, B, 1]
+			# Entropy from policy
+			# use_scaled_entropy=True: original TD-MPC2 (scales ~D², bad for high-dim)
+			# use_scaled_entropy=False: standard entropy (scales ~D, recommended)
+			if self.cfg.use_scaled_entropy:
+				entropy_term = info["scaled_entropy"]  # float32[T, B, 1]
+			else:
+				entropy_term = info["entropy"]  # float32[T, B, 1]
 			
 			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
 			# Apply rho weighting across time
-			objective = q_scaled + entropy_coeff * scaled_entropy  # float32[T, B, 1]
+			objective = q_scaled + entropy_coeff * entropy_term  # float32[T, B, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ

@@ -169,6 +169,10 @@ log_std_min: -10
 log_std_max: 2
 end_entropy_coeff: 1e-6
 start_entropy_coeff: 1e-4
+# Whether to use scaled entropy (multiply by action_dim²) or standard entropy (scales with action_dim).
+# The scaled version was the original TD-MPC2 design but causes issues for high-dim tasks.
+# Set false for proper scaling that's consistent across action dimensions.
+use_scaled_entropy: true
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 0.5
 dynamic_entropy_schedule : exponential  # linear | exponential
