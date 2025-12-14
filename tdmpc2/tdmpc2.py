@@ -157,6 +157,11 @@ class TDMPC2(torch.nn.Module):
 		else:
 			pi_params = self.model._pi.parameters()
 		self.pi_optim = torch.optim.Adam(pi_params, lr=lr_pi, eps=1e-5, capturable=True)
+
+		# Store initial encoder LR for step-change schedule
+		self._enc_lr_initial = lr_encoder
+		self._enc_lr_stepped = False  # Track if step-change has been applied
+
 		self.model.eval()
 		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
@@ -166,10 +171,6 @@ class TDMPC2(torch.nn.Module):
 		self.register_buffer(
 			"dynamic_entropy_coeff",
 			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
-		)
-		self.register_buffer(
-			"detach_encoder_flag",
-			torch.tensor(False, device=self.device, dtype=torch.bool),
 		)
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
 		self.discount = torch.tensor(
@@ -424,9 +425,11 @@ class TDMPC2(torch.nn.Module):
 		if optimistic:
 			policy_reduce = self.cfg.optimistic_head_reduce  # 'max' or 'mean' for optimistic
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+			lambda_value_disagreement = self.cfg.optimistic_policy_lambda_value_disagreement
 		else:
 			policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
 			entropy_coeff = self.dynamic_entropy_coeff
+			lambda_value_disagreement = self.cfg.policy_lambda_value_disagreement
 			
 		with maybe_range('Agent/update_pi', self.cfg):
 			# Sample action from policy at current state (policy has gradients)
@@ -485,6 +488,12 @@ class TDMPC2(torch.nn.Module):
 			else:
 				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
+			# Compute value disagreement across dynamics heads (std of V estimates)
+			# Scale by self.scale.value for unit consistency with q_scaled
+			v_disagreement_flat = v_next_all.std(dim=0)  # float32[T*B, 1]
+			v_disagreement_scaled_flat = v_disagreement_flat / self.scale.value.clamp(min=1e-6)  # float32[T*B, 1]
+			v_disagreement_scaled = v_disagreement_scaled_flat.view(T, B, 1)  # float32[T, B, 1]
+			
 			# Compute Q-like estimate: r(z, a) + γ * V(z')
 			# This is what the action "earns" - immediate reward plus discounted future value
 			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B, 1]
@@ -508,9 +517,10 @@ class TDMPC2(torch.nn.Module):
 			else:
 				entropy_term = info["entropy"]  # float32[T, B, 1]
 			
-			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
+			# Policy loss: maximize (q_scaled + entropy_coeff * entropy - λ * v_disagreement)
+			# Subtraction: positive λ penalizes uncertainty, negative λ rewards it
 			# Apply rho weighting across time
-			objective = q_scaled + entropy_coeff * entropy_term  # float32[T, B, 1]
+			objective = q_scaled + entropy_coeff * entropy_term - lambda_value_disagreement * v_disagreement_scaled  # float32[T, B, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -538,6 +548,8 @@ class TDMPC2(torch.nn.Module):
 				"pi_q_estimate_mean": q_estimate.mean(),
 				"pi_reward_mean": reward_flat.mean(),
 				"pi_v_next_mean": v_next_flat.mean(),
+				"pi_value_disagreement": v_disagreement_flat.mean(),
+				"pi_value_disagreement_scaled": v_disagreement_scaled.mean(),
 			}, device=self.device)
 
 			return pi_loss, info
@@ -1198,7 +1210,7 @@ class TDMPC2(torch.nn.Module):
 
 		return loss_mean, info
 
-	def _compute_loss_components(self, obs, action, reward, terminated, task, update_value, log_grads, detach_encoder_active, update_world_model=True):
+	def _compute_loss_components(self, obs, action, reward, terminated, task, update_value, log_grads, update_world_model=True):
 		"""Compute world model, value, and auxiliary value losses.
 		
 		Args:
@@ -1209,15 +1221,12 @@ class TDMPC2(torch.nn.Module):
 			task: Task indices for multitask, or None.
 			update_value: If False, skip value/aux losses (return zeros).
 			log_grads: Whether to log gradient statistics.
-			detach_encoder_active: Whether to detach encoder outputs.
 			update_world_model: If False, skip WM losses (return zeros), set z_rollout=None,
 				and block encoder gradients from value loss.
 		"""
 		device = self.device
 
 		def encode_obs(obs_seq, use_ema, grad_enabled):
-			if detach_encoder_active:
-				grad_enabled = False
 			steps, batch = obs_seq.shape[0], obs_seq.shape[1]
 			flat_obs = obs_seq.view(steps * batch, *obs_seq.shape[2:])  # float32[steps*batch,...]
 			if self.cfg.multitask:
@@ -1232,8 +1241,6 @@ class TDMPC2(torch.nn.Module):
 			with maybe_range('_compute/encode_obs', self.cfg):
 				with torch.set_grad_enabled(grad_enabled and torch.is_grad_enabled()):
 					latents_flat = self.model.encode(flat_obs, task_flat, use_ema=use_ema)  # float32[steps*batch,L]
-			if detach_encoder_active:
-				latents_flat = latents_flat.detach()
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])  # float32[steps,batch,L]
 
 		# Encode observations (needed for value computation even when not updating WM)
@@ -1434,9 +1441,9 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
 			if log_grads:
-				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag, update_world_model)
+				components = self._compute_loss_components_eager(obs, action, reward, terminated, task, update_value, log_grads, update_world_model)
 			else:
-				components = self._compute_loss_components(obs, action, reward, terminated, task, update_value, log_grads, self.detach_encoder_flag, update_world_model)
+				components = self._compute_loss_components(obs, action, reward, terminated, task, update_value, log_grads, update_world_model)
     
 			wm_loss = components['wm_loss']
 			value_loss = components['value_loss']
@@ -1558,19 +1565,28 @@ class TDMPC2(torch.nn.Module):
 			self.log_detailed = True
 		else:
 			self.log_detailed = False
-   
-		detach_cutoff = (1 - self.cfg.detach_encoder_ratio) * self.cfg.steps
-		if self._step >= detach_cutoff:
-			self.detach_encoder_flag.fill_(True)
-		else:
-			self.detach_encoder_flag.fill_(False)
+
+		# Encoder LR step-change: apply once when crossing threshold
+		enc_lr_cutoff = int((1 - self.cfg.enc_lr_step_ratio) * self.cfg.steps)
+		if not self._enc_lr_stepped and self._step >= enc_lr_cutoff:
+			new_enc_lr = self._enc_lr_initial * self.cfg.enc_lr_step_scale
+			self.optim.param_groups[0]['lr'] = new_enc_lr
+			self._enc_lr_stepped = True
+			log.info('Step %d: encoder LR stepped from %.6f to %.6f',
+					 self._step, self._enc_lr_initial, new_enc_lr)
+
 		self.dynamic_entropy_coeff.fill_(self.get_entropy_coeff(self._step))
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
 		torch.compiler.cudagraph_mark_step_begin()
   
-		return self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
+		info = self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
+
+		# Log current encoder LR for W&B tracking
+		info['encoder_lr'] = self.optim.param_groups[0]['lr']
+
+		return info
 
 
 	@torch._dynamo.disable()
@@ -1677,7 +1693,7 @@ class TDMPC2(torch.nn.Module):
 				obs, action, reward, terminated, task = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
-					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False, detach_encoder_active=False)
+					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False)
 					val_info = components['info']
 
 					
