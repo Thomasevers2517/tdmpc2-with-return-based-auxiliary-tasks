@@ -484,20 +484,34 @@ class WorldModel(nn.Module):
 			else:
 				action_dims = None
 
-			log_prob = math.gaussian_logprob(eps, log_std)
-			size = eps.shape[-1] if action_dims is None else action_dims
-			scaled_log_prob = log_prob * size
+			# Compute Gaussian log prob before squashing
+			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1], ~D scaling from sum
+			action_dim = eps.shape[-1] if action_dims is None else action_dims
+			
+			# Sample action and apply squash (tanh) with Jacobian correction
 			action = mean + eps * log_std.exp()
 			presquash_mean = mean
-			mean, action, log_prob = math.squash(mean, action, log_prob)
-			entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+			mean, action, log_prob = math.squash(mean, action, log_prob_presquash)
+			
+			# Entropy with configurable action dimension scaling
+			# entropy_action_dim_power controls how entropy scales with action_dim:
+			#   0.0 = no extra scaling (entropy ~ D from Gaussian sum)
+			#   1.0 = multiply by D (entropy ~ D², like original TD-MPC2)
+			#   0.5 = multiply by sqrt(D) (entropy ~ D^1.5, compromise)
+			entropy = -log_prob  # float32[..., 1], correct squashed entropy
+			entropy_multiplier = torch.tensor(
+				action_dim, dtype=entropy.dtype, device=entropy.device
+			).pow(self.cfg.entropy_action_dim_power)  # float32 scalar tensor
+			scaled_entropy = entropy * entropy_multiplier  # float32[..., 1]
+			
 			info = TensorDict({
 				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,
-				"entropy": -log_prob,
-				"scaled_entropy": -log_prob * entropy_scale,
+				"entropy": entropy,
+				"scaled_entropy": scaled_entropy,
+				"entropy_multiplier": entropy_multiplier,
 			}, device=z.device, non_blocking=True)
 			return action, info
 

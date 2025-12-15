@@ -1,0 +1,164 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Entropy Scaling + Policy Value Disagreement Sweep
+  # 
+  # Goal: Test clean entropy scaling with action_dim^power
+  #       AND policy value disagreement penalty
+  # 
+  # Sweep: task × entropy_action_dim_power × policy_lambda_value_disagreement × seed
+  # - task: acrobot-swingup (D=1), quadruped-walk (D=12)
+  # - entropy_action_dim_power: 1.0, 1.5
+  # - policy_lambda_value_disagreement: 0.0 (off), 1.0 (on)
+  # - start_entropy_coeff: 3e-5
+  # 
+  # Effective entropy for quadruped (D=12):
+  #   power=1.0: 3e-5 * 12 ≈ 3.6e-4
+  #   power=1.5: 3e-5 * 41.6 ≈ 1.2e-3
+  # 
+  # Total: 2 tasks × 2 powers × 2 lambda × 2 seeds = 16 runs
+  #############################################
+
+  task:
+    values: [acrobot-swingup, quadruped-walk]
+
+  # Clean entropy scaling: entropy * (action_dim ** power)
+  entropy_action_dim_power:
+    values: [1.0, 1.5]
+
+  # Policy value disagreement penalty (extra pessimism)
+  policy_lambda_value_disagreement:
+    values: [0.0, 1.0]
+
+  # Base entropy coefficient
+  start_entropy_coeff:
+    value: 3e-5
+
+  end_entropy_coeff:
+    value: 1e-6
+
+  # Never decay entropy: start at 100% of training = never starts
+  start_dynamic_entropy_ratio:
+    value: 1.0
+
+  seed:
+    values: [101, 202]
+
+  #############################################
+  # FIXED PARAMETERS
+  #############################################
+
+  steps:
+    value: 100000
+
+  planner_num_dynamics_heads:
+    value: 4
+  num_q:
+    value: 2
+  planner_head_reduce:
+    value: max
+  planner_use_all_heads_eval:
+    value: true
+  planner_head_reduce_eval:
+    value: min
+  dual_policy_enabled:
+    value: true
+  horizon:
+    value: 3
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 4
+  pi_update_freq:
+    value: 1
+  dynamics_prior_enabled:
+    value: true
+  policy_head_reduce:
+    value: min
+  tau:
+    value: 0.003
+  dynamics_prior_hidden_dim:
+    value: 32
+  dynamics_prior_scale:
+    value: 1.0
+  train_act_std_coeff:
+    value: 0.0
+  temperature:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+  planner_policy_elites_first_iter_only:
+    value: false
+  planner_lambda_disagreement:
+    value: 0
+  planner_lambda_value_disagreement:
+    value: 0
+  planner_action_noise_std:
+    value: 0.0
+  final_rho:
+    value: 0.125
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+  hot_buffer_enabled:
+    value: true
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+  sac_style_td:
+    value: false
+  n_mc_samples_target:
+    value: 1
+  buffer_update_interval:
+    value: 1
+  enc_lr_step_ratio:
+    value: 0.5
+  enc_lr_step_scale:
+    value: 0.0
+  optimistic_policy_lambda_value_disagreement:
+    value: 0.0
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+  eval_freq:
+    value: 5000
+  batch_size:
+    value: 256
+  pi_lr_scale:
+    value: 1.0
+  aux_value_source:
+    value: imagine
+  ac_source:
+    value: imagine
+  multi_gamma_loss_weight:
+    value: 0.01
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_head:
+    value: joint
+  auxiliary_value_ema:
+    value: true
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
