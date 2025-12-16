@@ -50,6 +50,7 @@ CPUS="9"
 MEM="80G"
 ACCOUNT="tdsei8531"
 JOB_NAME="weather-tdmpc2-sweep"
+CONDA_ENV="/projects/0/prjs0951/conda_envs/tdmpc2"
 MAX_PARALLEL=""
 MAIL_USER="t.evers-2@student.tudelft.nl"
 WANDB_ENTITY="thomasevers9"
@@ -67,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --mem) MEM="$2"; shift 2;;
     --account) ACCOUNT="$2"; shift 2;;
     --job-name) JOB_NAME="$2"; shift 2;;
+    --conda-env) CONDA_ENV="$2"; shift 2;;
     --max-parallel) MAX_PARALLEL="$2"; shift 2;;
     --mail-user) MAIL_USER="$2"; shift 2;;
     --wandb-entity) WANDB_ENTITY="$2"; shift 2;;
@@ -153,6 +155,7 @@ echo "  Mem           : $MEM"
 echo "  Time          : $TIME_LIMIT"
 echo "  Account       : $ACCOUNT"
 echo "  Job name      : $JOB_NAME"
+echo "  Conda env     : $CONDA_ENV"
 
 # Build optional mail args
 MAIL_ARGS=()
@@ -184,7 +187,7 @@ else
   echo "conda command not found in PATH; ensure the appropriate conda module is loaded" >&2
   exit 2
 fi
-conda activate /projects/0/prjs0951/conda_envs/tdmpc2
+conda activate "${CONDA_ENV}"
 
 echo "Conda environment activated."
 python -V
@@ -240,7 +243,7 @@ CMD=( sbatch
   -o "$OUT_DIR/%x_%A_%a.out"
   -e "$OUT_DIR/%x_%A_%a.err"
   --array "$ARRAY_RANGE"
-  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT"
+  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT,CONDA_ENV=$CONDA_ENV"
   "${MAIL_ARGS[@]:-}"
   "$BATCH_SCRIPT"
 )

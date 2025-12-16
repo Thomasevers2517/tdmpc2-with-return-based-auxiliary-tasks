@@ -38,6 +38,10 @@ try:
 except Exception as e:
     print(e, flush=True)
     make_distracting_control_env = missing_dependencies
+try:
+	from envs.humanoid import make_env as make_humanoid_env
+except:
+	make_humanoid_env = missing_dependencies
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -73,7 +77,7 @@ def make_env(cfg):
 
 	else:
 		env = None
-		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env, make_humanoid_env]:
 			try:
 				log.info('Trying to make environment with %s', fn.__module__)
 				env = fn(cfg)

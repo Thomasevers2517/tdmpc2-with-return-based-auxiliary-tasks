@@ -1,4 +1,4 @@
-name: tdmpc2
+name: tdmpc2-new
 channels:
   - pytorch
   - nvidia
@@ -33,6 +33,14 @@ dependencies:
       - dm-control
       - mujoco==3.1.2
 
-# afterwards
-# afterwards install torch pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.6.0
 
+# afterwards Remove the pytorch installation, and then install it like this
+# pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.6.0
+
+
+    # Humanoidbench:
+    # - git+https://github.com/windigal/humanoid-bench
+    # (Due to the humanoid-bench dependency installation breaking some package dependencies, it is necessary to reinstall numpy and pandas)
+    # numpy==1.25.2
+    # pandas==2.0.3
+    # mujoco==3.1.6 ??
