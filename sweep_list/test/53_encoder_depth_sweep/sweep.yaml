@@ -10,34 +10,46 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Humanoid-Bench Environment Test Sweep
+  # Encoder Depth Ablation
   # 
-  # Goal: Verify tdmpc2-humanoid conda environment works
-  #       with humanoid-bench tasks
+  # Goal: Test effect of adding encoder layer on dm-control
   # 
-  # Total: 1 run (humanoid_h1-slide-v0, 10k steps)
+  # Task: quadruped-walk
+  # Encoder layers: 2 (default) vs 3
+  # Seeds: 5 per config
+  # Total: 10 runs (2 configs x 5 seeds)
   #############################################
 
   task:
-    value: humanoid_h1-slide-v0
+    value: quadruped-walk
+
+  num_enc_layers:
+    values:
+      - 2
+      - 3
 
   seed:
-    value: 42
+    values:
+      - 42
+      - 43
+      - 44
+      - 45
+      - 46
 
   #############################################
-  # MINIMAL TEST CONFIG
+  # TRAINING CONFIG
   #############################################
 
   steps:
-    value: 10000
+    value: 100000
   eval_freq:
-    value: 5000
+    value: 10000
   
-  # Standard training params
+  # Training params
   utd_ratio:
     value: 4
   value_update_freq:
-    value: 4
+    value: 2
   pi_update_freq:
     value: 1
   batch_size:
@@ -97,7 +109,7 @@ parameters:
   max_std:
     value: 1
   hot_buffer_enabled:
-    value: true
+    value: false
   hot_buffer_ratio:
     value: 0.01
   hot_buffer_size:

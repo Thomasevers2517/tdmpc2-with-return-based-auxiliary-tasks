@@ -10,23 +10,20 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Encoder Depth Ablation
+  # Scaled Architecture Sweep
   # 
-  # Goal: Test effect of adding encoder layer on dm-control
+  # Goal: Test whether 8 Q functions + 3 encoder layers
+  #       improves performance on dm-control tasks
   # 
-  # Task: quadruped-walk
-  # Encoder layers: 2 (default) vs 3
-  # Seeds: 5 per config
-  # Total: 10 runs (2 configs x 5 seeds)
+  # Tasks: quadruped-walk, acrobot-swingup
+  # Seeds: 8 per task
+  # Total: 16 runs (2 tasks x 8 seeds)
   #############################################
 
   task:
-    value: quadruped-walk
-
-  num_enc_layers:
     values:
-      - 2
-      - 3
+      - quadruped-walk
+      - acrobot-swingup
 
   seed:
     values:
@@ -35,15 +32,27 @@ parameters:
       - 44
       - 45
       - 46
+      - 47
+      - 48
+      - 49
+
+  #############################################
+  # SCALED ARCHITECTURE
+  #############################################
+
+  num_q:
+    value: 8
+  num_enc_layers:
+    value: 3
 
   #############################################
   # TRAINING CONFIG
   #############################################
 
   steps:
-    value: 1000000
+    value: 100000
   eval_freq:
-    value: 50000
+    value: 10000
   
   # Training params
   utd_ratio:
@@ -82,8 +91,6 @@ parameters:
   # Planner
   planner_num_dynamics_heads:
     value: 4
-  num_q:
-    value: 2
   planner_head_reduce:
     value: max
   planner_use_all_heads_eval:
