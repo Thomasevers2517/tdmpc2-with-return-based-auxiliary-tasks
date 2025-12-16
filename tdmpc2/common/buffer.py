@@ -265,12 +265,8 @@ class Buffer():
 
 	def _preload_gpu(self):
 		try:
-			# use_hot = (
-			# 	self._hot_buffer is not None and
-			# 	self._hot_slices > 0 and
-			# 	self._curr_ep_len >= self._slice_len
-			# )
-			use_hot = self.isTrainBuffer
+			# Use hot buffer only if enabled AND this is a train buffer
+			use_hot = self._hot_enabled and self.isTrainBuffer
 			if not use_hot:
 				# Entire batch from main buffer
 				td_cpu = self._buffer.sample()
