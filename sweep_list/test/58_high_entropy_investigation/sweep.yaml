@@ -10,18 +10,24 @@ metric:
   goal: maximize
 parameters:
   #############################################
-  # Large Q Ensemble Sweep
+  # High Entropy Investigation Sweep
   # 
-  # Goal: Test 16 Q heads + 4 dynamics heads
-  #       with 3-4 encoder layers on quadruped-walk
+  # Goal: Test whether higher starting entropy (1e-4)
+  #       improves acrobot-swingup with scaled architecture
   # 
-  # Sweep: num_enc_layers [3, 4]
-  # Seeds: 8
-  # Total: 16 runs (2 configs x 8 seeds)
+  # Hypothesis: After entropy calculation fix (Dec 15),
+  #             acrobot may need higher entropy to explore
+  # 
+  # Tasks: acrobot-swingup, quadruped-walk
+  # start_entropy_coeff: 1e-4 (vs previous 3e-5)
+  # Seeds: 5
+  # Total: 10 runs (2 tasks x 5 seeds)
   #############################################
 
   task:
-    value: quadruped-walk
+    values:
+      - acrobot-swingup
+      - quadruped-walk
 
   seed:
     values:
@@ -30,22 +36,30 @@ parameters:
       - 44
       - 45
       - 46
-      - 47
-      - 48
-      - 49
 
   #############################################
-  # LARGE Q ENSEMBLE ARCHITECTURE
+  # SCALED ARCHITECTURE (from sweep 54)
   #############################################
 
   num_q:
-    value: 16
+    value: 8
   planner_num_dynamics_heads:
     value: 4
   num_enc_layers:
-    values:
-      - 3
-      - 4
+    value: 3
+
+  #############################################
+  # ENTROPY - HIGHER START
+  #############################################
+
+  start_entropy_coeff:
+    value: 1e-4
+  end_entropy_coeff:
+    value: 1e-6
+  entropy_action_dim_power:
+    value: 1.0
+  start_dynamic_entropy_ratio:
+    value: 1.0
 
   #############################################
   # TRAINING CONFIG
@@ -67,15 +81,7 @@ parameters:
   horizon:
     value: 3
 
-  entropy_action_dim_power:
-    value: 1.0
-  start_entropy_coeff:
-    value: 3e-5
-  end_entropy_coeff:
-    value: 1e-6
-  start_dynamic_entropy_ratio:
-    value: 1.0
-
+  # Policy config
   dual_policy_enabled:
     value: true
   policy_lambda_value_disagreement:
@@ -87,6 +93,7 @@ parameters:
   policy_head_reduce:
     value: min
 
+  # Planner
   planner_head_reduce:
     value: max
   planner_use_all_heads_eval:
@@ -94,6 +101,7 @@ parameters:
   planner_head_reduce_eval:
     value: min
 
+  # Dynamics prior
   dynamics_prior_enabled:
     value: true
   dynamics_prior_scale:
@@ -101,6 +109,7 @@ parameters:
   dynamics_prior_hidden_dim:
     value: 32
 
+  # Other
   tau:
     value: 0.003
   temperature:
@@ -116,6 +125,7 @@ parameters:
   hot_buffer_size:
     value: 5
 
+  # Multi-gamma
   multi_gamma_loss_weight:
     value: 0.01
   multi_gamma_gammas:
@@ -125,11 +135,13 @@ parameters:
   auxiliary_value_ema:
     value: true
 
+  # Eval/train mode
   eval_mpc:
     value: true
   train_mpc:
     value: true
 
+  # Logging
   enable_wandb:
     value: true
   wandb_project:
@@ -139,6 +151,7 @@ parameters:
   save_video:
     value: false
 
+  # Compilation
   compile:
     value: true
   compile_type:
