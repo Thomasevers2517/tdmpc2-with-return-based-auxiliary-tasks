@@ -10,6 +10,15 @@ ANALYSIS_ROOT: Path = Path(__file__).resolve().parent.parent
 RESULTS_ROOT: Path = ANALYSIS_ROOT / "results"
 RUN_CACHE_ROOT: Path = ANALYSIS_ROOT / "run_cache"
 
+# -------------------------------------------------------------------------
+# Baseline Results Paths (in project root /results/)
+# -------------------------------------------------------------------------
+PROJECT_ROOT: Path = ANALYSIS_ROOT.parent
+BASELINE_TDMPC2: Path = (PROJECT_ROOT / "results" / "tdmpc2").resolve()
+BASELINE_TDMPC2_PIXELS: Path = (PROJECT_ROOT / "results" / "tdmpc2-pixels").resolve()
+BASELINE_DREAMERV3: Path = (PROJECT_ROOT / "results" / "dreamerv3").resolve()
+BASELINE_SAC: Path = (PROJECT_ROOT / "results" / "sac").resolve()
+
 
 _TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
