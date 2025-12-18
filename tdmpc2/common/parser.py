@@ -162,11 +162,41 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			f"Invalid policy_head_reduce '{cfg.policy_head_reduce}'. Expected 'mean', 'min', or 'max'."
 		)
 
-	# Number of reward heads must be positive.
+	# Number of reward heads must be exactly 1 (multiple reward heads deprecated).
 	if not hasattr(cfg, 'num_reward_heads'):
 		cfg.num_reward_heads = 1  # Default for backward compatibility
-	if cfg.num_reward_heads < 1:
-		raise ValueError(f"num_reward_heads must be >= 1, got {cfg.num_reward_heads}.")
+	if cfg.num_reward_heads != 1:
+		raise ValueError(
+			f"num_reward_heads={cfg.num_reward_heads} is not supported. "
+			"Only num_reward_heads=1 is supported; multiple reward heads are deprecated."
+		)
+
+	# ----------------------------------------------------------------------
+	# Actor-critic source constraints (only 'imagine' mode supported)
+	# ----------------------------------------------------------------------
+	# Rationale: The value loss optimization picks head 0 for V predictions
+	# (z_seq[:-1, 0]) because all dynamics heads are identical before the
+	# dynamics rollout. This assumption only holds when imagination_horizon=1.
+	# With replay_rollout or longer horizons, dynamics heads diverge after
+	# the first step, so heads would no longer be identical at t > 0.
+	if cfg.ac_source != 'imagine':
+		raise ValueError(
+			f"ac_source='{cfg.ac_source}' is not supported. Only ac_source='imagine' is supported. "
+			"The value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
+			"which only holds when imagination_horizon=1 (imagine mode)."
+		)
+	if cfg.aux_value_source != 'imagine':
+		raise ValueError(
+			f"aux_value_source='{cfg.aux_value_source}' is not supported. Only aux_value_source='imagine' is supported. "
+			"The auxiliary value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
+			"which only holds when imagination_horizon=1 (imagine mode)."
+		)
+	if cfg.imagination_horizon != 1:
+		raise ValueError(
+			f"imagination_horizon={cfg.imagination_horizon} is not supported. Only imagination_horizon=1 is supported. "
+			"Multi-step imagination would cause dynamics heads to diverge, breaking the assumption that "
+			"all heads are identical at t=0 for value predictions."
+		)
 
 	if cfg.planner_lambda_disagreement == 0:
 		if cfg.planner_num_dynamics_heads > 1:

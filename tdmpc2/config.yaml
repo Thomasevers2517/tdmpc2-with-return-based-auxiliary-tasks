@@ -35,9 +35,19 @@ n_mc_samples_target: 1
 
 
 # Number of reward ensemble heads for pessimistic reward estimation.
-# When > 1, rewards are predicted by multiple heads and reduced via planner_head_reduce (planning)
-# or policy_head_reduce (policy loss). TD targets always use min over reward heads (pessimistic).
+# NOTE: Only num_reward_heads=1 is supported. Multiple reward heads are deprecated.
 num_reward_heads: 1
+
+# TD bootstrap mode: how value ensemble heads (Ve) and dynamics heads (H) are reduced for TD targets.
+# Options:
+#   'min'   - min over Ve and H (pessimistic, default, preserves original behavior)
+#   'mean'  - mean over Ve and H
+#   'local' - each Ve head bootstraps itself (no Ve reduction), H reduced by local_td_target_dynamics_reduction
+td_bootstrap_mode: local
+
+# Dynamics head reduction when td_bootstrap_mode='local'.
+# Options: 'min' or 'mean'. Only used when td_bootstrap_mode='local'.
+local_td_target_dynamics_reduction: mean
 
 # Aggregation over reward and dynamics heads when computing trajectory values for planning.
 # Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
@@ -96,13 +106,16 @@ buffer_update_interval: 1  # number of env steps between buffer additions when n
 # per_priority: recency # recency | consistency
 
 utd_ratio: 4  # World model updates per environment step
-value_update_freq: -1  # Value updates per env step. -1 means same as utd_ratio.
+value_update_freq: 2  # Value updates per env step. -1 means same as utd_ratio.
 pi_update_freq: 1  # Policy updates per env step.
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
+
+# actor-critic source settings (ONLY IMAGINE SUPPORTED CURRENTLY)
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: imagine # replay_true | replay_rollout | imagine
+
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
@@ -145,7 +158,7 @@ discount_max: 0.995
 buffer_size: 1000_000
 
 # Hot buffer (recent transitions) for mixed sampling
-hot_buffer_enabled: true         # When true, also store recent transitions in a small buffer
+hot_buffer_enabled: false         # When true, also store recent transitions in a small buffer
 hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
 hot_buffer_size: 5               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
@@ -172,7 +185,7 @@ temperature: 0.1
 log_std_min: -10
 log_std_max: 2
 end_entropy_coeff: 1e-6
-start_entropy_coeff: 1e-4
+start_entropy_coeff: 3e-5
 # Entropy scaling by action dimension.
 # scaled_entropy = entropy * (action_dim ** entropy_action_dim_power)
 # power=0: no extra scaling (entropy ~ D from Gaussian sum)
@@ -205,7 +218,7 @@ vmax: +10
 
 # architecture
 model_size: ???
-num_enc_layers: 2
+num_enc_layers: 3
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512

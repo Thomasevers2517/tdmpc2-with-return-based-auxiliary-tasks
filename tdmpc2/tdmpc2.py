@@ -585,12 +585,14 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def _td_target(self, next_z, reward, terminated, task):
 		"""
-		Compute the TD-target from a reward and the observation at the following time step.
+		Compute TD-target from a reward and the observation at the following time step.
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
-		For multi-head inputs, computes per-head TD targets then takes min over heads
-		for pessimistic value estimation. First reduces over reward heads (R), then
-		takes min over all dynamics heads (H).
+		
+		Reduction behavior controlled by cfg.td_bootstrap_mode:
+		  - 'min': min over Ve (value heads) and H (dynamics heads), then expand to Ve
+		  - 'mean': mean over Ve and H, then expand to Ve
+		  - 'local': each Ve head bootstraps itself, H reduced by cfg.local_td_target_dynamics_reduction
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -599,7 +601,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tuple[Tensor[T, B, 1], Tensor[T, B, 1]]: (Pessimistic TD-target, std across heads).
+			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1]]: (TD-targets per Ve head, std across dynamics heads).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -607,26 +609,51 @@ class TDMPC2(torch.nn.Module):
 		# Merge H and B for V evaluation: [T, H, B, L] -> [T, H*B, L]
 		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
 		
-		# Evaluate V on next states using target network
-		v_values_flat = self.model.V(next_z_flat, task, return_type='min', target=True)  # float32[T, H*B, 1]
+		# Get V predictions for all ensemble heads: [Ve, T, H*B, K]
+		v_logits_flat = self.model.V(next_z_flat, task, return_type='all', target=True)  # float32[Ve, T, H*B, K]
+		Ve = v_logits_flat.shape[0]
 		
-		# Reshape back to [T, H, B, 1]
-		v_values = v_values_flat.view(T, H, B, 1)  # float32[T, H, B, 1]
+		# Convert to scalar values: [Ve, T, H*B, 1]
+		v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
+		
+		# Reshape back to [Ve, T, H, B, 1]
+		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Pessimistically reduce over reward heads first: min over R (dim=1)
+		# Pessimistically reduce over reward heads: min over R (dim=1)
 		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
-		# Per-head TD targets: r + γ * (1 - done) * V(s')
-		td_per_head = reward_pessimistic + discount * (1 - terminated) * v_values  # float32[T, H, B, 1]
+		# Expand reward/terminated for broadcasting with Ve: [T, H, B, 1] -> [1, T, H, B, 1]
+		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
+		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 		
-		# Compute std across sampled dynamics heads (for logging)
-		td_std_across_heads = td_per_head.std(dim=1, unbiased=False).squeeze(-1)  # float32[T, B]
-		td_std_across_heads = td_std_across_heads.unsqueeze(-1)  # float32[T, B, 1]
+		# Per-head TD targets: r + γ * (1 - done) * V(s')  ->  [Ve, T, H, B, 1]
+		td_per_head = reward_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
 		
-		# Take min over all dynamics heads for pessimistic TD target
-		td_targets = torch.amin(td_per_head, dim=1)  # float32[T, B, 1]
+		# Compute std across dynamics heads (for logging), using mean over Ve
+		td_mean_over_ve = td_per_head.mean(dim=0)  # float32[T, H, B, 1]
+		td_std_across_heads = td_mean_over_ve.std(dim=1, unbiased=False)  # float32[T, B, 1]
+		
+		# Apply reduction based on td_bootstrap_mode - always reduce H, output is [Ve, T, B, 1]
+		mode = self.cfg.td_bootstrap_mode
+		if mode == 'min':
+			# Min over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
+			td_reduced = torch.amin(td_per_head, dim=(0, 2), keepdim=False)  # float32[T, B, 1]
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+		elif mode == 'mean':
+			# Mean over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
+			td_reduced = td_per_head.mean(dim=(0, 2), keepdim=False)  # float32[T, B, 1]
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+		elif mode == 'local':
+			# Each Ve head bootstraps itself; reduce H by local_td_target_dynamics_reduction
+			h_reduction = self.cfg.local_td_target_dynamics_reduction
+			if h_reduction == 'min':
+				td_targets = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
+			else:  # 'mean'
+				td_targets = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
+		else:
+			raise ValueError(f"Unknown td_bootstrap_mode: {mode}. Expected 'min', 'mean', or 'local'.")
 		
 		return td_targets, td_std_across_heads 
   
@@ -634,8 +661,10 @@ class TDMPC2(torch.nn.Module):
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
 		"""
-		Compute auxiliary multi-gamma TD targets with multi-head pessimism.
-		First reduces over reward heads (R), then over dynamics heads (H).
+		Compute auxiliary multi-gamma TD targets.
+		
+		Auxiliary values have no Ve ensemble, so td_bootstrap_mode 'min'/'mean'/'local'
+		are equivalent for Ve. Dynamics head (H) reduction uses local_td_target_dynamics_reduction.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -644,7 +673,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tensor[G_aux, T, B, 1]: Pessimistic TD targets per auxiliary gamma.
+			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma (H dimension reduced).
 		"""
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
@@ -665,7 +694,7 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Pessimistically reduce over reward heads first: min over R (dim=1)
+		# Pessimistically reduce over reward heads: min over R (dim=1)
 		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
 		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
@@ -679,8 +708,12 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Take min over all dynamics heads for pessimistic auxiliary TD target
-		td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
+		# Reduce H dimension using local_td_target_dynamics_reduction - output is [G_aux, T, B, 1]
+		h_reduction = self.cfg.local_td_target_dynamics_reduction
+		if h_reduction == 'min':
+			td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
+		else:  # 'mean'
+			td_targets_aux = td_per_head.mean(dim=2)  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
@@ -1022,13 +1055,14 @@ class TDMPC2(torch.nn.Module):
 		"""Compute primary critic loss on arbitrary latent sequences with multi-head support.
 		
 		With V-function, we predict V(z) for each state in the sequence and
-		train against TD targets r + γ * V(next_z). For multi-head inputs,
-		TD targets are computed per-head then min'd for pessimism.
+		train against TD targets r + γ * V(next_z). Value predictions use head 0
+		only (all heads are identical before dynamics rollout). TD targets use all
+		heads for next-state diversity, then reduce over H.
 
 		Args:
 			z_seq (Tensor[T+1, H, B, L]): Latent sequences with H heads.
 			actions (Tensor[T, H_a, B, A]): Actions (H_a=1 when shared across heads).
-			rewards (Tensor[T, H, B, 1]): Rewards per head.
+			rewards (Tensor[T, R, H, B, 1]): Rewards with R reward heads, H dynamics heads.
 			terminated (Tensor[T, H, B, 1]): Termination signals per head.
 			full_detach (bool): Whether to detach z_seq from graph.
 			task: Task index for multitask.
@@ -1052,13 +1086,11 @@ class TDMPC2(torch.nn.Module):
 		rewards = rewards.detach()  # float32[T, R, H, B, 1]
 		terminated = terminated.detach()  # float32[T, H, B, 1]
 
-		# V-function: input is state only, merge H into B
-		# z_seq[:-1]: [T, H, B, L] -> [T, H*B, L]
-		z_for_v = z_seq[:-1].view(T, H * B, L)  # float32[T, H*B, L]
-		vs_flat = self.model.V(z_for_v, task, return_type='all')  # float32[Ve, T, H*B, K]
-		Ve = vs_flat.shape[0]
-		# Reshape back: [Ve, T, H*B, K] -> [Ve, T, H, B, K]
-		vs = vs_flat.view(Ve, T, H, B, K)  # float32[Ve, T, H, B, K]
+		# V-function: use head 0 only for value predictions (all heads identical at t=0)
+		# z_seq[:-1, 0]: [T, B, L] - pick head 0
+		z_for_v = z_seq[:-1, 0]  # float32[T, B, L]
+		vs = self.model.V(z_for_v, task, return_type='all')  # float32[Ve, T, B, K]
+		Ve = vs.shape[0]
 
 		with maybe_range('Value/td_target', self.cfg):
 			with torch.no_grad():
@@ -1066,19 +1098,16 @@ class TDMPC2(torch.nn.Module):
 					td_targets, td_std_across_heads = self._td_target(z_td, rewards, terminated, task)
 				else:
 					td_targets, td_std_across_heads = self._td_target(z_seq[1:], rewards, terminated, task)
-				# td_targets: float32[T, B, 1], td_std_across_heads: float32[T, B, 1]
+				# td_targets: float32[Ve, T, B, 1], td_std_across_heads: float32[T, B, 1]
 
 		with maybe_range('Value/ce', self.cfg):
-			# TD targets are [T, B, 1] after min over heads
-			# Expand to match vs: [Ve, T, H, B, 1] - same target for all heads
-			td_expanded = td_targets.unsqueeze(0).unsqueeze(2).expand(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
+			# TD targets are [Ve, T, B, 1], vs is [Ve, T, B, K]
+			# Flatten for soft_ce: [Ve*T*B, K] and [Ve*T*B, 1]
+			vs_flat_ce = vs.contiguous().view(Ve * T * B, K)
+			td_flat = td_targets.contiguous().view(Ve * T * B, 1)
 			
-			# Flatten for soft_ce: [Ve*T*H*B, K] and [Ve*T*H*B, 1]
-			vs_flat_ce = vs.contiguous().view(Ve * T * H * B, K)
-			td_flat = td_expanded.contiguous().view(Ve * T * H * B, 1)
-			
-			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat, self.cfg)  # float32[Ve*T*H*B]
-			val_ce = val_ce_flat.view(Ve, T, H, B, 1).mean(dim=(0, 2, 3)).squeeze(-1)  # float32[T]
+			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat, self.cfg)  # float32[Ve*T*B]
+			val_ce = val_ce_flat.view(Ve, T, B, 1).mean(dim=(0, 2)).squeeze(-1)  # float32[T]
 
 		weighted = val_ce * rho_pows
 		loss = weighted.mean()
@@ -1090,7 +1119,7 @@ class TDMPC2(torch.nn.Module):
 		for t in range(T):
 			info.update({f'value_loss/step{t}': val_ce[t]}, non_blocking=True)
 		
-		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T, H, B, 1]
+		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T, B, 1]
 		if self.log_detailed:
 			info.update({
 				'td_target_mean': td_targets.mean(),
@@ -1104,15 +1133,12 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
    
-		# Value error: expand td_targets to [Ve, T, H, B, 1] for comparison
-		td_full = td_targets.unsqueeze(0).unsqueeze(2).expand(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
-		value_error = value_pred - td_full  # float32[Ve, T, H, B, 1]
-		# Average over heads for per-step logging
-		value_error_avg = value_error.mean(dim=2)  # float32[Ve, T, B, 1]
+		# Value error: td_targets is [Ve, T, B, 1], value_pred is [Ve, T, B, 1]
+		value_error = value_pred - td_targets  # float32[Ve, T, B, 1]
 		for i in range(T):
-			info.update({f"value_error_abs_mean/step{i}": value_error_avg[:, i].abs().mean(),
-						f"value_error_std/step{i}": value_error_avg[:, i].std(),
-						f"value_error_max/step{i}": value_error_avg[:, i].abs().max()}, non_blocking=True)
+			info.update({f"value_error_abs_mean/step{i}": value_error[:, i].abs().mean(),
+						f"value_error_std/step{i}": value_error[:, i].std(),
+						f"value_error_max/step{i}": value_error[:, i].abs().max()}, non_blocking=True)
 
 
 		return loss, info
@@ -1152,16 +1178,14 @@ class TDMPC2(torch.nn.Module):
 		rewards = rewards.detach()  # float32[T, R, H, B, 1]
 		terminated = terminated.detach()  # float32[T, H, B, 1]
 
-		# V_aux: input is state only, merge H into B
-		# z_seq[:-1]: [T, H, B, L] -> [T, H*B, L]
-		z_for_v = z_seq[:-1].view(T, H * B, L)  # float32[T, H*B, L]
-		v_aux_logits_flat = self.model.V_aux(z_for_v, task, return_type='all')  # float32[G_aux, T, H*B, K] or None
-		if v_aux_logits_flat is None:
+		# V_aux: use head 0 only for value predictions (all heads identical at t=0)
+		# z_seq[:-1, 0]: [T, B, L] - pick head 0
+		z_for_v = z_seq[:-1, 0]  # float32[T, B, L]
+		v_aux_logits = self.model.V_aux(z_for_v, task, return_type='all')  # float32[G_aux, T, B, K] or None
+		if v_aux_logits is None:
 			return torch.zeros((), device=device), TensorDict({}, device=device)
 
-		G_aux = v_aux_logits_flat.shape[0]
-		# Reshape back: [G_aux, T, H*B, K] -> [G_aux, T, H, B, K]
-		v_aux_logits = v_aux_logits_flat.view(G_aux, T, H, B, K)  # float32[G_aux, T, H, B, K]
+		G_aux = v_aux_logits.shape[0]  # v_aux_logits: float32[G_aux, T, B, K]
 
 		with maybe_range('Aux/td_target', self.cfg):
 			with torch.no_grad():
@@ -1171,16 +1195,13 @@ class TDMPC2(torch.nn.Module):
 					aux_td_targets = self._td_target_aux(z_seq[1:], rewards, terminated, task)  # float32[G_aux, T, B, 1]
 
 		with maybe_range('Aux/ce', self.cfg):
-			# TD targets are [G_aux, T, B, 1] after min over heads
-			# Expand to match v_aux_logits: [G_aux, T, H, B, 1] - same target for all heads
-			td_expanded = aux_td_targets.unsqueeze(2).expand(G_aux, T, H, B, 1)  # float32[G_aux, T, H, B, 1]
+			# TD targets are [G_aux, T, B, 1], v_aux_logits is [G_aux, T, B, K]
+			# Flatten for soft_ce: [G_aux*T*B, K] and [G_aux*T*B, 1]
+			vaux_flat = v_aux_logits.contiguous().view(G_aux * T * B, K)
+			aux_targets_flat = aux_td_targets.contiguous().view(G_aux * T * B, 1)
 			
-			# Flatten for soft_ce: [G_aux*T*H*B, K] and [G_aux*T*H*B, 1]
-			vaux_flat = v_aux_logits.contiguous().view(G_aux * T * H * B, K)
-			aux_targets_flat = td_expanded.contiguous().view(G_aux * T * H * B, 1)
-			
-			aux_ce_flat = math.soft_ce(vaux_flat, aux_targets_flat, self.cfg)  # float32[G_aux*T*H*B]
-			aux_ce = aux_ce_flat.view(G_aux, T, H, B, 1).mean(dim=(2, 3)).squeeze(-1)  # float32[G_aux, T]
+			aux_ce_flat = math.soft_ce(vaux_flat, aux_targets_flat, self.cfg)  # float32[G_aux*T*B]
+			aux_ce = aux_ce_flat.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # float32[G_aux, T]
 
 		weighted = aux_ce * rho_pows.unsqueeze(0)  # float32[G_aux, T]
 		losses = weighted.mean(dim=1)  # float32[G_aux] - mean over time per head
