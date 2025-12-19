@@ -1,0 +1,170 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Sweep 71: Local Min Hard Tasks Sweep
+  # 
+  # Goal: Test local TD bootstrap mode with MIN dynamics
+  #       reduction on harder tasks to prevent overfitting
+  # 
+  # Hypothesis: Taking min over dynamics heads (pessimistic)
+  #             will prevent value overestimation and exploitation
+  #             that was observed with mean reduction on dog tasks
+  # 
+  # Config:
+  # - td_bootstrap_mode: local (each Ve head bootstraps itself)
+  # - local_td_target_dynamics_reduction: min (pessimistic)
+  # - num_q: 8
+  # - steps: 1,000,000
+  # 
+  # Tasks: humanoid-run, dog-run, dog-trot
+  # Seeds: 2
+  # Total: 6 runs (3 tasks x 2 seeds)
+  #############################################
+
+  task:
+    values:
+      - humanoid-run
+      - dog-run
+      - dog-trot
+
+  seed:
+    values:
+      - 42
+      - 43
+
+  #############################################
+  # TD BOOTSTRAP MODE - LOCAL + MIN (PESSIMISTIC)
+  #############################################
+
+  td_bootstrap_mode:
+    value: local
+
+  local_td_target_dynamics_reduction:
+    value: min
+
+  #############################################
+  # SCALED ARCHITECTURE - 8Q
+  #############################################
+
+  num_q:
+    value: 8
+  num_enc_layers:
+    value: 3
+
+  #############################################
+  # TRAINING CONFIG - 1M STEPS
+  #############################################
+
+  steps:
+    value: 1000000
+  eval_freq:
+    value: 10000
+  
+  # Training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+  batch_size:
+    value: 256
+  horizon:
+    value: 3
+
+  # Entropy
+  entropy_action_dim_power:
+    value: 1.0
+  start_entropy_coeff:
+    value: 3e-5
+  end_entropy_coeff:
+    value: 1e-6
+  start_dynamic_entropy_ratio:
+    value: 1.0
+
+  # Policy config
+  dual_policy_enabled:
+    value: true
+  policy_lambda_value_disagreement:
+    value: 1.0
+  optimistic_policy_lambda_value_disagreement:
+    value: 0.0
+  optimistic_entropy_mult:
+    value: 1.0
+  policy_head_reduce:
+    value: min
+
+  # Planner
+  planner_num_dynamics_heads:
+    value: 4
+  planner_head_reduce:
+    value: max
+  planner_use_all_heads_eval:
+    value: true
+  planner_head_reduce_eval:
+    value: min
+
+  # Dynamics prior
+  dynamics_prior_enabled:
+    value: true
+  dynamics_prior_scale:
+    value: 1.0
+  dynamics_prior_hidden_dim:
+    value: 32
+
+  # Other
+  tau:
+    value: 0.003
+  temperature:
+    value: 0.1
+  min_std:
+    value: 0
+  max_std:
+    value: 1
+  hot_buffer_enabled:
+    value: false
+  hot_buffer_ratio:
+    value: 0.01
+  hot_buffer_size:
+    value: 5
+
+  # Multi-gamma
+  multi_gamma_loss_weight:
+    value: 0.01
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  multi_gamma_head:
+    value: joint
+  auxiliary_value_ema:
+    value: true
+
+  # Eval/train mode
+  eval_mpc:
+    value: true
+  train_mpc:
+    value: true
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

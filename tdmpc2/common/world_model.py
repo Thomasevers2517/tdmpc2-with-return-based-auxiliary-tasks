@@ -666,8 +666,12 @@ class WorldModel(nn.Module):
 		elif head_mode == 'all':
 			H_sel = H_total
 			head_indices = list(range(H_total))
+		elif head_mode == 'random':
+			# Randomly select one dynamics head per update (for single-head imagination)
+			H_sel = 1
+			head_indices = [torch.randint(0, H_total, (1,)).item()]
 		else:
-			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
+			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single', 'all', or 'random'.")
 
 		# Determine action dim
 		if not use_policy:

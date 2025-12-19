@@ -648,7 +648,10 @@ class TDMPC2(torch.nn.Module):
 		elif mode == 'local':
 			# Each Ve head bootstraps itself; reduce H by local_td_target_dynamics_reduction
 			h_reduction = self.cfg.local_td_target_dynamics_reduction
-			if h_reduction == 'min':
+			if h_reduction == 'single':
+				# H=1 when using single random head, no reduction needed
+				td_targets = td_per_head.squeeze(2)  # float32[Ve, T, B, 1]
+			elif h_reduction == 'min':
 				td_targets = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
 			else:  # 'mean'
 				td_targets = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
@@ -710,7 +713,10 @@ class TDMPC2(torch.nn.Module):
 		
 		# Reduce H dimension using local_td_target_dynamics_reduction - output is [G_aux, T, B, 1]
 		h_reduction = self.cfg.local_td_target_dynamics_reduction
-		if h_reduction == 'min':
+		if h_reduction == 'single':
+			# H=1 when using single random head, no reduction needed
+			td_targets_aux = td_per_head.squeeze(2)  # float32[G_aux, T, B, 1]
+		elif h_reduction == 'min':
 			td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
 		else:  # 'mean'
 			td_targets_aux = td_per_head.mean(dim=2)  # float32[G_aux, T, B, 1]
@@ -969,8 +975,18 @@ class TDMPC2(torch.nn.Module):
 		S, B_orig, L = start_z.shape  # start_z: float32[S, B_orig, L]
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
-		# Use all dynamics heads for imagination (no random sampling to avoid CUDA graph issues)
-		H = int(self.cfg.planner_num_dynamics_heads)
+		
+		# Determine head_mode based on local_td_target_dynamics_reduction
+		# When 'single', use a randomly-selected dynamics head (cheapest)
+		# Otherwise, use all heads and reduce later
+		h_reduction = self.cfg.local_td_target_dynamics_reduction
+		if self.cfg.td_bootstrap_mode == 'local' and h_reduction == 'single':
+			head_mode = 'random'  # Use single randomly-selected head
+			H = 1  # Only one head in output
+		else:
+			head_mode = 'all'
+			H = int(self.cfg.planner_num_dynamics_heads)
+		
 		# Multi-head imagination requires rollout_len=1 so all heads share the same action
 		# (policy samples at z[0] before dynamics step)
 		if H > 1:
@@ -988,7 +1004,7 @@ class TDMPC2(torch.nn.Module):
 				use_policy=True,
 				horizon=rollout_len,
 				num_rollouts=n_rollouts,
-				head_mode='all',  # Use all dynamics heads (avoids torch.randperm issues with CUDA graphs)
+				head_mode=head_mode,  # 'all' or 'random' based on config
 				task=task,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]

@@ -46,7 +46,11 @@ num_reward_heads: 1
 td_bootstrap_mode: local
 
 # Dynamics head reduction when td_bootstrap_mode='local'.
-# Options: 'min' or 'mean'. Only used when td_bootstrap_mode='local'.
+# Options:
+#   'min'    - min over all dynamics heads (pessimistic)
+#   'mean'   - mean over all dynamics heads
+#   'single' - use a single randomly-selected dynamics head per update (cheapest)
+# Only used when td_bootstrap_mode='local'.
 local_td_target_dynamics_reduction: mean
 
 # Aggregation over reward and dynamics heads when computing trajectory values for planning.
