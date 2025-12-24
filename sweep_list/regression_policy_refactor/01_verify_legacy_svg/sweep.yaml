@@ -1,0 +1,66 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 01
+  # 
+  # Goal: Verify that the legacy SVG policy path still works
+  #       after adding the new regression policy code.
+  # 
+  # Key settings:
+  # - pi_regression_enabled: false (use legacy SVG)
+  # 
+  # This is a smoke test to ensure the refactoring didn't
+  # break the existing code path.
+  # 
+  # Total: 1 run
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    value: 42
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Disable regression policy (use legacy SVG)
+  pi_regression_enabled:
+    value: false
+
+  #############################################
+  # TRAINING CONFIG (short run for smoke test)
+  #############################################
+
+  steps:
+    value: 5000
+  eval_freq:
+    value: 2500
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Disable compilation for easier debugging
+  compile:
+    value: false
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 500

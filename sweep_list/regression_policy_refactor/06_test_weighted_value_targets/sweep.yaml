@@ -1,0 +1,87 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 06
+  # 
+  # Goal: Test weighted value targets implementation.
+  # Weights computed once via compute_regression_weights() and shared
+  # between value loss and policy loss.
+  # 
+  # Single test run to verify implementation works.
+  # 
+  # Total: 1 run
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    value: 1
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Enable regression policy (AWR-style)
+  pi_regression_enabled:
+    value: true
+  
+  # Enable weighted value targets (new feature)
+  weighted_value_targets:
+    value: true
+
+  # Softmax temperature for action weighting
+  pi_regression_temperature:
+    value: 0.01
+
+  # Number of rollouts for Q estimation
+  num_rollouts:
+    value: 32
+
+  #############################################
+  # ENTROPY CONFIG
+  #############################################
+
+  # Fixed entropy ratio
+  start_dynamic_entropy_ratio:
+    value: 1
+
+  # Entropy coefficient
+  start_entropy_coeff:
+    value: 0.01
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 20000
+  eval_freq:
+    value: 5000
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Disable compilation for easier debugging
+  compile:
+    value: false
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 500

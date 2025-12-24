@@ -11,7 +11,7 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
              value_disagreement: Tensor[1], score: Tensor[1]).
     """
-    lat_all, _ = world_model.rollout_latents(
+    lat_all, _, _, _ = world_model.rollout_latents(
         z0,
         actions=noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         use_policy=False,

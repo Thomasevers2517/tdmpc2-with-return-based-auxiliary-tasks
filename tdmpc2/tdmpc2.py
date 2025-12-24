@@ -204,6 +204,9 @@ class TDMPC2(torch.nn.Module):
 			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=self.cfg.compile_type, fullgraph=False)
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=self.cfg.compile_type, fullgraph=False)
+			# Separately compile regression policy loss (uses different CUDAGraph)
+			self._compute_regression_pi_loss_eager = self._compute_regression_pi_loss
+			self._compute_regression_pi_loss = torch.compile(self._compute_regression_pi_loss, mode=self.cfg.compile_type, fullgraph=False)
 
 			@torch.compile(mode=self.cfg.compile_type, fullgraph=False )
 			def optim_step():
@@ -223,6 +226,7 @@ class TDMPC2(torch.nn.Module):
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
+			self._compute_regression_pi_loss_eager = self._compute_regression_pi_loss
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
 
@@ -550,6 +554,245 @@ class TDMPC2(torch.nn.Module):
 
 			return pi_loss, info
 
+	@torch.no_grad()
+	def compute_regression_weights(
+		self,
+		td_targets,
+		v_next,
+		batch_structure,
+		update_scale=True,
+	):
+		"""Compute softmax(Q/τ) weights for both pessimistic and optimistic policies.
+		
+		This method computes action weights based on Q-estimates from TD targets.
+		Called once in _compute_loss_components, weights are then passed to both
+		value loss (pessimistic only) and policy losses (pessimistic + optimistic).
+		
+		Args:
+			td_targets (Tensor[T, R, H, Ve, B, 1]): Raw TD targets from compute_imagination_td_targets.
+			v_next (Tensor[T, H, Ve, B, 1]): V(next_z) for value disagreement computation.
+			batch_structure (dict): Contains S, B_orig, N, B for proper softmax over samples.
+			update_scale (bool): If True, update RunningScale with pessimistic Q values.
+			
+		Returns:
+			Tuple[Tensor, Tensor, TensorDict]: (pessimistic_weights, optimistic_weights, info_dict)
+				Each weights tensor has shape [T, B, 1].
+		"""
+		T = td_targets.shape[0]
+		B = batch_structure['B']
+		S = batch_structure['S']
+		B_orig = batch_structure['B_orig']
+		N = batch_structure['N']
+		device = td_targets.device
+		dtype = td_targets.dtype
+		
+		temperature = self.cfg.pi_regression_temperature
+		
+		# Flatten R, H, Ve dimensions for unified reduction: [T, R*H*Ve, B, 1]
+		td_flat = td_targets.view(T, -1, B, 1)  # float32[T, R*H*Ve, B, 1]
+		
+		# Pessimistic Q: min over all heads
+		pess_reduce_mode = self.cfg.policy_head_reduce  # 'min' or 'mean'
+		pess_reduce_fn = torch.amin if pess_reduce_mode == 'min' else torch.mean
+		Q_pess = pess_reduce_fn(td_flat, dim=1)  # float32[T, B, 1]
+		
+		# Optimistic Q: max over all heads
+		Q_opti = torch.amax(td_flat, dim=1)  # float32[T, B, 1]
+		
+		# Update RunningScale with pessimistic Q values (before disagreement)
+		if update_scale:
+			self.scale.update(Q_pess[0])
+		
+		# Value disagreement across all heads (H * Ve)
+		# v_next: [T, H, Ve, B, 1] -> flatten to [T, H*Ve, B, 1]
+		v_flat = v_next.view(T, -1, B, 1)  # float32[T, H*Ve, B, 1]
+		v_disagreement = v_flat.std(dim=1)  # float32[T, B, 1]
+		
+		# Apply disagreement penalty (pessimistic) and bonus (optimistic)
+		lambda_pess = self.cfg.policy_lambda_value_disagreement
+		lambda_opti = self.cfg.optimistic_policy_lambda_value_disagreement
+		Q_pess = Q_pess - lambda_pess * v_disagreement
+		Q_opti = Q_opti + lambda_opti * v_disagreement
+		
+		# Scale Q-estimates for softmax
+		Q_pess_scaled = self.scale(Q_pess)  # float32[T, B, 1]
+		Q_opti_scaled = self.scale(Q_opti)  # float32[T, B, 1]
+		
+		# Reshape to expose N dimension for proper AWR softmax over sampled actions
+		# B = S * B_orig * N, reshape to [T, S*B_orig, N, 1]
+		Q_pess_for_softmax = Q_pess_scaled.view(T, S * B_orig, N, 1)  # float32[T, S*B_orig, N, 1]
+		Q_opti_for_softmax = Q_opti_scaled.view(T, S * B_orig, N, 1)  # float32[T, S*B_orig, N, 1]
+		
+		# Softmax over N (the sampled actions per state)
+		weights_pess_per_state = torch.softmax(Q_pess_for_softmax / temperature, dim=2)  # float32[T, S*B_orig, N, 1]
+		weights_opti_per_state = torch.softmax(Q_opti_for_softmax / temperature, dim=2)  # float32[T, S*B_orig, N, 1]
+		
+		# Flatten back to [T, B, 1]
+		weights_pess = weights_pess_per_state.view(T, B, 1)  # float32[T, B, 1]
+		weights_opti = weights_opti_per_state.view(T, B, 1)  # float32[T, B, 1]
+		
+		# Compute effective number of samples: 1 / sum(w²) per state
+		# Higher = more uniform, lower = more peaked
+		weights_pess_sq = weights_pess_per_state.pow(2).sum(dim=2)  # [T, S*B_orig, 1]
+		eff_samples_pess = (1.0 / (weights_pess_sq + 1e-8)).mean()  # scalar
+		weights_opti_sq = weights_opti_per_state.pow(2).sum(dim=2)  # [T, S*B_orig, 1]
+		eff_samples_opti = (1.0 / (weights_opti_sq + 1e-8)).mean()  # scalar
+		
+		# Build info dict for logging
+		info = TensorDict({
+			'regression_weights_pess_max': weights_pess.max(),
+			'regression_weights_pess_min': weights_pess.min(),
+			'regression_weights_opti_max': weights_opti.max(),
+			'regression_weights_opti_min': weights_opti.min(),
+			'regression_eff_samples_pess': eff_samples_pess,
+			'regression_eff_samples_opti': eff_samples_opti,
+			'regression_q_pess_scaled_mean': Q_pess_scaled.mean(),
+			'regression_q_opti_scaled_mean': Q_opti_scaled.mean(),
+			'regression_q_pess_scaled_std': Q_pess_scaled.std(),
+			'regression_q_opti_scaled_std': Q_opti_scaled.std(),
+			'regression_v_disagreement_mean': v_disagreement.mean(),
+			'regression_temperature': float(temperature),
+		}, device=device)
+		
+		return weights_pess, weights_opti, info
+
+	def calculate_regression_pi_loss(
+		self,
+		z,
+		actions,
+		batch_structure,
+		task,
+		weights,
+		optimistic=False,
+	):
+		"""Compute AWR-style policy loss using pre-computed softmax weights.
+		
+		Uses pre-computed action weights from compute_regression_weights() to train
+		policy via weighted NLL + entropy bonus.
+
+		Args:
+			z (Tensor[T, B, L]): Latent states at t=0 of imagination (DETACHED).
+			actions (Tensor[T, B, A]): Sampled actions (from pessimistic policy, DETACHED).
+			batch_structure (dict): Contains S, B_orig, N, B for proper softmax over samples.
+			task: Optional task identifier.
+			weights (Tensor[T, B, 1]): Pre-computed softmax weights from compute_regression_weights.
+			optimistic (bool): If True, use optimistic policy and entropy scaling;
+				if False, use pessimistic policy.
+
+		Returns:
+			Tuple[Tensor, TensorDict]: Policy loss scalar and info dict with logging metrics.
+		"""
+		T, B, L = z.shape  # z: float32[T, B, L]
+		A = actions.shape[-1]  # actions: float32[T, B, A]
+		device = z.device
+		dtype = z.dtype
+		
+		# Extract batch structure for proper softmax over N samples
+		S = batch_structure['S']
+		B_orig = batch_structure['B_orig']
+		N = batch_structure['N']
+		assert B == S * B_orig * N, f"Batch mismatch: B={B}, S*B_orig*N={S*B_orig*N}"
+
+		# Temporal weighting
+		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=dtype))  # float32[T]
+
+		# Select entropy coefficient based on optimistic flag
+		if optimistic:
+			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+		else:
+			entropy_coeff = self.dynamic_entropy_coeff
+
+		# Get log_probs and entropy WITH GRADIENTS
+		# Must recompute for both policies using DETACHED z to avoid backprop through encoder.
+		# The log_probs from imagination are attached to encoder graph, which was freed after
+		# total_loss.backward(). Recomputing ensures gradients only flow to policy params.
+		z_flat = z.detach().view(T * B, L)  # float32[T*B, L] - DETACHED from encoder
+		actions_flat = actions.view(T * B, A)  # float32[T*B, A]
+		
+		_, pi_info = self.model.pi(z_flat, task, optimistic=optimistic)
+		mu = pi_info['presquash_mean']  # float32[T*B, A]
+		log_std = pi_info['log_std']  # float32[T*B, A]
+
+		# Compute log probability for the sampled actions
+		log_probs = math.compute_action_log_prob(actions_flat, mu, log_std)  # float32[T*B, 1]
+		log_probs = log_probs.view(T, B, 1)  # float32[T, B, 1]
+
+		# Use scaled_entropy from pi_info
+		scaled_entropy_flat = pi_info['scaled_entropy']  # float32[T*B, 1]
+		scaled_entropy = scaled_entropy_flat.view(T, B, 1)  # float32[T, B, 1]
+
+		# Weighted negative log-likelihood per state
+		# For each of the S*B_orig states, we have N samples with weights summing to 1.
+		# (weights * log_probs).sum(dim=1) sums across all B = S*B_orig*N samples.
+		# Since weights sum to 1 per state, this gives S*B_orig weighted averages summed together.
+		# Divide by S*B_orig to get the mean weighted log-prob across states.
+		num_states = S * B_orig
+		weighted_nll = -(weights * log_probs).sum(dim=1, keepdim=True) / num_states  # float32[T, 1, 1]
+		weighted_nll = weighted_nll.squeeze(-1)  # float32[T, 1]
+
+		# Entropy bonus (mean over all B samples, which is equivalent to mean over states)
+		entropy_mean = scaled_entropy.mean(dim=1, keepdim=True).squeeze(-1)  # float32[T, 1]
+
+		# Per-timestep loss
+		loss_t = weighted_nll - entropy_coeff * entropy_mean  # float32[T, 1]
+
+		# Temporal-weighted mean
+		loss_per_t = loss_t.squeeze(-1)  # float32[T]
+		loss = (loss_per_t * rho_pows).sum() / rho_pows.sum()
+
+		# Build info dict for logging
+		prefix = "opti_regression_" if optimistic else "regression_"
+		info = TensorDict({
+			f"{prefix}loss": loss,
+			f"{prefix}weight_entropy": -(weights * (weights + 1e-8).log()).sum(dim=1).mean(),
+			f"{prefix}log_prob_mean": log_probs.mean(),
+			f"{prefix}entropy_mean": entropy_mean.mean(),
+			f"{prefix}weights_max": weights.max(),
+			f"{prefix}weights_min": weights.min(),
+		}, device=device)
+
+		return loss, info
+
+	def _compute_regression_pi_loss(self, z, actions, weights_pess, weights_opti, S, B_orig, N, B, task):
+		"""Compute regression policy loss in a separately compiled function.
+		
+		This method wraps calculate_regression_pi_loss and is compiled separately from
+		_compute_loss_components to avoid CUDAGraph memory conflicts. All inputs must
+		be DETACHED tensors with no references to the encoder/dynamics graph.
+		
+		Args:
+			z (Tensor[T, B, L]): Latent states, DETACHED.
+			actions (Tensor[T, B, A]): Sampled actions, DETACHED.
+			weights_pess (Tensor[T, B, 1]): Pessimistic softmax weights, DETACHED.
+			weights_opti (Tensor[T, B, 1] or None): Optimistic weights if dual_policy, DETACHED.
+			S (int): Number of starting states.
+			B_orig (int): Original batch size.
+			N (int): Number of rollouts per state.
+			B (int): Total batch size = S * B_orig * N.
+			task: Task identifier.
+			
+		Returns:
+			Tuple[Tensor, TensorDict]: Total policy loss and combined info dict.
+		"""
+		batch_structure = {'S': S, 'B_orig': B_orig, 'N': N, 'B': B}
+		
+		# Pessimistic policy loss
+		pess_loss, pess_info = self.calculate_regression_pi_loss(
+			z, actions, batch_structure, task, weights_pess, optimistic=False
+		)
+		pi_loss = pess_loss
+		pi_info = pess_info
+		
+		# Optimistic policy loss (if dual policy enabled)
+		if self.cfg.dual_policy_enabled:
+			opt_loss, opt_info = self.calculate_regression_pi_loss(
+				z, actions, batch_structure, task, weights_opti, optimistic=True
+			)
+			pi_info.update(opt_info, non_blocking=True)
+			pi_loss = pi_loss + opt_loss
+		
+		return pi_loss, pi_info
+
 	def update_pi(self, zs, task):
 		"""
 		Update policy using a sequence of latent states.
@@ -723,6 +966,109 @@ class TDMPC2(torch.nn.Module):
 		
 		return td_targets_aux
 
+	@torch.no_grad()
+	def compute_imagination_td_targets(self, rewards, next_z, terminated, task):
+		"""Compute 1-step TD targets for all head combinations from imagined rollout.
+		
+		Returns raw targets without any head reduction — that's left to the loss functions.
+		Used for both value loss and regression policy loss which require different reductions.
+
+		Args:
+			rewards (Tensor[T, R, H, B_exp, 1]): Rewards from R reward heads × H dynamics heads.
+			next_z (Tensor[T, H, B_exp, L]): Next latent states from H dynamics heads.
+			terminated (Tensor[T, H, B_exp, 1]): Termination flags per dynamics head.
+			task: Optional task identifier.
+
+		Returns:
+			Tuple[Tensor[T, R, H, Ve, B_exp, 1], Tensor[T, H, Ve, B_exp, 1]]:
+				- td_targets: Raw TD targets for all head combinations
+				- v_next: V(next_z) for all heads (for disagreement computation)
+		"""
+		T, H, B_exp, L = next_z.shape  # next_z: float32[T, H, B_exp, L]
+		R = rewards.shape[1]  # rewards: float32[T, R, H, B_exp, 1]
+
+		# Get discount
+		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+
+		# Flatten for V call: [T, H, B_exp, L] -> [T, H*B_exp, L]
+		next_z_flat = next_z.view(T, H * B_exp, L)  # float32[T, H*B_exp, L]
+
+		# Get all Ve value heads using target network: [Ve, T, H*B_exp, K]
+		v_logits = self.model.V(next_z_flat, task, return_type='all', target=True)  # float32[Ve, T, H*B_exp, K]
+		v_values = math.two_hot_inv(v_logits, self.cfg)  # float32[Ve, T, H*B_exp, 1]
+
+		# Reshape to [T, H, Ve, B_exp, 1]
+		Ve = v_values.shape[0]
+		v_values_reshaped = v_values.view(Ve, T, H, B_exp, 1)  # float32[Ve, T, H, B_exp, 1]
+		v_next = v_values_reshaped.permute(1, 2, 0, 3, 4).contiguous()  # float32[T, H, Ve, B_exp, 1]
+
+		# Compute TD targets: r + γ(1-term)V
+		# rewards: [T, R, H, B_exp, 1], need to broadcast with Ve
+		# terminated: [T, H, B_exp, 1], broadcast to [T, 1, H, 1, B_exp, 1]
+
+		# Expand dimensions for broadcasting
+		rewards_exp = rewards.unsqueeze(3)  # float32[T, R, H, 1, B_exp, 1]
+		term_exp = terminated.unsqueeze(1).unsqueeze(3)  # float32[T, 1, H, 1, B_exp, 1]
+		v_next_exp = v_next.unsqueeze(1)  # float32[T, 1, H, Ve, B_exp, 1]
+
+		td_targets = rewards_exp + discount * (1 - term_exp) * v_next_exp  # float32[T, R, H, Ve, B_exp, 1]
+
+		return td_targets, v_next
+
+	@torch.no_grad()
+	def compute_imagination_aux_td_targets(self, rewards, next_z, terminated, task):
+		"""Compute 1-step TD targets for auxiliary values with different gammas.
+		
+		Similar to compute_imagination_td_targets but uses V_aux instead of V.
+		Returns raw targets without head reduction.
+
+		Args:
+			rewards (Tensor[T, R, H, B_exp, 1]): Rewards from R reward heads × H dynamics heads.
+			next_z (Tensor[T, H, B_exp, L]): Next latent states from H dynamics heads.
+			terminated (Tensor[T, H, B_exp, 1]): Termination flags per dynamics head.
+			task: Optional task identifier.
+
+		Returns:
+			Tensor[T, R, H, G_aux, B_exp, 1]: Raw aux TD targets for all head/gamma combinations.
+				Returns None if no auxiliary gammas configured.
+		"""
+		G_aux = self.model._num_aux_gamma
+		if G_aux == 0:
+			return None
+
+		T, H, B_exp, L = next_z.shape  # next_z: float32[T, H, B_exp, L]
+
+		# Get discount
+		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
+
+		# Flatten for V_aux call: [T, H, B_exp, L] -> [T, H*B_exp, L]
+		next_z_flat = next_z.view(T, H * B_exp, L)  # float32[T, H*B_exp, L]
+
+		# Get aux values for all gammas using target network
+		v_aux_flat = self.model.V_aux(next_z_flat, task, return_type='min', target=True)  # float32[G_aux, T, H*B_exp, 1]
+
+		# Reshape to [G_aux, T, H, B_exp, 1]
+		v_aux = v_aux_flat.view(G_aux, T, H, B_exp, 1)  # float32[G_aux, T, H, B_exp, 1]
+
+		# Compute TD targets for each gamma
+		# gammas_aux: [G_aux] tensor of gamma values (exclude primary gamma)
+		gammas_aux = torch.tensor(self._all_gammas[1:], device=next_z.device, dtype=next_z.dtype)  # float32[G_aux]
+		gammas_aux = gammas_aux.view(G_aux, 1, 1, 1, 1)  # float32[G_aux, 1, 1, 1, 1]
+
+		# rewards: [T, R, H, B_exp, 1] -> expand for G_aux: [1, T, R, H, B_exp, 1]
+		# terminated: [T, H, B_exp, 1] -> expand: [1, T, 1, H, B_exp, 1]
+		# v_aux: [G_aux, T, H, B_exp, 1] -> expand for R: [G_aux, T, 1, H, B_exp, 1]
+		rewards_exp = rewards.unsqueeze(0)  # float32[1, T, R, H, B_exp, 1]
+		terminated_exp = terminated.unsqueeze(0).unsqueeze(2)  # float32[1, T, 1, H, B_exp, 1]
+		v_aux_exp = v_aux.unsqueeze(2)  # float32[G_aux, T, 1, H, B_exp, 1]
+
+		aux_td_targets = rewards_exp + gammas_aux * discount * (1 - terminated_exp) * v_aux_exp
+		# Shape: float32[G_aux, T, R, H, B_exp, 1]
+
+		# Permute to match main TD target convention: [T, R, H, G_aux, B_exp, 1]
+		aux_td_targets = aux_td_targets.permute(1, 2, 3, 0, 4, 5).contiguous()  # float32[T, R, H, G_aux, B_exp, 1]
+
+		return aux_td_targets
 
 	def world_model_losses(self, z_true, z_target, action, reward, terminated, task=None):
 		"""Compute world-model losses (consistency, reward, termination)."""
@@ -738,7 +1084,7 @@ class TDMPC2(torch.nn.Module):
 		with maybe_range('Agent/world_model_rollout', self.cfg):
 			# Use vectorized multi-head rollout over provided actions
 			actions_in = action.permute(1, 0, 2).unsqueeze(1)  # [B,1,T,A]
-			lat_all, _ = self.model.rollout_latents(
+			lat_all, _, _, _ = self.model.rollout_latents(
 				z_true[0], actions=actions_in, use_policy=False, head_mode='all', task=task
 			)  # lat_all: [H,B,1,T+1,L]
 			# Consistency over heads: average MSE across heads and batch per time step
@@ -999,7 +1345,7 @@ class TDMPC2(torch.nn.Module):
 		start_flat = start_z.view(B_total, L)  # float32[B_total, L]
 
 		with maybe_range('Agent/imagined_rollout', self.cfg):
-			latents, actions = self.model.rollout_latents(
+			latents, actions, log_probs_raw, scaled_entropy_raw = self.model.rollout_latents(
 				start_flat,
 				use_policy=True,
 				horizon=rollout_len,
@@ -1008,6 +1354,8 @@ class TDMPC2(torch.nn.Module):
 				task=task,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
+		# log_probs_raw: float32[B_total, N, T, 1] - ATTACHED for policy gradients
+		# scaled_entropy_raw: float32[B_total, N, T, 1] - ATTACHED for policy gradients
 		# H equals planner_num_dynamics_heads when head_mode='all'
 		assert latents.shape[0] == H, f"Expected {H} heads, got {latents.shape[0]}"
 
@@ -1055,7 +1403,16 @@ class TDMPC2(torch.nn.Module):
 
 		# Avoid in-place detach on a view; build a fresh contiguous tensor
 		with maybe_range('Imagined/final_pack', self.cfg):
-			z_seq_out = torch.cat([z_seq[:1], z_seq[1:].detach()], dim=0).clone()  # float32[T+1, H, B, L]
+			# Clone z_seq[:1] to ensure it persists past CUDAGraph replay.
+			# The starting states are ATTACHED to encoder for value loss gradients,
+			# but the intermediate buffers may be overwritten by CUDAGraph replays.
+			z_seq_out = torch.cat([z_seq[:1].clone(), z_seq[1:].detach()], dim=0).clone()  # float32[T+1, H, B, L]
+
+			# NOTE: log_probs and scaled_entropy from rollout_latents are NOT returned.
+			# They would require gradients through pi() which causes CUDAGraph memory conflicts
+			# due to graph breaks from torch.no_grad() in later computations. Instead, the policy
+			# loss (both SVG and regression) recomputes these from scratch using the detached
+			# z and actions, ensuring gradients flow only through the policy params.
 
 		return {
 			'z_seq': z_seq_out,  # float32[T+1, H, B, L]
@@ -1063,11 +1420,18 @@ class TDMPC2(torch.nn.Module):
 			'rewards': rewards.detach(),  # float32[T, R, H, B, 1]
 			'terminated': terminated.detach(),  # float32[T, H, B, 1]
 			'termination_logits': term_logits.detach(),  # float32[T, H, B, 1]
+			# Batch structure info for proper softmax over samples in regression policy
+			'batch_structure': {
+				'S': S,  # number of starting states
+				'B_orig': B_orig,  # original batch size
+				'N': n_rollouts,  # num_rollouts (samples per state)
+				'B': B,  # flattened batch = S * B_orig * N
+			},
 		}
 
 
 
-	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
+	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None, sample_weights=None, batch_structure=None):
 		"""Compute primary critic loss on arbitrary latent sequences with multi-head support.
 		
 		With V-function, we predict V(z) for each state in the sequence and
@@ -1083,12 +1447,15 @@ class TDMPC2(torch.nn.Module):
 			full_detach (bool): Whether to detach z_seq from graph.
 			task: Task index for multitask.
 			z_td (Tensor[T, H, B, L], optional): Override next_z for TD target.
+			sample_weights (Tensor[T, B, 1], optional): Softmax weights for weighted averaging
+				over N rollouts per state. If None, use uniform averaging.
+			batch_structure (dict, optional): Contains S, B_orig, N, B for proper weighted
+				averaging over N samples. Required when sample_weights is provided.
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Scalar loss and info dict.
 		"""
-		if z_td is None:
-			assert self.cfg.ac_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
+		# Note: z_td is always None now (imagination mode only, no replay_rollout)
 		
 		# z_seq: [T+1, H, B, L]; actions: [T, H_a, B, A] where H_a may be 1
 		T_plus_1, H, B, L = z_seq.shape
@@ -1123,9 +1490,30 @@ class TDMPC2(torch.nn.Module):
 			td_flat = td_targets.contiguous().view(Ve * T * B, 1)
 			
 			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat, self.cfg)  # float32[Ve*T*B]
-			val_ce = val_ce_flat.view(Ve, T, B, 1).mean(dim=(0, 2)).squeeze(-1)  # float32[T]
+			val_ce = val_ce_flat.view(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+			
+			# Apply sample weights if provided (weighted averaging over N rollouts per state)
+			if sample_weights is not None and batch_structure is not None:
+				# sample_weights: [T, B, 1], need to expand for Ve
+				# weights sum to 1 per state over N samples
+				# B = S * B_orig * N, want weighted mean over N for each of (S * B_orig) states
+				S = batch_structure['S']
+				B_orig = batch_structure['B_orig']
+				N = batch_structure['N']
+				num_states = S * B_orig
+				
+				# Expand weights for Ve dimension: [1, T, B, 1]
+				w = sample_weights.unsqueeze(0)  # float32[1, T, B, 1]
+				
+				# Weighted sum over B (which contains N samples per state, weights sum to 1 per state)
+				# Then divide by num_states to get mean over states
+				val_ce_weighted = (w * val_ce).sum(dim=2, keepdim=True) / num_states  # float32[Ve, T, 1, 1]
+				val_ce_per_t = val_ce_weighted.mean(dim=0).squeeze(-1).squeeze(-1)  # float32[T]
+			else:
+				# Uniform averaging: mean over Ve and B, keep T
+				val_ce_per_t = val_ce.mean(dim=(0, 2)).squeeze(-1)  # float32[T]
 
-		weighted = val_ce * rho_pows
+		weighted = val_ce_per_t * rho_pows
 		loss = weighted.mean()
 
 		info = TensorDict({
@@ -1133,7 +1521,7 @@ class TDMPC2(torch.nn.Module):
 		}, device=device, non_blocking=True)
 
 		for t in range(T):
-			info.update({f'value_loss/step{t}': val_ce[t]}, non_blocking=True)
+			info.update({f'value_loss/step{t}': val_ce_per_t[t]}, non_blocking=True)
 		
 		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T, B, 1]
 		if self.log_detailed:
@@ -1159,7 +1547,7 @@ class TDMPC2(torch.nn.Module):
 
 		return loss, info
 
-	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None):
+	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None, z_td=None, sample_weights=None, batch_structure=None):
 		"""Compute auxiliary multi-gamma critic losses with multi-head support.
 		
 		With V-function, we predict V_aux(z) for each state and auxiliary gamma.
@@ -1173,12 +1561,15 @@ class TDMPC2(torch.nn.Module):
 			full_detach (bool): Whether to detach z_seq from graph.
 			task: Task index for multitask.
 			z_td (Tensor[T, H, B, L], optional): Override next_z for TD target.
+			sample_weights (Tensor[T, B, 1], optional): Softmax weights for weighted averaging
+				over N rollouts per state. If None, use uniform averaging.
+			batch_structure (dict, optional): Contains S, B_orig, N, B for proper weighted
+				averaging over N samples. Required when sample_weights is provided.
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Scalar loss and info dict.
 		"""
-		if z_td is None:
-			assert self.cfg.aux_value_source != "replay_rollout", "Need to supply z_td for ac_source=replay_rollout in calculate_value_loss"
+		# Note: z_td is always None now (imagination mode only, no replay_rollout)
 		if self.model._num_aux_gamma == 0:
 			return torch.zeros((), device=z_seq.device), TensorDict({}, device=z_seq.device)
 
@@ -1217,9 +1608,29 @@ class TDMPC2(torch.nn.Module):
 			aux_targets_flat = aux_td_targets.contiguous().view(G_aux * T * B, 1)
 			
 			aux_ce_flat = math.soft_ce(vaux_flat, aux_targets_flat, self.cfg)  # float32[G_aux*T*B]
-			aux_ce = aux_ce_flat.view(G_aux, T, B, 1).mean(dim=2).squeeze(-1)  # float32[G_aux, T]
+			aux_ce = aux_ce_flat.view(G_aux, T, B, 1)  # float32[G_aux, T, B, 1]
+			
+			# Apply sample weights if provided (weighted averaging over N rollouts per state)
+			if sample_weights is not None and batch_structure is not None:
+				# sample_weights: [T, B, 1], need to expand for G_aux
+				# B = S * B_orig * N, want weighted mean over N for each state
+				S = batch_structure['S']
+				B_orig = batch_structure['B_orig']
+				N = batch_structure['N']
+				num_states = S * B_orig
+				
+				# Expand weights for G_aux dimension: [1, T, B, 1]
+				w = sample_weights.unsqueeze(0)  # float32[1, T, B, 1]
+				
+				# Weighted sum over B (contains N samples per state, weights sum to 1 per state)
+				# Then divide by num_states to get mean over states
+				aux_ce_weighted = (w * aux_ce).sum(dim=2, keepdim=True) / num_states  # float32[G_aux, T, 1, 1]
+				aux_ce_per_t = aux_ce_weighted.squeeze(-1).squeeze(-1)  # float32[G_aux, T]
+			else:
+				# Uniform averaging: mean over B, keep G_aux and T
+				aux_ce_per_t = aux_ce.mean(dim=2).squeeze(-1)  # float32[G_aux, T]
 
-		weighted = aux_ce * rho_pows.unsqueeze(0)  # float32[G_aux, T]
+		weighted = aux_ce_per_t * rho_pows.unsqueeze(0)  # float32[G_aux, T]
 		losses = weighted.mean(dim=1)  # float32[G_aux] - mean over time per head
 		# Mean over aux heads (not sum) - LR scaling compensates for ensemble size
 		loss_mean = losses.mean()  # scalar
@@ -1290,143 +1701,109 @@ class TDMPC2(torch.nn.Module):
 			z_rollout = None  # No rollout available
 			lat_all = None  # No multi-head rollout available
 
-		source_cache = {}
-
-		def fetch_source(name):
-			"""Fetch source data for value loss computation with unified [T, H, B, ...] format.
-			
-			Non-imagined sources (replay_true, replay_rollout) have H=1 and R=1 added via unsqueeze.
-			Rewards use format [T, R, H, B, 1] where R=num_reward_heads, H=num_dynamics_heads.
-			The 'imagine' source uses native multi-head output from imagined_rollout.
-			"""
-			if name in source_cache:
-				return source_cache[name]
-			if name == 'replay_true':
-				# Add H=1 dimension: [T, B, ...] -> [T, 1, B, ...]
-				# Add R=1 dimension for rewards: [T, B, 1] -> [T, 1, 1, B, 1]
-				src = {
-					'z_seq': z_true.unsqueeze(1),  # float32[T+1, 1, B, L]
-					'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
-					'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
-					'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
-					'full_detach': False,
-					'z_td': None,
-				}
-			elif name == 'replay_rollout':
-				# Interleaved head selection: split batch B across H heads diagonally.
-				# lat_all: [H, B, 1, T+1, L] - each head has its own rollout for all B samples.
-				# We select: samples 0:chunk_size from head 0, chunk_size:2*chunk_size from head 1, etc.
-				# This ensures uniform training across all dynamics heads.
-				# When lat_all is None (WM not updated), fall back to z_true with H=1 dimension.
-				if lat_all is None:
-					# No rollout available, use z_true instead
-					src = {
-						'z_seq': z_true.unsqueeze(1),  # float32[T+1, 1, B, L]
-						'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
-						'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
-						'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
-						'full_detach': False,
-						'z_td': None,
-					}
-					source_cache[name] = src
-					return src
-				H_dyn, B_dyn, _, T_plus_1, L_lat = lat_all.shape  # lat_all: [H, B, 1, T+1, L]
-				assert B_dyn % H_dyn == 0, (
-					f"Batch size must be divisible by number of dynamics heads for interleaved selection. "
-					f"Got B={B_dyn}, H={H_dyn}."
-				)
-				chunk_size = B_dyn // H_dyn
-				
-				# Build interleaved z_seq: select chunk from each head
-				# Samples [0:chunk] from head 0, [chunk:2*chunk] from head 1, etc.
-				z_interleaved_parts = [
-					lat_all[h, h * chunk_size:(h + 1) * chunk_size, 0]  # [chunk_size, T+1, L]
-					for h in range(H_dyn)
-				]
-				z_interleaved = torch.cat(z_interleaved_parts, dim=0)  # [B, T+1, L]
-				z_interleaved = z_interleaved.permute(1, 0, 2)  # [T+1, B, L]
-				
-				# Add H=1 dimension for compatibility with multi-head format
-				src = {
-					'z_seq': z_interleaved.unsqueeze(1),  # float32[T+1, 1, B, L]
-					'actions': action.unsqueeze(1),  # float32[T, 1, B, A]
-					'rewards': reward.unsqueeze(1).unsqueeze(1),  # float32[T, 1, 1, B, 1] (R=1, H=1)
-					'terminated': terminated.unsqueeze(1),  # float32[T, 1, B, 1]
-					'full_detach': False,
-					'z_td': z_true[1:].unsqueeze(1),  # float32[T, 1, B, L]
-				}
-			elif name == 'imagine':
-				# Imagination starts from encoded/rollout latents and rolls forward with policy.
-				# imagine_initial_source controls starting point:
-				#   'replay_true': start from true encoded latents z_true
-				#   'replay_rollout': start from dynamics rollout z_rollout (head 0)
-				# 
-				# Gradient flow logic:
-				#   - If update_world_model=False: fully detach start_z (no encoder gradients from value)
-				#   - If update_world_model=True and replay_true: keep attached (encoder gradients flow)
-				#   - If update_world_model=True and replay_rollout: partial detach (z[0] attached, z[1:] detached)
-				imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
-				# When z_rollout is None (WM not updated), force replay_true
-				if z_rollout is None:
-					imagine_source = 'replay_true'
-				if imagine_source == 'replay_true':
-					# When WM not updated: no WM gradients to encoder, so also block value gradients.
-					start_z = z_true.detach() if not update_world_model else z_true
-				elif imagine_source == 'replay_rollout':
-					# z_rollout[0] = encoder output (same as z_true[0]), z_rollout[1:] = dynamics predictions.
-					# When WM updated: keep z_rollout[0] attached for encoder gradients, detach z_rollout[1:]
-					# to block gradients to dynamics (already trained via consistency loss).
-					# When WM not updated: fully detach (no encoder gradients from value).
-					if not update_world_model:
-						start_z = z_rollout.detach()
-					else:
-						start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
-				else:
-					raise ValueError(f"imagine_initial_source must be 'replay_true' or 'replay_rollout', got '{imagine_source}'")
-				imagined = self.imagined_rollout(start_z, task=task, rollout_len=self.cfg.imagination_horizon)
-				# imagined_rollout already returns [T, R, H, B, 1] format for rewards
-				src = {
-					'z_seq': imagined['z_seq'],  # float32[T+1, H, B, L]
-					'actions': imagined['actions'],  # float32[T, 1, B, A] (shared across heads)
-					'rewards': imagined['rewards'],  # float32[T, R, H, B, 1]
-					'terminated': imagined['terminated'],  # float32[T, H, B, 1]
-					'full_detach': (not update_value) or self.cfg.detach_imagine_value,
-					'z_td': None,
-				}
-			else:
-				raise ValueError(f'Unsupported value source "{name}"')
-			source_cache[name] = src
-			return src
-
-		# Only compute value losses if update_value is True
+		# Imagined rollout for value/policy losses (always use imagination)
+		# imagine_initial_source controls starting point:
+		#   'replay_true': start from true encoded latents z_true
+		#   'replay_rollout': start from dynamics rollout z_rollout (head 0)
+		imagined = None
+		sample_weights_for_value = None
+		batch_structure_for_value = None
 		if update_value:
-			value_inputs = fetch_source(self.cfg.ac_source)
+			imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
+			# When z_rollout is None (WM not updated), force replay_true
+			if z_rollout is None:
+				imagine_source = 'replay_true'
+			if imagine_source == 'replay_true':
+				# When WM not updated: no WM gradients to encoder, so also block value gradients.
+				start_z = z_true.detach() if not update_world_model else z_true
+			elif imagine_source == 'replay_rollout':
+				# z_rollout[0] = encoder output (same as z_true[0]), z_rollout[1:] = dynamics predictions.
+				# When WM updated: keep z_rollout[0] attached for encoder gradients, detach z_rollout[1:]
+				# to block gradients to dynamics (already trained via consistency loss).
+				# When WM not updated: fully detach (no encoder gradients from value).
+				if not update_world_model:
+					start_z = z_rollout.detach()
+				else:
+					start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
+			else:
+				raise ValueError(f"imagine_initial_source must be 'replay_true' or 'replay_rollout', got '{imagine_source}'")
+			
+			# Imagination horizon is always 1 (hardcoded)
+			IMAGINATION_HORIZON = 1
+
+			imagined = self.imagined_rollout(start_z, task=task, rollout_len=IMAGINATION_HORIZON)
+			# imagined contains:
+			#   z_seq: float32[T+1, H, B, L]
+			#   actions: float32[T, 1, B, A] (shared across heads)
+			#   rewards: float32[T, R, H, B, 1]
+			#   terminated: float32[T, H, B, 1]
+			#   batch_structure: dict with S, B_orig, N, B
+			# NOTE: log_probs/scaled_entropy are NOT returned to avoid CUDAGraph conflicts.
+			# Policy loss recomputes them from detached z and actions.
+			
+			full_detach = self.cfg.detach_imagine_value
+			batch_structure = imagined['batch_structure']
+			
+			# Compute regression weights early if enabled (shared between value and policy losses)
+			# This avoids recomputing weights in both places and ensures consistency.
+			weights_pess = None
+			weights_opti = None
+			weights_info = None
+			if self.cfg.pi_regression_enabled and self.cfg.weighted_value_targets:
+				# Extract tensors for weight computation
+				z_seq = imagined['z_seq'].detach()  # float32[T+1, H, B, L]
+				rewards_im = imagined['rewards'].detach()  # float32[T, R, H, B, 1]
+				terminated_im = imagined['terminated'].detach()  # float32[T, H, B, 1]
+				
+				# Compute TD targets for weighting
+				next_z = z_seq[1:]  # float32[T, H, B, L]
+				td_targets, v_next = self.compute_imagination_td_targets(
+					rewards_im, next_z, terminated_im, task
+				)
+				# td_targets: [T, R, H, Ve, B, 1], v_next: [T, H, Ve, B, 1]
+				
+				# Compute both pessimistic and optimistic weights
+				weights_pess, weights_opti, weights_info = self.compute_regression_weights(
+					td_targets, v_next, batch_structure, task
+				)
+				# weights_pess/weights_opti: [T, B, 1], both detached
+				
+				# Use pessimistic weights for value loss
+				sample_weights_for_value = weights_pess
+				batch_structure_for_value = batch_structure
+			
 			value_loss, value_info = self.calculate_value_loss(
-				value_inputs['z_seq'],
-				value_inputs['actions'],
-				value_inputs['rewards'],
-				value_inputs['terminated'],
-				value_inputs['full_detach'],
-				z_td=value_inputs['z_td'],
+				imagined['z_seq'],
+				imagined['actions'],
+				imagined['rewards'],
+				imagined['terminated'],
+				full_detach,
+				z_td=None,
 				task=task,
+				sample_weights=sample_weights_for_value,
+				batch_structure=batch_structure_for_value,
 			)
+			
+			# Add weights info to value_info for logging
+			if weights_info is not None:
+				value_info.update(weights_info, non_blocking=True)
 
 			aux_loss = torch.zeros((), device=device)
 			aux_info = TensorDict({}, device=device)
 			if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
-				aux_inputs = fetch_source(self.cfg.aux_value_source)
 				aux_loss, aux_info = self.calculate_aux_value_loss(
-					aux_inputs['z_seq'],
-					aux_inputs['actions'],
-					aux_inputs['rewards'],
-					aux_inputs['terminated'],
-					aux_inputs['full_detach'],
-					z_td=aux_inputs['z_td'],
+					imagined['z_seq'],
+					imagined['actions'],
+					imagined['rewards'],
+					imagined['terminated'],
+					full_detach,
+					z_td=None,
 					task=task,
+					sample_weights=sample_weights_for_value,
+					batch_structure=batch_structure_for_value,
 				)
 		else:
 			# Skip value/aux losses when not updating value
-			value_inputs = {'z_seq': z_rollout.unsqueeze(1)}  # Minimal for actor_source fallback
 			value_loss = torch.zeros((), device=device)
 			value_info = TensorDict({}, device=device)
 			aux_loss = torch.zeros((), device=device)
@@ -1437,10 +1814,8 @@ class TDMPC2(torch.nn.Module):
 		info.update(value_info, non_blocking=True)
 		info.update(aux_info, non_blocking=True)
   
-		critic_weighted = self.cfg.value_coef * value_loss
-		critic_weighted =  critic_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.ac_source == 'imagine' else critic_weighted
-		aux_weighted = self.cfg.multi_gamma_loss_weight * aux_loss
-		aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult if self.cfg.aux_value_source == 'imagine' else aux_weighted
+		critic_weighted = self.cfg.value_coef * value_loss * self.cfg.imagine_value_loss_coef_mult
+		aux_weighted = self.cfg.multi_gamma_loss_weight * aux_loss * self.cfg.imagine_value_loss_coef_mult
 
 		total_loss = wm_loss + critic_weighted + aux_weighted
 		info.update({
@@ -1450,6 +1825,41 @@ class TDMPC2(torch.nn.Module):
 			'aux_loss_mean_weighted': aux_weighted
 		}, non_blocking=True)
 
+		# Prepare policy_data for regression policy loss (all tensors DETACHED)
+		# This data will be passed to _compute_regression_pi_loss which is separately compiled.
+		policy_data = None
+		if imagined is not None and self.cfg.pi_regression_enabled:
+			# Extract and detach tensors needed for regression policy loss
+			z_seq = imagined['z_seq'].detach()  # float32[T+1, H, B, L]
+			actions_im = imagined['actions'].detach()  # float32[T, 1, B, A]
+			batch_structure = imagined['batch_structure']
+			
+			# Get z at t=0 for policy (head 0, since all heads identical before dynamics)
+			# Clone after detach to ensure separate memory from CUDAGraph-captured buffers
+			z_for_pi = z_seq[:-1, 0].detach().clone()  # float32[T, B, L]
+			actions_flat = actions_im[:, 0].detach().clone()  # float32[T, B, A]
+			
+			# Use pre-computed weights if weighted_value_targets is enabled
+			# Otherwise, compute weights in _compute_regression_pi_loss (legacy path - not implemented)
+			if self.cfg.weighted_value_targets:
+				# weights_pess and weights_opti were computed earlier for value loss
+				# They are already detached, clone for separate memory from CUDAGraph
+				policy_data = {
+					'z': z_for_pi,
+					'actions': actions_flat,
+					'weights_pess': weights_pess.clone(),  # float32[T, B, 1]
+					'weights_opti': weights_opti.clone() if weights_opti is not None else None,
+					'S': batch_structure['S'],
+					'B_orig': batch_structure['B_orig'],
+					'N': batch_structure['N'],
+					'B': batch_structure['B'],
+				}
+			else:
+				raise NotImplementedError(
+					"pi_regression_enabled requires weighted_value_targets=true. "
+					"The old path computing weights inside calculate_regression_pi_loss is deprecated."
+				)
+
 		return {
 			'wm_loss': wm_loss,
 			'value_loss': value_loss,
@@ -1457,8 +1867,8 @@ class TDMPC2(torch.nn.Module):
 			'info': info,
 			'z_true': z_true,
 			'z_rollout': z_rollout,
-			'value_inputs': value_inputs,
-
+			'imagined': imagined,  # Full imagined dict (kept for legacy SVG path)
+			'policy_data': policy_data,  # Detached data for regression policy loss
 		}
 
 	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, update_world_model=True, task=None):
@@ -1484,7 +1894,8 @@ class TDMPC2(torch.nn.Module):
 			info = components['info']
 			z_true = components['z_true']
 			z_rollout = components['z_rollout']
-			value_inputs = components['value_inputs']
+			imagined = components['imagined']  # Full imagined dict (kept for legacy SVG path)
+			policy_data = components['policy_data']  # Detached data for regression policy loss
       
 			total_loss = info['total_loss']		
 			self.optim.zero_grad(set_to_none=True) # this is crucial since the pi_loss also backprops through the world model, we want to clear those remaining gradients
@@ -1505,24 +1916,46 @@ class TDMPC2(torch.nn.Module):
 			pi_grad_norm = torch.zeros((), device=self.device)
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
-				if self.cfg.actor_source == 'ac':
-					# value_inputs['z_seq'] is [T_imag+1, H, B_expanded, L] where:
-					#   T_imag = imagination_horizon (e.g., 1)
-					#   B_expanded = S * batch_size * num_rollouts (e.g., 2 * 256 * 4 = 2048)
-					# 
-					# Problem: Due to num_rollouts, the initial states (t=0) are duplicated
-					# num_rollouts times. Training on these duplicates is wasteful.
-					# Solution: Skip t=0 and train only on rolled-out states (t=1+).
-					# Trade-off: Policy never sees true encoded states, only 1-step imagined ones.
-					z_for_pi = value_inputs['z_seq'][1:, 0].detach()  # float32[T_imag, B_expanded, L]
-				elif self.cfg.actor_source == 'replay_rollout':
-					# z_rollout is [T+1, B, L] (no H dimension from world_model_losses)
-					z_for_pi = z_rollout.detach()
-				elif self.cfg.actor_source == 'replay_true':
-					# z_true is [T+1, B, L] (no H dimension from encoder)
-					z_for_pi = z_true.detach()
-    
-				pi_loss, pi_info = self.update_pi(z_for_pi, task)
+
+				if self.cfg.pi_regression_enabled:
+					# ========== Regression-style policy loss (AWR-like) ==========
+					# Use pre-computed policy_data from _compute_loss_components.
+					# All tensors are DETACHED - no references to encoder/dynamics graph.
+					# _compute_regression_pi_loss is separately compiled (different CUDAGraph).
+					assert policy_data is not None, (
+						"pi_regression_enabled requires update_value=True to have policy_data"
+					)
+					
+					if log_grads:
+						pi_loss, pi_info = self._compute_regression_pi_loss_eager(
+							policy_data['z'],
+							policy_data['actions'],
+							policy_data['weights_pess'],
+							policy_data['weights_opti'],
+							policy_data['S'],
+							policy_data['B_orig'],
+							policy_data['N'],
+							policy_data['B'],
+							task,
+						)
+					else:
+						pi_loss, pi_info = self._compute_regression_pi_loss(
+							policy_data['z'],
+							policy_data['actions'],
+							policy_data['weights_pess'],
+							policy_data['weights_opti'],
+							policy_data['S'],
+							policy_data['B_orig'],
+							policy_data['N'],
+							policy_data['B'],
+							task,
+						)
+				else:
+					# ========== Legacy SVG-style policy loss ==========
+					# Use z_rollout from world model losses for policy training
+					z_for_pi = z_rollout.detach()  # float32[T+1, B, L]
+					pi_loss, pi_info = self.update_pi(z_for_pi, task)
+				
 				pi_total = pi_loss * self.cfg.policy_coef
 				pi_total.backward()
 				if log_grads:
@@ -1729,16 +2162,9 @@ class TDMPC2(torch.nn.Module):
 					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False)
 					val_info = components['info']
 
-					
-					if self.cfg.actor_source == 'ac':
-						# Same logic as training: skip t=0 to avoid duplicated initial states,
-						# and index H=0 to remove dynamics head dimension.
-						# z_seq shape: [T_imag+1, H, B_expanded, L] -> [T_imag, B_expanded, L]
-						z_for_pi = components['value_inputs']['z_seq'][1:, 0].detach()
-					elif self.cfg.actor_source == 'replay_rollout':
-						z_for_pi = components['z_rollout'].detach()
-					elif self.cfg.actor_source == 'replay_true':
-						z_for_pi = components['z_true'].detach()
+					# Use z_rollout for policy validation (matches legacy SVG training path)
+					# z_rollout: [T+1, B, L] — dynamics rollout from encoded observations
+					z_for_pi = components['z_rollout'].detach()
       
 					pi_loss, pi_info = self.update_pi(z_for_pi, task)
 					val_info.update(pi_info, non_blocking=True)

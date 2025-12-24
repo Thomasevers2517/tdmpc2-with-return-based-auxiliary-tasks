@@ -508,7 +508,7 @@ class WorldModel(nn.Module):
 				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
-				"action_prob": 1.,
+				"action_prob": log_prob,  # float32[..., 1], log π(a|z) with squash correction
 				"entropy": entropy,
 				"scaled_entropy": scaled_entropy,
 				"entropy_multiplier": entropy_multiplier,
@@ -633,8 +633,13 @@ class WorldModel(nn.Module):
 				for action sampling. Ignored when `use_policy=False`.
 
 		Returns:
-			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
-				H_sel is 1 for 'single', H_total for 'all'.
+			Tuple of 4 tensors:
+			- latents: Tensor[H_sel,B,N,T+1,L] — Latent trajectories. H_sel is 1 for 'single', H_total for 'all'.
+			- actions: Tensor[B,N,T,A] — Actions used at each step.
+			- log_probs: Tensor[B,N,T,1] or None — Log probabilities of actions (only when use_policy=True).
+				ATTACHED (has gradients to policy parameters through μ and σ).
+			- scaled_entropy: Tensor[B,N,T,1] or None — Scaled entropy at each step (only when use_policy=True).
+				ATTACHED (has gradients to policy parameters through σ).
 		"""
 		if use_policy:
 			if actions is not None:
@@ -680,11 +685,16 @@ class WorldModel(nn.Module):
 			A = self.cfg.action_dim
 
 		# Build per-step lists to avoid in-place writes on graph tensors
-		# t=0 state for all heads: broadcast z0 over N, then tile over heads
-		z0_bn = z0.unsqueeze(1).expand(B, N, L)  # float32[B,N,L]
-		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)  # float32[H_sel,B,N,L]
+		# t=0 state for all heads: expand z0 to [H_sel, B, N, L]
+		# NOTE: Clone to ensure tensor persists past CUDAGraph replay.
+		# Without clone, CUDAGraphs may overwrite the memory during subsequent runs,
+		# causing "accessing tensor output that has been overwritten" errors on backward.
+		# z0: [B, L] -> unsqueeze(0) -> [1, B, L] -> unsqueeze(2) -> [1, B, 1, L] -> expand -> [H_sel, B, N, L]
+		z0_hbn = z0.unsqueeze(0).unsqueeze(2).expand(H_sel, B, N, L).clone()  # float32[H_sel,B,N,L] - CLONED for CUDAGraph safety
 		latents_steps = [z0_hbn]
 		actions_steps = []  # each entry: float32[B,N,A]
+		log_probs_steps = []  # each entry: float32[B,N,1] - ATTACHED for policy gradients
+		entropy_steps = []  # each entry: float32[B,N,1] - ATTACHED for policy gradients
 
 		with maybe_range('WM/rollout_latents', self.cfg):
 			# Time loop over T
@@ -694,9 +704,18 @@ class WorldModel(nn.Module):
 					if use_policy:
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
-							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
-							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
+							# Clone to ensure tensor survives CUDAGraph memory reuse
+							z_for_pi = latents_steps[t][0].reshape(B * N, L).clone()  # float32[B*N,L]
+							a_flat, pi_info = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
+							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A] - DETACHED
+							
+							# Capture log_prob and entropy - KEEP ATTACHED for policy gradients
+							# Gradients flow through μ (presquash_mean) and σ (log_std) to policy params
+							log_prob_t = pi_info['action_prob'].view(B, N, 1)  # float32[B,N,1] - ATTACHED
+							entropy_t = pi_info['scaled_entropy'].view(B, N, 1)  # float32[B,N,1] - ATTACHED
+							log_probs_steps.append(log_prob_t)
+							entropy_steps.append(entropy_t)
+							
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
 								a_t = (a_t + noise).clamp(-1.0, 1.0)
@@ -730,8 +749,16 @@ class WorldModel(nn.Module):
 		with maybe_range('WM/rollout_latents/finalize', self.cfg):
 			latents = torch.stack(latents_steps, dim=3).contiguous()  # float32[H_sel,B,N,T+1,L]
 			actions_out = torch.stack(actions_steps, dim=2).contiguous()  # float32[B,N,T,A]
+			
+			# Stack log_probs and entropy if policy was used
+			if use_policy:
+				log_probs_out = torch.stack(log_probs_steps, dim=2).contiguous()  # float32[B,N,T,1]
+				entropy_out = torch.stack(entropy_steps, dim=2).contiguous()  # float32[B,N,T,1]
+			else:
+				log_probs_out = None
+				entropy_out = None
 
 		# Cheap sanity: ensure contiguity for downstream views
 		assert latents.is_contiguous(), "latents expected contiguous"
 		assert actions_out.is_contiguous(), "actions_out expected contiguous"
-		return latents, actions_out
+		return latents, actions_out, log_probs_out, entropy_out

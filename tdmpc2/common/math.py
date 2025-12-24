@@ -38,6 +38,40 @@ def squash(mu, pi, log_pi):
 	return mu, pi, log_pi
 
 
+def compute_action_log_prob(actions, mu, log_std):
+	"""Compute log-probability of squashed actions under Gaussian policy.
+	
+	Given squashed actions (in [-1, 1]) and policy parameters (pre-squash mean, log_std),
+	computes log π(a|z) accounting for the tanh squashing transformation via the
+	change-of-variables Jacobian correction.
+	
+	Args:
+		actions: Squashed actions in [-1, 1], float32[..., A].
+		mu: Pre-squash mean from policy (presquash_mean), float32[..., A].
+		log_std: Log standard deviation from policy, float32[..., A].
+		
+	Returns:
+		log_prob: Log probability summed over action dims, float32[..., 1].
+	"""
+	# Clamp actions for numerical stability: atanh(±1) = ±∞
+	# This is required because tanh can produce values arbitrarily close to ±1
+	actions_clamped = actions.clamp(-0.9999, 0.9999)
+	
+	# Transform to pre-squash space: a_presquash = atanh(a)
+	actions_presquash = torch.atanh(actions_clamped)
+	
+	# Compute Gaussian log-prob in pre-squash space
+	std = log_std.exp()
+	eps = (actions_presquash - mu) / std
+	log_prob_presquash = gaussian_logprob(eps, log_std)  # float32[..., 1]
+	
+	# Jacobian correction for tanh squashing: -Σ log(1 - a²)
+	# This accounts for the change of variables from pre-squash to squashed space
+	jacobian_correction = torch.log(1 - actions_clamped.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+	
+	return log_prob_presquash - jacobian_correction
+
+
 def int_to_one_hot(x, num_classes):
 	"""
 	Converts an integer tensor to a one-hot tensor.

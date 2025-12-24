@@ -92,7 +92,7 @@ class Planner(torch.nn.Module):
         if S > 0:
             # Use optimistic policy for seeding during training if dual_policy_enabled
             use_optimistic = (not eval_mode) and self.cfg.dual_policy_enabled
-            latents_p, actions_p = self.world_model.rollout_latents(
+            latents_p, actions_p, _, _ = self.world_model.rollout_latents(
                 z0,
                 use_policy=True,
                 horizon=T,
@@ -150,7 +150,7 @@ class Planner(torch.nn.Module):
             std = std.clamp(self.cfg.min_std, self.cfg.max_std)
             actions_s = sample_action_sequences(mean, std, N).detach()
             # World model expects actions [B,N,T,A]; here B=1
-            latents_s, actions_s = self.world_model.rollout_latents(
+            latents_s, actions_s, _, _ = self.world_model.rollout_latents(
                 z0, actions=actions_s.unsqueeze(0), use_policy=False, head_mode=head_mode, task=task
             )
             # Squeeze singleton batch dim back to planner shapes

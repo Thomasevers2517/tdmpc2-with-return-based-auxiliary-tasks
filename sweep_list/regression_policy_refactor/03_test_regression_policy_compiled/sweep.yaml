@@ -1,0 +1,70 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 03
+  # 
+  # Goal: Test the regression policy with torch.compile enabled.
+  # 
+  # Key settings:
+  # - pi_regression_enabled: true (use AWR-style regression)
+  # - compile: true (test compilation compatibility)
+  # 
+  # This verifies the regression policy path is compatible
+  # with torch.compile and doesn't break graph compilation.
+  # 
+  # Total: 1 run
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    value: 42
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Enable regression policy (AWR-style)
+  pi_regression_enabled:
+    value: true
+  
+  # Softmax temperature for action weighting
+  pi_regression_temperature:
+    value: 1.0
+
+  #############################################
+  # TRAINING CONFIG (short run for smoke test)
+  #############################################
+
+  steps:
+    value: 5000
+  eval_freq:
+    value: 2500
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Enable compilation to test graph compatibility
+  compile:
+    value: true
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 500

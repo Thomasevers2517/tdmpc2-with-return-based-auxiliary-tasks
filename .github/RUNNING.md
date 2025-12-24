@@ -6,11 +6,11 @@ Environment setup (Conda)
 
 ```bash
 # If the environment already exists
-conda activate tdmpc2
+conda activate tdmpc2-new
 
 # If you need to create it (one-time)
 conda env create -f docker/environment.yaml -n tdmpc2
-conda activate tdmpc2
+conda activate tdmpc2-new
 ```
 
 Recommended GPU selection (4 GPUs available on this machine):
@@ -41,7 +41,7 @@ CUDA_VISIBLE_DEVICES=1 python tdmpc2/train.py \
 ---
 
 ## Running Sweeps on SLURM
-
+You will usually be on a remote machine where you need to use slurm
 ### 1. Create the W&B Sweep
 
 ```bash

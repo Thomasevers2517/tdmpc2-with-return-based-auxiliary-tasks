@@ -24,6 +24,7 @@ from common.logger import get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
+# Enable autograd anomaly detection to trace where gradients go wrong
 # torch.autograd.set_detect_anomaly(True)
 
 @hydra.main(config_name='config', config_path='.')

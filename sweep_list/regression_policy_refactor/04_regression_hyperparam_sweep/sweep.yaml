@@ -1,0 +1,85 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 04
+  # 
+  # Goal: Hyperparameter sweep for regression policy.
+  # 
+  # Sweep axes:
+  # - pi_regression_temperature: [0.01, 0.1, 1.0] (3 values)
+  # - start_entropy_coef: [1e-6, 1e-5, 1e-4, 1e-3] (4 values)
+  # 
+  # Fixed settings:
+  # - pi_regression_enabled: true
+  # - start_dynamic_entropy_ratio: 1 (constant entropy)
+  # - compile: true
+  # - steps: 100000
+  # 
+  # Total: 3 x 4 x 3 = 36 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3]
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Enable regression policy (AWR-style)
+  pi_regression_enabled:
+    value: true
+  
+  # Softmax temperature for action weighting - SWEEP
+  pi_regression_temperature:
+    values: [0.01, 0.1, 1.0]
+
+  #############################################
+  # ENTROPY CONFIG
+  #############################################
+
+  # Fixed entropy ratio (no dynamic schedule)
+  start_dynamic_entropy_ratio:
+    value: 1
+
+  # Entropy coefficient - SWEEP
+  start_entropy_coeff:
+    values: [0.000001, 0.00001, 0.0001, 0.001]
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Enable compilation
+  compile:
+    value: true
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 500

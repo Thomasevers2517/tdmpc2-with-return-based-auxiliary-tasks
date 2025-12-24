@@ -116,14 +116,10 @@ pi_update_freq: 1  # Policy updates per env step.
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
 
-# actor-critic source settings (ONLY IMAGINE SUPPORTED CURRENTLY)
-ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
-aux_value_source: imagine # replay_true | replay_rollout | imagine
-
-imagination_horizon: 1 
+# Imagination settings
+# Value and policy losses always use imagined rollout (horizon=1 hardcoded).
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
-actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
 ema_value_planning: false # if true, use ema critic for mpc planning
 
@@ -137,7 +133,7 @@ policy_coef: 1
 
 encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
 
-imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts, only used if ac_source or aux_value_source is imagine
+imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts
 
 rho: 0.5
 lr: 3e-4
@@ -196,6 +192,17 @@ start_entropy_coeff: 3e-5
 # power=1: multiply by D (entropy ~ D², original TD-MPC2 intent)
 # power=0.5: compromise (entropy ~ D^1.5)
 entropy_action_dim_power: 1.0
+
+# Regression-style policy loss (AWR-like)
+# If true, use value-weighted regression instead of SVG-style policy gradients.
+# Samples N actions from pessimistic policy, weights by softmax(Q/τ), trains via weighted NLL.
+pi_regression_enabled: false
+# Softmax temperature for regression policy weights. Lower = sharper weighting toward high-Q actions.
+pi_regression_temperature: 1.0
+# If true, use softmax(Q/τ) weights for value targets (weighted avg over rollouts instead of uniform).
+# Only applies when pi_regression_enabled=true. Makes value estimate V^π instead of V^uniform.
+weighted_value_targets: true
+
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 0.5
 dynamic_entropy_schedule : exponential  # linear | exponential

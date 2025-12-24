@@ -1,0 +1,91 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 05
+  # 
+  # Goal: Test regression policy with higher entropy coefficients.
+  # 
+  # Sweep axes:
+  # - pi_regression_temperature: [0.1, 0.01, 0.001] (3 values)
+  # - start_entropy_coeff: [0.03, 0.01, 0.001] (3 values)
+  # - seed: [1, 2, 3, 4] (4 seeds)
+  # 
+  # Fixed settings:
+  # - pi_regression_enabled: true
+  # - num_rollouts: 32
+  # - start_dynamic_entropy_ratio: 1 (constant entropy)
+  # - compile: true
+  # - steps: 70000
+  # 
+  # Total: 3 x 3 x 4 = 36 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Enable regression policy (AWR-style)
+  pi_regression_enabled:
+    value: true
+  
+  # Softmax temperature for action weighting - SWEEP
+  pi_regression_temperature:
+    values: [0.1, 0.01, 0.001]
+
+  # High number of rollouts for better Q estimation in AWR
+  num_rollouts:
+    value: 32
+
+  #############################################
+  # ENTROPY CONFIG
+  #############################################
+
+  # Fixed entropy ratio (no dynamic schedule)
+  start_dynamic_entropy_ratio:
+    value: 1
+
+  # Entropy coefficient - SWEEP (higher values)
+  start_entropy_coeff:
+    values: [0.03, 0.01, 0.001]
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 70000
+  eval_freq:
+    value: 10000
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Enable compilation
+  compile:
+    value: true
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 500
