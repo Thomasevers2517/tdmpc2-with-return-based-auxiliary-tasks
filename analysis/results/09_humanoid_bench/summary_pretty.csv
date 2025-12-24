@@ -1,4 +1,4 @@
-task,Ours,SimbaV2
-H1 Balance Simple,70 ± nan,135 ± 28
-H1 Slide,226 ± nan,104 ± 29
-H1 Walk,217 ± nan,104 ± 21
+task,BMPC,Ours,SimbaV2
+H1 Balance Simple,69 ± nan,82 ± nan,251 ± 76
+H1 Slide,195 ± nan,316 ± nan,370 ± 22
+H1 Walk,224 ± nan,804 ± nan,307 ± 108
