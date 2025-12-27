@@ -406,6 +406,9 @@ class TDMPC2(torch.nn.Module):
 		Uses policy_head_reduce to aggregate over both reward heads (R) and
 		dynamics heads (H) when computing the Q-estimate.
 		
+		When num_rollouts > 1, samples multiple actions per state to reduce
+		variance in policy gradients.
+		
 		Args:
 			z (Tensor[T, B, L]): Current latent states.
 			task: Task identifier for multitask setup.
@@ -417,6 +420,8 @@ class TDMPC2(torch.nn.Module):
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
 		"""
 		T, B, L = z.shape
+		# Number of action samples per state: num_rollouts if pi_multi_rollout enabled, else 1
+		N = int(self.cfg.num_rollouts) if self.cfg.pi_multi_rollout else 1
 		
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
@@ -432,120 +437,136 @@ class TDMPC2(torch.nn.Module):
 			lambda_value_disagreement = self.cfg.policy_lambda_value_disagreement
 			
 		with maybe_range('Agent/update_pi', self.cfg):
+			# Expand z to have N rollouts: [T, B, L] -> [T, B, N, L] -> [T, B*N, L]
+			# This allows sampling N different actions per state for variance reduction
+			z_expanded = z.unsqueeze(2).expand(T, B, N, L).reshape(T, B * N, L)  # float32[T, B*N, L]
+			
 			# Sample action from policy at current state (policy has gradients)
-			action, info = self.model.pi(z, task, optimistic=optimistic)  # action: float32[T, B, A]
+			# Due to stochasticity, each of the N copies gets a different action
+			action, info = self.model.pi(z_expanded, task, optimistic=optimistic)  # action: float32[T, B*N, A]
 			
 			# Flatten for model calls
-			z_flat = z.view(T * B, L)              # float32[T*B, L]
-			action_flat = action.view(T * B, -1)  # float32[T*B, A]
+			z_flat = z_expanded.view(T * B * N, L)              # float32[T*B*N, L]
+			action_flat = action.view(T * B * N, -1)  # float32[T*B*N, A]
 			
 			# Get discount factor
 			if self.cfg.multitask:
-				task_flat = task.repeat(T) if task is not None else None
-				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B, 1]
+				task_flat = task.repeat(T * N) if task is not None else None
+				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B*N, 1]
 			else:
 				task_flat = None
 				gamma = self.discount  # scalar
 			
 			# Predict reward r(z, a) from all reward heads
-			# reward() returns distributional logits [R, T*B, K], convert to scalar
+			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
 			# NOTE: Gradients flow through reward/dynamics/V to the action, but only
 			# policy params are updated (pi_optim only contains policy parameters).
-			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B, K]
+			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B*N, K]
 			R = reward_logits_all.shape[0]  # number of reward heads
-			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B, 1]
+			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B*N, 1]
 			
 			# Reduce over reward heads using policy_head_reduce
 			if policy_reduce == 'mean':
-				reward_flat = reward_all.mean(dim=0)  # float32[T*B, 1]
+				reward_flat = reward_all.mean(dim=0)  # float32[T*B*N, 1]
 			elif policy_reduce == 'min':
-				reward_flat = torch.amin(reward_all, dim=0)  # float32[T*B, 1]
+				reward_flat = torch.amin(reward_all, dim=0)  # float32[T*B*N, 1]
 			elif policy_reduce == 'max':
-				reward_flat = torch.amax(reward_all, dim=0)  # float32[T*B, 1]
+				reward_flat = torch.amax(reward_all, dim=0)  # float32[T*B*N, 1]
 			else:
 				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
 			# Roll through ALL dynamics heads to get next states z', then reduce V
 			# This adds pessimism/optimism based on policy_head_reduce to prevent policy from exploiting errors
-			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B, L]
+			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B*N, L]
 			H = next_z_all.shape[0]  # number of dynamics heads
 			
 			# Evaluate V(z') for each dynamics head using detached network
 			# Use return_type='min' to also take minimum over V ensemble heads
-			# Reshape to evaluate all heads at once: [H*T*B, L]
-			next_z_all_flat = next_z_all.view(H * T * B, L)  # float32[H*T*B, L]
+			# Reshape to evaluate all heads at once: [H*T*B*N, L]
+			next_z_all_flat = next_z_all.view(H * T * B * N, L)  # float32[H*T*B*N, L]
 			task_flat_expanded = task_flat.repeat(H) if task_flat is not None else None
-			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B, 1]
-			v_next_all = v_next_all_flat.view(H, T * B, 1)  # float32[H, T*B, 1]
+			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B*N, 1]
+			v_next_all = v_next_all_flat.view(H, T * B * N, 1)  # float32[H, T*B*N, 1]
 			
 			# Reduce over dynamics heads using policy_head_reduce
 			if policy_reduce == 'mean':
-				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B, 1]
+				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B*N, 1]
 			elif policy_reduce == 'min':
-				v_next_flat = torch.amin(v_next_all, dim=0)  # float32[T*B, 1]
+				v_next_flat = torch.amin(v_next_all, dim=0)  # float32[T*B*N, 1]
 			elif policy_reduce == 'max':
-				v_next_flat = torch.amax(v_next_all, dim=0)  # float32[T*B, 1]
+				v_next_flat = torch.amax(v_next_all, dim=0)  # float32[T*B*N, 1]
 			else:
 				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
 			# Compute value disagreement across dynamics heads (std of V estimates)
 			# Scale by self.scale.value for unit consistency with q_scaled
-			v_disagreement_flat = v_next_all.std(dim=0)  # float32[T*B, 1]
-			v_disagreement_scaled_flat = v_disagreement_flat / self.scale.value.clamp(min=1e-6)  # float32[T*B, 1]
-			v_disagreement_scaled = v_disagreement_scaled_flat.view(T, B, 1)  # float32[T, B, 1]
+			v_disagreement_flat = v_next_all.std(dim=0)  # float32[T*B*N, 1]
+			v_disagreement_scaled_flat = v_disagreement_flat / self.scale.value.clamp(min=1e-6)  # float32[T*B*N, 1]
+			v_disagreement_scaled = v_disagreement_scaled_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
 			
 			# Compute Q-like estimate: r(z, a) + γ * V(z')
 			# This is what the action "earns" - immediate reward plus discounted future value
-			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B, 1]
-			q_estimate = q_estimate_flat.view(T, B, 1)           # float32[T, B, 1]
+			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B*N, 1]
+			q_estimate = q_estimate_flat.view(T, B * N, 1)           # float32[T, B*N, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
 			# when computing both policies in a single backward pass.
 			if not optimistic:
 				self.scale.update(q_estimate[0])
-			q_scaled = self.scale(q_estimate)  # float32[T, B, 1]
+			q_scaled = self.scale(q_estimate)  # float32[T, B*N, 1]
 			
 			# Temporal weighting
 			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
 			
 			# Entropy from policy (always use scaled_entropy with configurable action_dim power)
-			entropy_term = info["scaled_entropy"]  # float32[T, B, 1]
+			entropy_term = info["scaled_entropy"]  # float32[T, B*N, 1]
 			
 			# Policy loss: maximize (q_scaled + entropy_coeff * entropy - λ * v_disagreement)
 			# Subtraction: positive λ penalizes uncertainty, negative λ rewards it
 			# Apply rho weighting across time
-			objective = q_scaled + entropy_coeff * entropy_term - lambda_value_disagreement * v_disagreement_scaled  # float32[T, B, 1]
+			# Average over both B and N dimensions to reduce variance from multiple rollouts
+			objective = q_scaled + entropy_coeff * entropy_term - lambda_value_disagreement * v_disagreement_scaled  # float32[T, B*N, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
 			lam = float(self.cfg.hinge_coef)
-			hinge_loss = self.calc_hinge_loss(info["presquash_mean"], rho_pows)
+			hinge_loss = self.calc_hinge_loss(info["presquash_mean"].view(T, B, N, -1)[:, :, 0, :], rho_pows)  # Use first rollout for hinge
 			pi_loss = pi_loss + lam * hinge_loss
+
+			# For logging, reshape and average over N rollouts
+			info_entropy = info["entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			info_scaled_entropy = info["scaled_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			info_mean = info["mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
+			info_log_std = info["log_std"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
+			info_presquash_mean = info["presquash_mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
+			q_estimate_avg = q_estimate.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			v_disagreement_scaled_avg = v_disagreement_scaled.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
 
 			info = TensorDict({
 				"pi_loss": pi_loss,
 				"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
-				"pi_entropy": info["entropy"],
-				"pi_scaled_entropy": info["scaled_entropy"],
+				"pi_entropy": info_entropy,
+				"pi_scaled_entropy": info_scaled_entropy,
 				"pi_entropy_multiplier": info["entropy_multiplier"],
 				"pi_scale": self.scale.value,
-				"pi_std": info["log_std"].mean(),
-				"pi_mean": info["mean"].mean(),
-				"pi_abs_mean": info["mean"].abs().mean(),
-				"pi_presquash_mean": info["presquash_mean"].mean(),
-				"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
-				"pi_presquash_abs_std": info["presquash_mean"].abs().std(),
-				"pi_presquash_abs_min": info["presquash_mean"].abs().min(),
-				"pi_presquash_abs_median": info["presquash_mean"].abs().median(),
-				"pi_frac_sat_095": (info["mean"].abs() > 0.95).float().mean(),
+				"pi_std": info_log_std.mean(),
+				"pi_mean": info_mean.mean(),
+				"pi_abs_mean": info_mean.abs().mean(),
+				"pi_presquash_mean": info_presquash_mean.mean(),
+				"pi_presquash_abs_mean": info_presquash_mean.abs().mean(),
+				"pi_presquash_abs_std": info_presquash_mean.abs().std(),
+				"pi_presquash_abs_min": info_presquash_mean.abs().min(),
+				"pi_presquash_abs_median": info_presquash_mean.abs().median(),
+				"pi_frac_sat_095": (info_mean.abs() > 0.95).float().mean(),
 				"entropy_coeff": self.dynamic_entropy_coeff,
 				"entropy_coeff_effective": entropy_coeff,
-				"pi_q_estimate_mean": q_estimate.mean(),
+				"pi_q_estimate_mean": q_estimate_avg.mean(),
 				"pi_reward_mean": reward_flat.mean(),
 				"pi_v_next_mean": v_next_flat.mean(),
 				"pi_value_disagreement": v_disagreement_flat.mean(),
-				"pi_value_disagreement_scaled": v_disagreement_scaled.mean(),
+				"pi_value_disagreement_scaled": v_disagreement_scaled_avg.mean(),
+				"pi_num_rollouts": float(N),  # Log how many rollouts used (float for mean() compatibility)
 			}, device=self.device)
 
 			return pi_loss, info

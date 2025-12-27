@@ -51,7 +51,7 @@ td_bootstrap_mode: local
 #   'mean'   - mean over all dynamics heads
 #   'single' - use a single randomly-selected dynamics head per update (cheapest)
 # Only used when td_bootstrap_mode='local'.
-local_td_target_dynamics_reduction: mean
+local_td_target_dynamics_reduction: min
 
 # Aggregation over reward and dynamics heads when computing trajectory values for planning.
 # Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
@@ -96,7 +96,7 @@ planner_num_dynamics_heads: 4
 
 # Frozen random prior network for dynamics heads to encourage ensemble diversity.
 # The prior is added BEFORE SimNorm so the main network can learn to compensate.
-dynamics_prior_enabled: false      # If true, add frozen prior to each dynamics head
+dynamics_prior_enabled: true      # If true, add frozen prior to each dynamics head
 dynamics_prior_hidden_dim: 32      # Hidden dimension for prior MLP (small for efficiency)
 dynamics_prior_scale: 1.0          # Scale factor for prior output (prior uses Tanh, so in [-1, 1])
 
@@ -207,7 +207,12 @@ hinge_coef: 0
 # dual policy (optimistic + pessimistic)
 dual_policy_enabled: true        # If true, create pessimistic + optimistic policies
 optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
-optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
+optimistic_head_reduce: mean       # Reduction for optimistic policy: 'max' or 'mean'
+
+# Policy multi-rollout for variance reduction
+# If true, expand each state by num_rollouts and sample multiple actions per state,
+# averaging the loss over rollouts for lower variance policy gradients.
+pi_multi_rollout: false
 
 # Value disagreement penalty for policy optimization
 # Penalizes (positive λ) or rewards (negative λ) actions where dynamics heads disagree on V(z')
@@ -222,13 +227,13 @@ vmax: +10
 
 # architecture
 model_size: ???
-num_enc_layers: 3
+num_enc_layers: 2 # 3 seemed good on easy, but broke dog.
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
-num_q: 2
+num_q: 8
 dropout: 0.01
 simnorm_dim: 8
 
