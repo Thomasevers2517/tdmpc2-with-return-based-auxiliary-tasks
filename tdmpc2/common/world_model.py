@@ -686,11 +686,9 @@ class WorldModel(nn.Module):
 
 		# Build per-step lists to avoid in-place writes on graph tensors
 		# t=0 state for all heads: expand z0 to [H_sel, B, N, L]
-		# NOTE: Clone to ensure tensor persists past CUDAGraph replay.
-		# Without clone, CUDAGraphs may overwrite the memory during subsequent runs,
-		# causing "accessing tensor output that has been overwritten" errors on backward.
 		# z0: [B, L] -> unsqueeze(0) -> [1, B, L] -> unsqueeze(2) -> [1, B, 1, L] -> expand -> [H_sel, B, N, L]
-		z0_hbn = z0.unsqueeze(0).unsqueeze(2).expand(H_sel, B, N, L).clone()  # float32[H_sel,B,N,L] - CLONED for CUDAGraph safety
+		# expand() creates a view with stride 0; make contiguous for downstream view() calls
+		z0_hbn = z0.unsqueeze(0).unsqueeze(2).expand(H_sel, B, N, L).contiguous()  # float32[H_sel,B,N,L]
 		latents_steps = [z0_hbn]
 		actions_steps = []  # each entry: float32[B,N,A]
 		log_probs_steps = []  # each entry: float32[B,N,1] - ATTACHED for policy gradients
@@ -704,8 +702,7 @@ class WorldModel(nn.Module):
 					if use_policy:
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
-							# Clone to ensure tensor survives CUDAGraph memory reuse
-							z_for_pi = latents_steps[t][0].reshape(B * N, L).clone()  # float32[B*N,L]
+							z_for_pi = latents_steps[t][0].reshape(B * N, L)  # float32[B*N,L]
 							a_flat, pi_info = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A] - DETACHED
 							
@@ -729,7 +726,7 @@ class WorldModel(nn.Module):
 						# h indexes into latents_steps (0..H_sel-1)
 						# head_indices[h] gives the actual dynamics head to use
 						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
-							z_curr = latents_steps[t][h].view(B * N, L)  # float32[B*N,L]
+							z_curr = latents_steps[t][h].reshape(B * N, L)  # float32[B*N,L]
 							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
 							if self.cfg.multitask:
 								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]

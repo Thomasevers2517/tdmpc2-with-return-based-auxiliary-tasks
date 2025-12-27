@@ -1,0 +1,105 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Regression Policy Refactor - Test 08
+  # 
+  # Goal: Explore pi_regression_temperature and entropy coefficient interaction.
+  # Higher temperatures should make policy more stochastic naturally,
+  # potentially reducing the need for entropy regularization.
+  # 
+  # Sweep axes:
+  # - pi_regression_temperature: [10, 1, 0.1] (3 values)
+  #   - 10: Very high temp, nearly uniform weights
+  #   - 1: High temp, weights spread across actions
+  #   - 0.1: Medium temp, moderate preference for better actions
+  # - start_entropy_coeff: [0.001, 0.003] (2 values)
+  # - seed: [1, 2, 3, 4] (4 seeds)
+  # 
+  # Fixed settings:
+  # - pi_regression_enabled: true
+  # - weighted_value_targets: true
+  # - num_rollouts: 32
+  # - local_td_target_dynamics_reduction: min
+  # - compile: true
+  # 
+  # Total: 3 x 2 x 4 = 24 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  #############################################
+  # REGRESSION POLICY CONFIG
+  #############################################
+
+  # Enable regression policy (AWR-style)
+  pi_regression_enabled:
+    value: true
+  
+  # Enable weighted value targets
+  weighted_value_targets:
+    value: true
+
+  # Softmax temperature for action weighting - SWEEP
+  # Higher = more uniform weights, lower = more peaked at best action
+  pi_regression_temperature:
+    values: [10, 1, 0.1]
+
+  # Number of rollouts
+  num_rollouts:
+    value: 32
+
+  # TD target reduction over dynamics heads
+  local_td_target_dynamics_reduction:
+    value: min
+
+  #############################################
+  # ENTROPY CONFIG
+  #############################################
+
+  # Fixed entropy ratio
+  start_dynamic_entropy_ratio:
+    value: 1
+
+  # Entropy coefficient - SWEEP
+  start_entropy_coeff:
+    values: [0.001, 0.003]
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 70000
+  eval_freq:
+    value: 5000
+  
+  # Standard training params
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  # Enable compilation
+  compile:
+    value: true
+
+  # Logging
+  log_freq:
+    value: 100
+  log_detail_freq:
+    value: 2000

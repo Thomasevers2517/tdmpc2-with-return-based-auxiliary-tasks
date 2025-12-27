@@ -1403,10 +1403,8 @@ class TDMPC2(torch.nn.Module):
 
 		# Avoid in-place detach on a view; build a fresh contiguous tensor
 		with maybe_range('Imagined/final_pack', self.cfg):
-			# Clone z_seq[:1] to ensure it persists past CUDAGraph replay.
-			# The starting states are ATTACHED to encoder for value loss gradients,
-			# but the intermediate buffers may be overwritten by CUDAGraph replays.
-			z_seq_out = torch.cat([z_seq[:1].clone(), z_seq[1:].detach()], dim=0).clone()  # float32[T+1, H, B, L]
+			# Concatenate attached z_seq[:1] with detached z_seq[1:]
+			z_seq_out = torch.cat([z_seq[:1], z_seq[1:].detach()], dim=0)  # float32[T+1, H, B, L]
 
 			# NOTE: log_probs and scaled_entropy from rollout_latents are NOT returned.
 			# They would require gradients through pi() which causes CUDAGraph memory conflicts
@@ -1835,20 +1833,18 @@ class TDMPC2(torch.nn.Module):
 			batch_structure = imagined['batch_structure']
 			
 			# Get z at t=0 for policy (head 0, since all heads identical before dynamics)
-			# Clone after detach to ensure separate memory from CUDAGraph-captured buffers
-			z_for_pi = z_seq[:-1, 0].detach().clone()  # float32[T, B, L]
-			actions_flat = actions_im[:, 0].detach().clone()  # float32[T, B, A]
+			z_for_pi = z_seq[:-1, 0].detach()  # float32[T, B, L]
+			actions_flat = actions_im[:, 0].detach()  # float32[T, B, A]
 			
 			# Use pre-computed weights if weighted_value_targets is enabled
 			# Otherwise, compute weights in _compute_regression_pi_loss (legacy path - not implemented)
 			if self.cfg.weighted_value_targets:
 				# weights_pess and weights_opti were computed earlier for value loss
-				# They are already detached, clone for separate memory from CUDAGraph
 				policy_data = {
 					'z': z_for_pi,
 					'actions': actions_flat,
-					'weights_pess': weights_pess.clone(),  # float32[T, B, 1]
-					'weights_opti': weights_opti.clone() if weights_opti is not None else None,
+					'weights_pess': weights_pess,  # float32[T, B, 1]
+					'weights_opti': weights_opti,
 					'S': batch_structure['S'],
 					'B_orig': batch_structure['B_orig'],
 					'N': batch_structure['N'],
