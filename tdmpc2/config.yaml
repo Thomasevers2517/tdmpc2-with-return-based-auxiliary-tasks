@@ -35,8 +35,7 @@ n_mc_samples_target: 1
 
 
 # Number of reward ensemble heads for pessimistic reward estimation.
-# NOTE: Only num_reward_heads=1 is supported. Multiple reward heads are deprecated.
-num_reward_heads: 1
+num_reward_heads: 2
 
 # TD bootstrap mode: how value ensemble heads (Ve) and dynamics heads (H) are reduced for TD targets.
 # Options:
@@ -146,16 +145,16 @@ enc_lr_scale: 0.3
 # At (1 - enc_lr_step_ratio) * steps, encoder LR is multiplied by enc_lr_step_scale
 # Set enc_lr_step_scale=0.0 to freeze encoder (similar to old detaching behavior)
 # Set enc_lr_step_scale=0.1 for 10× reduction instead of full freeze
+# IMPORTANT: enc_lr_step_ratio controls WHEN the step happens:
+#   0.0 = step at end (never freeze during training)
+#   0.5 = step at halfway (default)
+#   1.0 = step at start (freeze immediately)
 enc_lr_step_ratio: 0.5          # Fraction of training after which to step-change LR (0.5 = halfway)
 enc_lr_step_scale: 0.0          # Multiplier for encoder LR after step (0.0 = freeze)
 pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize training.
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
 tau: 0.003
-policy_ema_enabled: false
-policy_ema_tau: 0.05
-encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
-encoder_ema_tau: 0.05
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
@@ -176,14 +175,14 @@ data_dir: ???
 # planning
 eval_mpc: true
 train_mpc: true
-iterations: 6
+iterations: 9
 num_samples: 1024
 num_elites: 64
 num_pi_trajs: 512
 horizon: 3
 min_std: 0
 max_std: 1
-temperature: 0.1
+temperature: 0.5
 
 # actor
 log_std_min: -10
@@ -207,7 +206,7 @@ hinge_coef: 0
 # dual policy (optimistic + pessimistic)
 dual_policy_enabled: true        # If true, create pessimistic + optimistic policies
 optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
-optimistic_head_reduce: mean       # Reduction for optimistic policy: 'max' or 'mean'
+optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
 
 # Policy multi-rollout for variance reduction
 # If true, expand each state by num_rollouts and sample multiple actions per state,
@@ -217,7 +216,7 @@ pi_multi_rollout: false
 # Value disagreement penalty for policy optimization
 # Penalizes (positive λ) or rewards (negative λ) actions where dynamics heads disagree on V(z')
 # Scaled by self.scale.value for unit consistency with Q estimates
-policy_lambda_value_disagreement: 1           # Penalty for pessimistic policy (positive = avoid uncertainty)
+policy_lambda_value_disagreement: 0           # Penalty for pessimistic policy (positive = avoid uncertainty)
 optimistic_policy_lambda_value_disagreement: 0.0  # For optimistic policy (negative = seek uncertainty)
 
 # critic
@@ -227,7 +226,7 @@ vmax: +10
 
 # architecture
 model_size: ???
-num_enc_layers: 2 # 3 seemed good on easy, but broke dog.
+num_enc_layers: 3 # 3 seemed good on easy, but breaks dog if reward head size is not reduced.
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
@@ -235,9 +234,11 @@ latent_dim: 512
 task_dim: 96
 num_q: 8
 dropout: 0.01
+encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (train + eval mode for stable targets)
 simnorm_dim: 8
 
-reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value
+reward_dim_div: 32 # reward MLP dimension is mlp_dim divided by this value
+num_reward_layers: 1 # number of hidden layers in reward MLP (1 or 2)
 value_dim_div: 1 # value (V) MLP dimension is mlp_dim divided by this value
 # logging
 wandb_project: test_auxiliary

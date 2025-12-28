@@ -239,10 +239,19 @@ def conv(in_shape, num_channels, out_dim, act=None):
 def enc(cfg, out={}):
 	"""
 	Returns a dictionary of encoders for each observation in the dict.
+	
+	Args:
+		cfg: Config object with obs_shape, task_dim, num_enc_layers, enc_dim, 
+		     latent_dim, encoder_dropout, num_channels, simnorm_dim.
+		out: Optional dict to populate (default empty).
+	
+	Returns:
+		nn.ModuleDict of encoders keyed by observation type ('state', 'rgb').
 	"""
+	encoder_dropout = getattr(cfg, 'encoder_dropout', 0.0)
 	for k in cfg.obs_shape.keys():
 		if k == 'state':
-			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg))
+			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout)
 		elif k == 'rgb':
 			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:

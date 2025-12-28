@@ -185,15 +185,6 @@ class TDMPC2(torch.nn.Module):
 		log.info('Episode length: %s', cfg.episode_length)
 		log.info('Discount factor: %s', str(self.discount))
 
-		if self.cfg.policy_ema_enabled:
-			log.info('Policy EMA enabled (tau=%s)', self.cfg.policy_ema_tau)
-		else:
-			log.info('Policy EMA disabled')
-
-		if self.cfg.encoder_ema_enabled:
-			log.info('Encoder EMA enabled (tau=%s)', self.cfg.encoder_ema_tau)
-		else:
-			log.info('Encoder EMA disabled')
 		# Modular planner (replaces legacy _plan / _prev_mean logic)
 		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=self.scale)
 		if cfg.compile:
@@ -272,7 +263,6 @@ class TDMPC2(torch.nn.Module):
 		state_dict = state_dict["model"] if "model" in state_dict else state_dict
 		state_dict = api_model_conversion(self.model.state_dict(), state_dict)
 		self.model.load_state_dict(state_dict)
-		self.model.reset_policy_encoder_targets()
 		return
 
 	@torch.no_grad()
@@ -310,7 +300,7 @@ class TDMPC2(torch.nn.Module):
 				return chosen_action, planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
-			action_pi, info_pi = self.model.pi(z, task_tensor, use_ema=self.cfg.policy_ema_enabled)
+			action_pi, info_pi = self.model.pi(z, task_tensor)
 			if eval_mode:
 				action_pi = info_pi['mean']
 			return action_pi[0], None
@@ -746,7 +736,17 @@ class TDMPC2(torch.nn.Module):
 
 
 	def world_model_losses(self, z_true, z_target, action, reward, terminated, task=None):
-		"""Compute world-model losses (consistency, reward, termination)."""
+		"""Compute world-model losses (consistency, reward, termination).
+		
+		Args:
+			z_true: Encoded latents with gradients [T+1, B, L]
+			z_target: Stable latents for consistency targets (eval mode, no dropout) [T+1, B, L], 
+			          or None if encoder_dropout == 0
+			action: Actions [T, B, A]
+			reward: Rewards [T, B, 1]
+			terminated: Termination flags [T, B, 1]
+			task: Optional task indices
+		"""
 		T, B, _ = action.shape
 		device = z_true.device
 		dtype = z_true.dtype
@@ -755,6 +755,10 @@ class TDMPC2(torch.nn.Module):
 
 		consistency_losses = torch.zeros(T, device=device, dtype=dtype)
 		encoder_consistency_losses = torch.zeros(T, device=device, dtype=dtype)
+		
+		# Use z_target for consistency targets if available (when encoder has dropout),
+		# otherwise fall back to z_true
+		z_consistency_target = z_target if z_target is not None else z_true
 
 		with maybe_range('Agent/world_model_rollout', self.cfg):
 			# Use vectorized multi-head rollout over provided actions
@@ -766,9 +770,10 @@ class TDMPC2(torch.nn.Module):
 			# Align dims to [H,T,B,L] for both predicted and true latents
 			with maybe_range('WM/consistency', self.cfg):
 				pred_TBL = lat_all[:, :, 0, 1:, :].permute(0, 2, 1, 3)  # float32[H,T,B,L]
-				true_TBL = z_true[1:].unsqueeze(0)  # [1,T,B,L]
-				delta = pred_TBL - true_TBL.detach()
-				delta_enc = pred_TBL.detach() - true_TBL
+				# Use stable targets (z_target) for consistency loss when encoder has dropout
+				target_TBL = z_consistency_target[1:].unsqueeze(0)  # [1,T,B,L]
+				delta = pred_TBL - target_TBL.detach()
+				delta_enc = pred_TBL.detach() - z_consistency_target[1:].unsqueeze(0)
 				consistency_losses = (delta.pow(2).mean(dim=(0, 2, 3)))  # float32[T]
 				encoder_consistency_losses = (delta_enc.pow(2).mean(dim=(0, 2, 3)))  # [T]
 			# For downstream consumers expecting a single rollout tensor, expose head-0 rollout
@@ -1280,7 +1285,17 @@ class TDMPC2(torch.nn.Module):
 		"""
 		device = self.device
 
-		def encode_obs(obs_seq, use_ema, grad_enabled):
+		def encode_obs(obs_seq, grad_enabled, eval_mode=False):
+			"""Encode observations with optional eval mode for stable targets.
+			
+			Args:
+				obs_seq: Observation sequence [steps, batch, ...]
+				grad_enabled: Whether to enable gradients
+				eval_mode: If True, encode with model in eval mode (disables dropout)
+			
+			Returns:
+				Encoded latents [steps, batch, L]
+			"""
 			steps, batch = obs_seq.shape[0], obs_seq.shape[1]
 			flat_obs = obs_seq.view(steps * batch, *obs_seq.shape[2:])  # float32[steps*batch,...]
 			if self.cfg.multitask:
@@ -1294,12 +1309,21 @@ class TDMPC2(torch.nn.Module):
 				task_flat = task
 			with maybe_range('_compute/encode_obs', self.cfg):
 				with torch.set_grad_enabled(grad_enabled and torch.is_grad_enabled()):
-					latents_flat = self.model.encode(flat_obs, task_flat, use_ema=use_ema)  # float32[steps*batch,L]
+					if eval_mode:
+						# Temporarily set encoder to eval mode for stable targets
+						was_training = self.model._encoder.training
+						self.model._encoder.eval()
+						latents_flat = self.model.encode(flat_obs, task_flat)  # float32[steps*batch,L]
+						if was_training:
+							self.model._encoder.train()
+					else:
+						latents_flat = self.model.encode(flat_obs, task_flat)  # float32[steps*batch,L]
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])  # float32[steps,batch,L]
 
 		# Encode observations (needed for value computation even when not updating WM)
-		z_true = encode_obs(obs, use_ema=False, grad_enabled=True)
-		z_target = encode_obs(obs, use_ema=True, grad_enabled=False) if self.cfg.encoder_ema_enabled else None
+		z_true = encode_obs(obs, grad_enabled=True, eval_mode=False)
+		# When encoder has dropout, encode again in eval mode for stable consistency targets
+		z_target = encode_obs(obs, grad_enabled=False, eval_mode=True) if self.cfg.encoder_dropout > 0 else None
 		
 		# Compute WM losses if updating world model, otherwise zero loss and skip rollout
 		if update_world_model:
@@ -1563,8 +1587,6 @@ class TDMPC2(torch.nn.Module):
 			# Soft updates: only update targets when corresponding component is updated
 			if update_value:
 				self.model.soft_update_target_V()
-			if update_pi:
-				self.model.soft_update_policy_encoder_targets()
 
 			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
 				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
@@ -1582,15 +1604,6 @@ class TDMPC2(torch.nn.Module):
 				'total_loss': total_loss.detach()
 			}, non_blocking=True)
 		info.update(pi_info, non_blocking=True)
-
-		if self.cfg.encoder_ema_enabled:
-			info.update({
-				'encoder_ema_max_delta': torch.tensor(self.model.encoder_target_max_delta, device=self.device)
-			}, non_blocking=True)
-		if self.cfg.policy_ema_enabled:
-			info.update({
-				'policy_ema_max_delta': torch.tensor(self.model.policy_target_max_delta, device=self.device)
-			}, non_blocking=True)
 
 		self.model.eval()
 		#TODO this mean adds a lot of computation time; consider removing or replacing with a more efficient logging

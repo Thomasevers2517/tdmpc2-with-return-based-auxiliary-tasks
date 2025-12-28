@@ -162,14 +162,9 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			f"Invalid policy_head_reduce '{cfg.policy_head_reduce}'. Expected 'mean', 'min', or 'max'."
 		)
 
-	# Number of reward heads must be exactly 1 (multiple reward heads deprecated).
+	# Number of reward heads: default to 1 for backward compatibility
 	if not hasattr(cfg, 'num_reward_heads'):
-		cfg.num_reward_heads = 1  # Default for backward compatibility
-	if cfg.num_reward_heads != 1:
-		raise ValueError(
-			f"num_reward_heads={cfg.num_reward_heads} is not supported. "
-			"Only num_reward_heads=1 is supported; multiple reward heads are deprecated."
-		)
+		cfg.num_reward_heads = 1
 
 	# ----------------------------------------------------------------------
 	# Actor-critic source constraints (only 'imagine' mode supported)

@@ -73,10 +73,12 @@ class WorldModel(nn.Module):
 		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
 		# Ensemble stores params in TensorDictParams which apply() does not traverse.
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
+		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
+		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
 		self._reward_heads = nn.ModuleList([
 			layers.mlp(
 				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				2 * [cfg.mlp_dim // cfg.reward_dim_div],
+				num_reward_layers * [reward_hidden_dim],  # [dim] or [dim, dim]
 				max(cfg.num_bins, 1),
 			)
 			for _ in range(num_reward_heads)
@@ -97,20 +99,6 @@ class WorldModel(nn.Module):
 		for mlp in v_mlps:
 			mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
-		self._target_encoder = None
-		self._target_pi = None
-		self.encoder_target_max_delta = 0.0
-		self.policy_target_max_delta = 0.0
-		if cfg.encoder_ema_enabled:
-			self._target_encoder = deepcopy(self._encoder)
-			for param in self._target_encoder.parameters():
-				param.requires_grad_(False)
-			self._target_encoder.eval()
-		if cfg.policy_ema_enabled:
-			self._target_pi = deepcopy(self._pi)
-			for param in self._target_pi.parameters():
-				param.requires_grad_(False)
-			self._target_pi.eval()
 
 		# ------------------------------------------------------------------
 		# Auxiliary multi-gamma state-value heads (training-only)
@@ -150,7 +138,6 @@ class WorldModel(nn.Module):
 		self.apply(init.weight_init)
 		reward_weights = [head[-1].weight for head in self._reward_heads]
 		init.zero_(reward_weights + [self._Vs.params["2", "weight"]])
-		self.reset_policy_encoder_targets()
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
@@ -310,24 +297,6 @@ class WorldModel(nn.Module):
 			online_vec = parameters_to_vector(source_params).detach()
 			target_vec = parameters_to_vector(target_params).detach()
 			return torch.max(torch.abs(online_vec - target_vec))
-
-	def soft_update_policy_encoder_targets(self):
-		updates = {}
-		if self._target_encoder is not None:
-			updates['encoder'] = self._soft_update_module(self._target_encoder, self._encoder, float(self.cfg.encoder_ema_tau))
-			self.encoder_target_max_delta = updates['encoder']
-		if self._target_pi is not None:
-			updates['policy'] = self._soft_update_module(self._target_pi, self._pi, float(self.cfg.policy_ema_tau))
-			self.policy_target_max_delta = updates['policy']
-		return updates
-
-	def reset_policy_encoder_targets(self):
-		if self._target_encoder is not None:
-			self._target_encoder.load_state_dict(self._encoder.state_dict())
-			self.encoder_target_max_delta = 0.0
-		if self._target_pi is not None:
-			self._target_pi.load_state_dict(self._pi.state_dict())
-			self.policy_target_max_delta = 0.0
 				
 	def task_emb(self, x, task):
 		"""
@@ -344,18 +313,13 @@ class WorldModel(nn.Module):
 			emb = emb.repeat(x.shape[0], 1)
 		return torch.cat([x, emb], dim=-1)
 
-	def encode(self, obs, task, use_ema=False):
+	def encode(self, obs, task):
 		"""
 		Encodes an observation into its latent representation.
 		This implementation assumes a single state-based observation.
 		"""
 		with maybe_range('WM/encode', self.cfg):
-			if use_ema:
-				if self._target_encoder is None:
-					raise RuntimeError('Encoder target requested but not initialized')
-				encoder = self._target_encoder
-			else:
-				encoder = self._encoder
+			encoder = self._encoder
 			if self.cfg.multitask:
 				obs = self.task_emb(obs, task)
 			if self.cfg.obs == 'rgb' and obs.ndim == 5:
@@ -446,7 +410,7 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(logits)
 		
 
-	def pi(self, z, task, use_ema=False, search_noise=False, optimistic=False):
+	def pi(self, z, task, search_noise=False, optimistic=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
@@ -455,16 +419,11 @@ class WorldModel(nn.Module):
 		Args:
 			z: Latent state tensor.
 			task: Task identifier for multitask setup.
-			use_ema: If True, use target (EMA) policy.
 			search_noise: Unused (legacy parameter).
 			optimistic: If True and dual_policy_enabled, use optimistic policy.
 		"""
 		with maybe_range('WM/pi', self.cfg):
-			if use_ema:
-				if self._target_pi is None:
-					raise RuntimeError('Policy target requested but not initialized')
-				module = self._target_pi
-			elif optimistic and self.cfg.dual_policy_enabled:
+			if optimistic and self.cfg.dual_policy_enabled:
 				module = self._pi_optimistic
 			else:
 				module = self._pi
@@ -695,7 +654,7 @@ class WorldModel(nn.Module):
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
+							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy)
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
