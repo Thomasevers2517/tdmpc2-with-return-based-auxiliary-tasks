@@ -118,17 +118,28 @@ class NormedLinear(nn.Linear):
 			f"act={self.act.__class__.__name__})"
 
 
-def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.):
+def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0., dropout_layer=0):
 	"""
 	Basic building block of TD-MPC2.
 	MLP with LayerNorm, Mish activations, and optionally dropout.
+	
+	Args:
+		in_dim: Input dimension.
+		mlp_dims: Hidden layer dimensions (int or list).
+		out_dim: Output dimension.
+		act: Optional activation for output layer (e.g., SimNorm).
+		dropout: Dropout rate.
+		dropout_layer: Index of hidden layer to apply dropout (0=first, -1=last hidden layer).
 	"""
 	if isinstance(mlp_dims, int):
 		mlp_dims = [mlp_dims]
 	dims = [in_dim] + mlp_dims + [out_dim]
 	mlp = nn.ModuleList()
-	for i in range(len(dims) - 2):
-		mlp.append(NormedLinear(dims[i], dims[i+1], dropout=dropout*(i==0)))
+	num_hidden = len(dims) - 2  # Number of hidden layers (excluding output)
+	dropout_idx = dropout_layer if dropout_layer >= 0 else num_hidden + dropout_layer
+	for i in range(num_hidden):
+		layer_dropout = dropout if i == dropout_idx else 0.
+		mlp.append(NormedLinear(dims[i], dims[i+1], dropout=layer_dropout))
 	mlp.append(NormedLinear(dims[-2], dims[-1], act=act) if act else nn.Linear(dims[-2], dims[-1]))
 	return nn.Sequential(*mlp)
 
@@ -251,7 +262,8 @@ def enc(cfg, out={}):
 	encoder_dropout = getattr(cfg, 'encoder_dropout', 0.0)
 	for k in cfg.obs_shape.keys():
 		if k == 'state':
-			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout)
+			# Apply dropout at last hidden layer (before SimNorm) to allow encoder compute before noise
+			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
 		elif k == 'rgb':
 			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:

@@ -235,6 +235,7 @@ task_dim: 96
 num_q: 8
 dropout: 0.01
 encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (train + eval mode for stable targets)
+reward_dropout_enabled: false  # Whether to apply dropout to reward heads (uses same dropout rate as value heads)
 simnorm_dim: 8
 
 reward_dim_div: 32 # reward MLP dimension is mlp_dim divided by this value

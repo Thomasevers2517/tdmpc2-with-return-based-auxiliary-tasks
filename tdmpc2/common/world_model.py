@@ -75,11 +75,13 @@ class WorldModel(nn.Module):
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
+		reward_dropout = cfg.dropout if getattr(cfg, 'reward_dropout_enabled', False) else 0.0
 		self._reward_heads = nn.ModuleList([
 			layers.mlp(
 				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
 				num_reward_layers * [reward_hidden_dim],  # [dim] or [dim, dim]
 				max(cfg.num_bins, 1),
+				dropout=reward_dropout,
 			)
 			for _ in range(num_reward_heads)
 		])
