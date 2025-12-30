@@ -756,6 +756,11 @@ class TDMPC2(torch.nn.Module):
 		consistency_losses = torch.zeros(T, device=device, dtype=dtype)
 		encoder_consistency_losses = torch.zeros(T, device=device, dtype=dtype)
 		
+		# Compute latent variance across batch (collapse detection metric)
+		# Take first timestep z_true[0]: [B, L], compute variance per dimension, then mean
+		# TODO: Could use simplex-wise cross-entropy instead of MSE for consistency loss
+		latent_batch_variance = z_true[0].var(dim=0).mean()  # float32[]
+		
 		# Use z_target for consistency targets if available (when encoder has dropout),
 		# otherwise fall back to z_true
 		z_consistency_target = z_target if z_target is not None else z_true
@@ -915,9 +920,14 @@ class TDMPC2(torch.nn.Module):
 		H = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))  # dynamics heads
 		R = int(getattr(self.cfg, 'num_reward_heads', 1))  # reward heads
 
+		# Apply warmup: disable encoder consistency for first X% of training
+		warmup_ratio = getattr(self.cfg, 'encoder_consistency_warmup_ratio', 0.0)
+		warmup_steps = int(warmup_ratio * self.cfg.steps)
+		enc_consistency_warmup_scale = 0.0 if self._step < warmup_steps else 1.0
+
 		wm_total = (
 			self.cfg.consistency_coef * consistency_loss
-			+ self.cfg.encoder_consistency_coef * encoder_consistency_loss
+			+ self.cfg.encoder_consistency_coef * enc_consistency_warmup_scale * encoder_consistency_loss
 			+ self.cfg.reward_coef * reward_loss
 			+ self.cfg.termination_coef * termination_loss
 		)
@@ -928,6 +938,7 @@ class TDMPC2(torch.nn.Module):
 			'consistency_loss_weighted': consistency_losses * self.cfg.consistency_coef * H,
 			'encoder_consistency_loss': encoder_consistency_loss,
 			'encoder_consistency_loss_weighted': encoder_consistency_losses * self.cfg.encoder_consistency_coef * H,
+			'latent_batch_variance': latent_batch_variance,
 			'reward_loss': reward_loss,
 			'reward_loss_weighted': reward_loss * self.cfg.reward_coef * R,
 			'termination_loss': termination_loss,

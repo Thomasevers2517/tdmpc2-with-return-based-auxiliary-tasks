@@ -135,6 +135,7 @@ consistency_coef: 20
 policy_coef: 1
 
 encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+encoder_consistency_warmup_ratio: 0.0  # Fraction of training to disable encoder consistency (0.1 = first 10%)
 
 imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts, only used if ac_source or aux_value_source is imagine
 
