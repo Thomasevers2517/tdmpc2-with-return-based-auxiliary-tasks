@@ -54,15 +54,19 @@ class WorldModel(nn.Module):
 		prior_enabled = cfg.dynamics_prior_enabled
 		prior_hidden_dim = cfg.dynamics_prior_hidden_dim
 		prior_scale = cfg.dynamics_prior_scale
+		# Dynamics head config: layer count and dropout
+		dynamics_num_layers = int(getattr(cfg, 'dynamics_num_layers', 2))
+		dynamics_dropout = float(getattr(cfg, 'dynamics_dropout', 0.0))
 		self._dynamics_heads = nn.ModuleList([
 			layers.DynamicsHeadWithPrior(
 				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				mlp_dims=2 * [cfg.mlp_dim],
+				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
 				out_dim=cfg.latent_dim,
 				cfg=cfg,
 				prior_enabled=prior_enabled,
 				prior_hidden_dim=prior_hidden_dim,
 				prior_scale=prior_scale,
+				dropout=dynamics_dropout,
 			)
 			for _ in range(h_total)
 		])
@@ -97,7 +101,8 @@ class WorldModel(nn.Module):
 		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
 		v_input_dim = cfg.latent_dim + cfg.task_dim
 		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div  # Allow smaller V networks via value_dim_div
-		v_mlps = [layers.mlp(v_input_dim, 2*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
+		num_value_layers = cfg.num_value_layers  # Number of hidden layers (default 2)
+		v_mlps = [layers.mlp(v_input_dim, num_value_layers*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
 		for mlp in v_mlps:
 			mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
@@ -124,14 +129,14 @@ class WorldModel(nn.Module):
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
 			# Auxiliary V heads: input is latent only (no action)
-			# Use same v_mlp_dim as primary V heads for consistency
+			# Use same v_mlp_dim and num_value_layers as primary V heads for consistency
 			aux_in_dim = cfg.latent_dim + (cfg.task_dim if cfg.multitask else 0)
 			aux_v_mlp_dim = v_mlp_dim  # Already computed above as cfg.mlp_dim // cfg.value_dim_div
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Vs = layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+				self._aux_joint_Vs = layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
 				self._aux_separate_Vs = torch.nn.ModuleList([
-					layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
+					layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
 					for _ in range(self._num_aux_gamma)
 				])
 			else:
@@ -139,7 +144,9 @@ class WorldModel(nn.Module):
 
 		self.apply(init.weight_init)
 		reward_weights = [head[-1].weight for head in self._reward_heads]
-		init.zero_(reward_weights + [self._Vs.params["2", "weight"]])
+		# Last layer index = num_value_layers (e.g., 1 hidden → layers 0,1 → output is "1")
+		v_output_layer_key = str(num_value_layers)
+		init.zero_(reward_weights + [self._Vs.params[v_output_layer_key, "weight"]])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)

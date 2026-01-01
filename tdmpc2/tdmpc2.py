@@ -266,7 +266,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True):
+	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'min'):
 		"""Select an action.
 
 		If `mpc=True`, uses modular `Planner` over latent space; else falls back to single policy prior.
@@ -276,6 +276,7 @@ class TDMPC2(torch.nn.Module):
 			eval_mode (bool): Evaluation flag (planner switches to value-only scoring / argmax selection).
 			task: Optional task index (unsupported for planner; passed to policy when mpc=False).
 			mpc (bool): Whether to use planning.
+			eval_head_reduce (str): Head reduction mode for eval ('min', 'mean', 'max'). Only used when eval_mode=True and mpc=True.
 
 		Returns:
 			Tensor: Action.
@@ -293,7 +294,8 @@ class TDMPC2(torch.nn.Module):
 				z0 = self.model.encode(obs, task_tensor)
 				chosen_action, planner_info, mean, std = self.planner.plan(
 					z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step,
-					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff))
+					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
+					eval_head_reduce=eval_head_reduce
 				)
 
 				# Planner already applies any training noise and clamps
@@ -1230,11 +1232,11 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
 			
-			# Variance across num_rollouts (N dimension) - diagnostic for rollout diversity
+			# Std across num_rollouts (N dimension) - diagnostic for rollout diversity
 			# Need to reshape back to include N: [Ve, T_imag, S, B, N, 1]
 			td_targets_with_n = td_targets.view(Ve, T_imag, S, B, N, 1)
-			td_var_across_rollouts = td_targets_with_n.var(dim=4).mean()  # variance across N
-			info.update({'td_target_var_across_rollouts': td_var_across_rollouts}, non_blocking=True)
+			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()  # std across N (different actions)
+			info.update({'td_target_std_across_rollouts': td_std_across_rollouts}, non_blocking=True)
    
 		# Value error per replay step (S dimension)
 		value_error = value_pred - td_targets  # float32[Ve, T_imag, S, BN, 1]

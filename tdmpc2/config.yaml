@@ -11,6 +11,7 @@ episodic: false
 checkpoint: ???
 eval_episodes: 5
 eval_freq: 10000
+eval_mean_head_reduce: true  # If true, also run evaluation with mean head reduction (in addition to default min)
 
 
 critic_type: V  # 'V' (state value) only. 'Q' is not implemented.
@@ -57,10 +58,9 @@ local_td_target_dynamics_reduction: min
 planner_head_reduce: max
 
 # Evaluation-specific planner head configuration.
-# If true, eval uses all dynamics heads and reduces via planner_head_reduce_eval.
+# If true, eval uses all dynamics heads and reduces via min (default).
 # If false, eval uses only head 0 (single head, no reduction needed).
 planner_use_all_heads_eval: true
-planner_head_reduce_eval: min  # Reduction over heads during eval: 'min' | 'max' | 'mean'
 
 # Aggregation over reward and dynamics heads when computing policy loss.
 # Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
@@ -98,6 +98,8 @@ planner_num_dynamics_heads: 4
 dynamics_prior_enabled: true      # If true, add frozen prior to each dynamics head
 dynamics_prior_hidden_dim: 32      # Hidden dimension for prior MLP (small for efficiency)
 dynamics_prior_scale: 1.0          # Scale factor for prior output (prior uses Tanh, so in [-1, 1])
+dynamics_dropout: 0.0              # Dropout rate for dynamics head (applied to first hidden layer)
+dynamics_num_layers: 2             # Number of hidden layers in dynamics head MLP
 
 train_act_std_coeff: 0 # multiplier of the noise added to training env actions
 
@@ -242,6 +244,7 @@ simnorm_dim: 8
 reward_dim_div: 32 # reward MLP dimension is mlp_dim divided by this value
 num_reward_layers: 1 # number of hidden layers in reward MLP (1 or 2)
 value_dim_div: 1 # value (V) MLP dimension is mlp_dim divided by this value
+num_value_layers: 2 # number of hidden layers in value (V) MLP
 # logging
 wandb_project: test_auxiliary
 wandb_entity: thomasevers9

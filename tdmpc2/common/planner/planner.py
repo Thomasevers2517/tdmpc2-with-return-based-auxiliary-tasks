@@ -41,7 +41,7 @@ class Planner(torch.nn.Module):
         return shifted
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
+    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None, eval_head_reduce: str = 'min') -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
         """Plan an action sequence and return the first action.
 
         Args:
@@ -49,6 +49,7 @@ class Planner(torch.nn.Module):
             task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection, eval temperature.
             step: Global step for detailed logging frequency gating.
+            eval_head_reduce: Head reduction mode for eval ('min', 'mean', 'max'). Only used when eval_mode=True.
 
         Returns:
             (Tensor[A], PlannerBasicInfo | PlannerAdvancedInfo, Tensor[T,A], Tensor[T,A])
@@ -72,10 +73,11 @@ class Planner(torch.nn.Module):
         # Head mode and reduction depend on eval vs train
         # Train: always use all heads with planner_head_reduce
         # Eval: use all heads or single head based on planner_use_all_heads_eval
+        #       reduction controlled by eval_head_reduce parameter (default 'min')
         if eval_mode:
             use_all_heads_eval = bool(self.cfg.planner_use_all_heads_eval)
             head_mode = 'all' if use_all_heads_eval else 'single'
-            head_reduce = self.cfg.planner_head_reduce_eval if use_all_heads_eval else 'mean'
+            head_reduce = eval_head_reduce if use_all_heads_eval else 'mean'
             reward_head_mode = head_mode  # Match dynamics head mode
         else:
             head_mode = 'all'

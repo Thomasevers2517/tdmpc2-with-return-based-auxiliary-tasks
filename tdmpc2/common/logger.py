@@ -47,6 +47,9 @@ CAT_TO_COLOR = {
 	"validation_all": "magenta",
 	"validation_recent": "cyan",
 	"policy_eval": "red",
+	"eval_mean_head_reduce": "green",
+	"validation_all_mean_head_reduce": "magenta",
+	"validation_recent_mean_head_reduce": "cyan",
 }
 
 

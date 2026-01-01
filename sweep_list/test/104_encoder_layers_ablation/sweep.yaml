@@ -1,0 +1,63 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Sweep 104: Encoder Layers Ablation
+  # 
+  # Hypothesis: Verify whether 3 encoder layers really helps
+  # compared to 2. If no significant difference, can simplify
+  # by keeping default 2 layers.
+  #
+  # Config:
+  # - num_enc_layers: [2, 3]
+  #
+  # Task: quadruped-walk
+  # Seeds: 10
+  # Total: 2 × 10 = 20 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+  #############################################
+  # KEY CONFIG: Encoder layers sweep
+  #############################################
+
+  num_enc_layers:
+    values: [2, 3]
+
+  #############################################
+  # FIXED CONFIG (standard settings)
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
