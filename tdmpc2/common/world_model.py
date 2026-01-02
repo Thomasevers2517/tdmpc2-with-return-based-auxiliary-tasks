@@ -453,24 +453,26 @@ class WorldModel(nn.Module):
 				action_dims = None
 
 			# Compute Gaussian log prob before squashing
-			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1], ~D scaling from sum
+			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action and apply squash (tanh) with Jacobian correction
+			# Sample action and apply squash (tanh) with configurable Jacobian correction
+			# jacobian_correction_scale controls how much we penalize action saturation:
+			#   1.0 = correct entropy (full Jacobian penalty near ±1)
+			#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
 			action = mean + eps * log_std.exp()
 			presquash_mean = mean
-			mean, action, log_prob = math.squash(mean, action, log_prob_presquash)
+			jacobian_scale = float(self.cfg.jacobian_correction_scale)
+			mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
 			
-			# Entropy with configurable action dimension scaling
-			# entropy_action_dim_power controls how entropy scales with action_dim:
-			#   0.0 = no extra scaling (entropy ~ D from Gaussian sum)
-			#   1.0 = multiply by D (entropy ~ D², like original TD-MPC2)
-			#   0.5 = multiply by sqrt(D) (entropy ~ D^1.5, compromise)
-			entropy = -log_prob  # float32[..., 1], correct squashed entropy
+			# Entropy and scaled_entropy for policy loss
+			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)
+			# When jacobian_scale=1, log_prob includes full Jacobian correction (correct)
+			entropy = -log_prob
 			entropy_multiplier = torch.tensor(
-				action_dim, dtype=entropy.dtype, device=entropy.device
-			).pow(self.cfg.entropy_action_dim_power)  # float32 scalar tensor
-			scaled_entropy = entropy * entropy_multiplier  # float32[..., 1]
+				action_dim, dtype=log_prob.dtype, device=log_prob.device
+			).pow(self.cfg.entropy_action_dim_power)
+			scaled_entropy = entropy * entropy_multiplier
 			
 			info = TensorDict({
 				"presquash_mean": presquash_mean,

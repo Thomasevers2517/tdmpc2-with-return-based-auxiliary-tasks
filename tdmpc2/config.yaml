@@ -198,6 +198,14 @@ start_entropy_coeff: 3e-5
 # power=1: multiply by D (entropy ~ D², original TD-MPC2 intent)
 # power=0.5: compromise (entropy ~ D^1.5)
 entropy_action_dim_power: 1.0
+# Jacobian correction scale: controls how much tanh Jacobian affects entropy calculation.
+# The Jacobian correction accounts for the change of variables when squashing actions via tanh.
+# 1.0 = mathematically correct (full penalty for confidence near ±1)
+# 0.5 = half penalty (more lenient on action saturation)
+# 0.0 = no Jacobian penalty (legacy TD-MPC2 behavior - ignores tanh compression)
+# Setting to 0.0 reproduces the old buggy behavior which may help tasks requiring
+# extreme/saturated actions (e.g., dog-run) by not penalizing confidence near boundaries.
+jacobian_correction_scale: 1.0
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 0.5
 dynamic_entropy_schedule : exponential  # linear | exponential

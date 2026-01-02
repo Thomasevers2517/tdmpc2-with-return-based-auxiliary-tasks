@@ -29,12 +29,28 @@ def gaussian_logprob(eps, log_std):
 	return log_prob.sum(-1, keepdim=True)
 
 
-def squash(mu, pi, log_pi):
-	"""Apply squashing function."""
+def squash(mu, pi, log_pi, jacobian_scale=1.0):
+	"""Apply tanh squashing function with configurable Jacobian correction.
+	
+	Args:
+		mu: Pre-squash mean.
+		pi: Pre-squash action samples.
+		log_pi: Pre-squash log probability.
+		jacobian_scale: Multiplier for Jacobian correction (default 1.0).
+			1.0 = mathematically correct (full penalty for confidence near ±1)
+			<1.0 = reduced penalty (more lenient on extreme/saturated actions)
+			0.0 = no correction (ignore tanh compression entirely)
+			
+	The Jacobian correction accounts for the change of variables when applying
+	tanh. With scale=1.0, actions near ±1 incur a large log_prob penalty.
+	Reducing the scale allows the policy to be more confident near boundaries.
+	"""
+	assert jacobian_scale <= 1.0, f"jacobian_scale must be <= 1.0, got {jacobian_scale}"
 	mu = torch.tanh(mu)
 	pi = torch.tanh(pi)
-	squashed_pi = torch.log(F.relu(1 - pi.pow(2)) + 1e-6)
-	log_pi = log_pi - squashed_pi.sum(-1, keepdim=True)
+	# Jacobian correction: -sum(log(1 - tanh²(action)))
+	jacobian_correction = torch.log(F.relu(1 - pi.pow(2)) + 1e-6).sum(-1, keepdim=True)
+	log_pi = log_pi - jacobian_scale * jacobian_correction
 	return mu, pi, log_pi
 
 
