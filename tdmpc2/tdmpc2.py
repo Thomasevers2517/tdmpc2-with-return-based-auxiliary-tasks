@@ -602,10 +602,9 @@ class TDMPC2(torch.nn.Module):
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		
-		Reduction behavior controlled by cfg.td_bootstrap_mode:
-		  - 'min': min over Ve (value heads) and H (dynamics heads), then expand to Ve
-		  - 'mean': mean over Ve and H, then expand to Ve
-		  - 'local': each Ve head bootstraps itself, H reduced by cfg.local_td_target_dynamics_reduction
+		Reduction behavior controlled by:
+		  - cfg.td_target_value_reduction: 'min'/'mean'/'local' - how Ve heads are reduced
+		  - cfg.td_target_dynamics_reduction: 'min'/'mean'/'single' - how H dynamics heads are reduced
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -655,28 +654,36 @@ class TDMPC2(torch.nn.Module):
 		td_std_over_ve_per_h = td_per_head.std(dim=0, unbiased=False)  # float32[T, H, B, 1]
 		td_std_across_value_heads = td_std_over_ve_per_h.mean(dim=1)  # float32[T, B, 1]
 		
-		# Apply reduction based on td_bootstrap_mode - always reduce H, output is [Ve, T, B, 1]
-		mode = self.cfg.td_bootstrap_mode
-		if mode == 'min':
-			# Min over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
-			td_reduced = torch.amin(td_per_head, dim=(0, 2), keepdim=False)  # float32[T, B, 1]
-			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-		elif mode == 'mean':
-			# Mean over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
-			td_reduced = td_per_head.mean(dim=(0, 2), keepdim=False)  # float32[T, B, 1]
-			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-		elif mode == 'local':
-			# Each Ve head bootstraps itself; reduce H by local_td_target_dynamics_reduction
-			h_reduction = self.cfg.local_td_target_dynamics_reduction
-			if h_reduction == 'single':
-				# H=1 when using single random head, no reduction needed
-				td_targets = td_per_head.squeeze(2)  # float32[Ve, T, B, 1]
-			elif h_reduction == 'min':
-				td_targets = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
-			else:  # 'mean'
-				td_targets = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
+		# Apply reduction based on td_target_value_reduction and td_target_dynamics_reduction
+		# Output is [Ve, T, B, 1]
+		v_reduction = self.cfg.td_target_value_reduction
+		h_reduction = self.cfg.td_target_dynamics_reduction
+		
+		# First reduce dynamics heads (H dimension = 2)
+		if h_reduction == 'single':
+			# H=1 when using single random head, no reduction needed
+			td_h_reduced = td_per_head.squeeze(2)  # float32[Ve, T, B, 1]
+		elif h_reduction == 'min':
+			td_h_reduced = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
+		elif h_reduction == 'mean':
+			td_h_reduced = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
 		else:
-			raise ValueError(f"Unknown td_bootstrap_mode: {mode}. Expected 'min', 'mean', or 'local'.")
+			raise ValueError(f"Unknown td_target_dynamics_reduction: {h_reduction}. Expected 'min', 'mean', or 'single'.")
+		
+		# Then reduce value heads (Ve dimension = 0)
+		if v_reduction == 'local':
+			# Each Ve head bootstraps itself, no reduction
+			td_targets = td_h_reduced  # float32[Ve, T, B, 1]
+		elif v_reduction == 'min':
+			# Min over Ve, then expand back to [Ve, T, B, 1]
+			td_reduced = torch.amin(td_h_reduced, dim=0, keepdim=False)  # float32[T, B, 1]
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+		elif v_reduction == 'mean':
+			# Mean over Ve, then expand back to [Ve, T, B, 1]
+			td_reduced = td_h_reduced.mean(dim=0, keepdim=False)  # float32[T, B, 1]
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+		else:
+			raise ValueError(f"Unknown td_target_value_reduction: {v_reduction}. Expected 'min', 'mean', or 'local'.")
 		
 		return td_targets, td_std_across_dynamics_heads, td_std_across_value_heads 
   
@@ -686,8 +693,8 @@ class TDMPC2(torch.nn.Module):
 		"""
 		Compute auxiliary multi-gamma TD targets.
 		
-		Auxiliary values have no Ve ensemble, so td_bootstrap_mode 'min'/'mean'/'local'
-		are equivalent for Ve. Dynamics head (H) reduction uses local_td_target_dynamics_reduction.
+		Auxiliary values have no Ve ensemble, so td_target_value_reduction has no effect.
+		Dynamics head (H) reduction uses td_target_dynamics_reduction.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -731,15 +738,17 @@ class TDMPC2(torch.nn.Module):
 		
 		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# Reduce H dimension using local_td_target_dynamics_reduction - output is [G_aux, T, B, 1]
-		h_reduction = self.cfg.local_td_target_dynamics_reduction
+		# Reduce H dimension using td_target_dynamics_reduction - output is [G_aux, T, B, 1]
+		h_reduction = self.cfg.td_target_dynamics_reduction
 		if h_reduction == 'single':
 			# H=1 when using single random head, no reduction needed
 			td_targets_aux = td_per_head.squeeze(2)  # float32[G_aux, T, B, 1]
 		elif h_reduction == 'min':
 			td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
-		else:  # 'mean'
+		elif h_reduction == 'mean':
 			td_targets_aux = td_per_head.mean(dim=2)  # float32[G_aux, T, B, 1]
+		else:
+			raise ValueError(f"Unknown td_target_dynamics_reduction: {h_reduction}. Expected 'min', 'mean', or 'single'.")
 		
 		return td_targets_aux
 
@@ -1022,11 +1031,11 @@ class TDMPC2(torch.nn.Module):
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
 		
-		# Determine head_mode based on local_td_target_dynamics_reduction
+		# Determine head_mode based on td_target_dynamics_reduction
 		# When 'single', use a randomly-selected dynamics head (cheapest)
 		# Otherwise, use all heads and reduce later
-		h_reduction = self.cfg.local_td_target_dynamics_reduction
-		if self.cfg.td_bootstrap_mode == 'local' and h_reduction == 'single':
+		h_reduction = self.cfg.td_target_dynamics_reduction
+		if h_reduction == 'single':
 			head_mode = 'random'  # Use single randomly-selected head
 			H = 1  # Only one head in output
 		else:
@@ -1459,13 +1468,16 @@ class TDMPC2(torch.nn.Module):
 			S, B_orig, L = start_z.shape
 			A = self.cfg.action_dim
 			N = int(self.cfg.num_rollouts)
-			H = int(self.cfg.planner_num_dynamics_heads)
 			R = int(self.cfg.num_reward_heads)
 			T_imag = int(self.cfg.imagination_horizon)
 			
 			# imagined_rollout flattens S*B into batch, uses N rollouts per state
 			# Returns tensors with B_expanded = S * B_orig * N
+			# H depends on td_target_dynamics_reduction: 1 if 'single', planner_num_dynamics_heads otherwise
 			imagined = self.imagined_rollout(start_z, task=task, rollout_len=T_imag)
+			
+			# Get actual H from returned tensor (may be 1 if td_target_dynamics_reduction='single')
+			H = imagined['z_seq'].shape[1]
 			
 			# Reshape outputs from [*, B_expanded, *] to [*, S, B, N, *]
 			# z_seq: [T_imag+1, H, S*B*N, L] -> [T_imag+1, H, S, B, N, L]

@@ -38,20 +38,19 @@ n_mc_samples_target: 1
 # Number of reward ensemble heads for pessimistic reward estimation.
 num_reward_heads: 2
 
-# TD bootstrap mode: how value ensemble heads (Ve) and dynamics heads (H) are reduced for TD targets.
+# TD target value head reduction: how value ensemble heads (Ve) are reduced for TD targets.
 # Options:
-#   'min'   - min over Ve and H (pessimistic, default, preserves original behavior)
-#   'mean'  - mean over Ve and H
-#   'local' - each Ve head bootstraps itself (no Ve reduction), H reduced by local_td_target_dynamics_reduction
-td_bootstrap_mode: local
+#   'min'   - min over all Ve heads (pessimistic)
+#   'mean'  - mean over all Ve heads
+#   'local' - each Ve head bootstraps itself (no Ve reduction)
+td_target_value_reduction: mean
 
-# Dynamics head reduction when td_bootstrap_mode='local'.
+# TD target dynamics head reduction: how dynamics heads (H) are reduced for TD targets.
 # Options:
 #   'min'    - min over all dynamics heads (pessimistic)
 #   'mean'   - mean over all dynamics heads
 #   'single' - use a single randomly-selected dynamics head per update (cheapest)
-# Only used when td_bootstrap_mode='local'.
-local_td_target_dynamics_reduction: min
+td_target_dynamics_reduction: mean
 
 # Aggregation over reward and dynamics heads when computing trajectory values for planning.
 # Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
