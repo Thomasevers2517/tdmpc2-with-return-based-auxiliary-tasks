@@ -634,11 +634,17 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Pessimistically reduce over reward heads: min over R (dim=1)
-		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
+		# Reduce over reward heads (R) based on td_target_reward_reduction config
+		r_reduction = self.cfg.td_target_reward_reduction
+		if r_reduction == 'min':
+			reward_reduced = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
+		elif r_reduction == 'mean':
+			reward_reduced = reward.mean(dim=1)  # float32[T, H, B, 1]
+		else:
+			raise ValueError(f"Unknown td_target_reward_reduction: {r_reduction}. Expected 'min' or 'mean'.")
 		
 		# Expand reward/terminated for broadcasting with Ve: [T, H, B, 1] -> [1, T, H, B, 1]
-		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
+		reward_exp = reward_reduced.unsqueeze(0)  # float32[1, T, H, B, 1]
 		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 		
 		# Per-head TD targets: r + γ * (1 - done) * V(s')  ->  [Ve, T, H, B, 1]
@@ -724,11 +730,17 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Pessimistically reduce over reward heads: min over R (dim=1)
-		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
+		# Reduce over reward heads (R) based on td_target_reward_reduction config
+		r_reduction = self.cfg.td_target_reward_reduction
+		if r_reduction == 'min':
+			reward_reduced = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
+		elif r_reduction == 'mean':
+			reward_reduced = reward.mean(dim=1)  # float32[T, H, B, 1]
+		else:
+			raise ValueError(f"Unknown td_target_reward_reduction: {r_reduction}. Expected 'min' or 'mean'.")
 		
 		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
-		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
+		reward_exp = reward_reduced.unsqueeze(0)  # float32[1, T, H, B, 1]
 		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 		
 		# Compute per-head TD targets for all auxiliary gammas at once

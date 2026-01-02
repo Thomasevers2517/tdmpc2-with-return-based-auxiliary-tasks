@@ -52,6 +52,12 @@ td_target_value_reduction: mean
 #   'single' - use a single randomly-selected dynamics head per update (cheapest)
 td_target_dynamics_reduction: mean
 
+# TD target reward head reduction: how reward heads (R) are reduced for TD targets.
+# Options:
+#   'min'  - min over all reward heads (pessimistic, default)
+#   'mean' - mean over all reward heads
+td_target_reward_reduction: min
+
 # Aggregation over reward and dynamics heads when computing trajectory values for planning.
 # Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
 planner_head_reduce: max
