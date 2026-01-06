@@ -186,7 +186,7 @@ class TDMPC2(torch.nn.Module):
 		log.info('Discount factor: %s', str(self.discount))
 
 		# Modular planner (replaces legacy _plan / _prev_mean logic)
-		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=self.scale)
+		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=self.scale, discount=self.discount)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
 			# Keep eager references
@@ -402,10 +402,13 @@ class TDMPC2(torch.nn.Module):
 		through dynamics. The dynamics, reward, and value function are frozen
 		during policy optimization (SAC-style backprop through frozen model).
 		
-		Computes Q estimates for ALL (R × H × Ve) head combinations, then reduces
-		using mean + value_std_coef × std. This provides gradients through the
-		uncertainty term, allowing the policy to learn to avoid uncertain regions
-		when value_std_coef < 0 (pessimistic).
+		CORRECT OPTIMISM: For each dynamics head h, compute:
+		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std)
+		  Q_h = μ_h + value_std_coef × σ_h
+		Then reduce over dynamics heads:
+		  value_std_coef > 0: max over H (optimistic)
+		  value_std_coef < 0: min over H (pessimistic)
+		  value_std_coef = 0: mean over H (neutral)
 		
 		When num_rollouts > 1, samples multiple actions per state to reduce
 		variance in policy gradients.
@@ -426,7 +429,7 @@ class TDMPC2(torch.nn.Module):
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
 		
-		# Select std_coef based on optimistic flag for mean + coef × std reduction
+		# Select std_coef based on optimistic flag
 		if optimistic:
 			value_std_coef = self.cfg.optimistic_policy_value_std_coef  # +1.0 for optimistic
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
@@ -451,9 +454,11 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.multitask:
 				task_flat = task.repeat(T * N) if task is not None else None
 				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B*N, 1]
+				gamma_scalar = self.discount.mean().item()  # for std discounting
 			else:
 				task_flat = None
 				gamma = self.discount  # scalar
+				gamma_scalar = float(self.discount)
 			
 			# Predict reward r(z, a) from ALL reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
@@ -474,21 +479,43 @@ class TDMPC2(torch.nn.Module):
 			Ve = v_next_all_flat.shape[0]  # number of value heads
 			v_next_all = v_next_all_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
 			
-			# Compute Q for ALL (R × H × Ve) combinations
-			# reward_all: [R, T*B*N, 1] -> [1, 1, R, T*B*N, 1] for broadcasting
-			# v_next_all: [Ve, H, T*B*N, 1] -> [Ve, H, 1, T*B*N, 1] for broadcasting
-			reward_exp = reward_all.unsqueeze(0).unsqueeze(0)  # float32[1, 1, R, T*B*N, 1]
-			v_next_exp = v_next_all.unsqueeze(2)  # float32[Ve, H, 1, T*B*N, 1]
+			# CORRECT OPTIMISM: Compute per dynamics head
+			# reward_all: [R, T*B*N, 1] - same reward for all dynamics heads
+			# v_next_all: [Ve, H, T*B*N, 1] - different values per dynamics head
 			
-			# Q = r + gamma * V(z') for all combinations
-			q_all = reward_exp + gamma * v_next_exp  # float32[Ve, H, R, T*B*N, 1]
+			# Reward mean and std across R reward heads (same for all dynamics heads)
+			reward_mean = reward_all.mean(dim=0)  # float32[T*B*N, 1]
+			reward_std = reward_all.std(dim=0, unbiased=True)  # float32[T*B*N, 1]
 			
-			# Flatten (Ve × H × R) and reduce with mean + std_coef × std
-			q_flat = q_all.view(Ve * H * R, T * B * N, 1)  # float32[Ve*H*R, T*B*N, 1]
-			q_mean = q_flat.mean(dim=0)  # float32[T*B*N, 1]
-			q_std = q_flat.std(dim=0, unbiased=False)  # float32[T*B*N, 1]
-			q_estimate_flat = q_mean + value_std_coef * q_std  # float32[T*B*N, 1]
+			# Value mean and std across Ve value heads, per dynamics head h
+			v_mean_per_h = v_next_all.mean(dim=0)  # float32[H, T*B*N, 1]
+			v_std_per_h = v_next_all.std(dim=0, unbiased=True)  # float32[H, T*B*N, 1]
+			
+			# Q_h = (r_mean + γ * v_mean_h) + std_coef * (r_std + γ * v_std_h)
+			# Total mean per dynamics head: μ_h = r_mean + γ * v_mean_h
+			q_mean_per_h = reward_mean + gamma * v_mean_per_h  # float32[H, T*B*N, 1]
+			
+			# Total std per dynamics head: σ_h = r_std + γ * v_std_h
+			q_std_per_h = reward_std + gamma_scalar * v_std_per_h  # float32[H, T*B*N, 1]
+			
+			# Q_h = μ_h + std_coef * σ_h
+			q_per_h = q_mean_per_h + value_std_coef * q_std_per_h  # float32[H, T*B*N, 1]
+			
+			# Reduce over dynamics heads based on sign of value_std_coef
+			if value_std_coef > 0:
+				# Optimistic: max over dynamics heads
+				q_estimate_flat, _ = q_per_h.max(dim=0)  # float32[T*B*N, 1]
+			elif value_std_coef < 0:
+				# Pessimistic: min over dynamics heads
+				q_estimate_flat, _ = q_per_h.min(dim=0)  # float32[T*B*N, 1]
+			else:
+				# Neutral: mean over dynamics heads
+				q_estimate_flat = q_per_h.mean(dim=0)  # float32[T*B*N, 1]
+			
 			q_estimate = q_estimate_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
+			
+			# For logging: std across dynamics heads (disagreement)
+			q_std = q_per_h.std(dim=0, unbiased=True)  # float32[T*B*N, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
@@ -589,9 +616,16 @@ class TDMPC2(torch.nn.Module):
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		
-		Computes TD targets for ALL (R × H × Ve) head combinations, then reduces via:
-		  reduced = mean + td_target_std_coef × std
-		across all combinations.
+		CORRECT OPTIMISM: For each dynamics head h, compute:
+		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std, if global)
+		  TD_h = μ_h + td_target_std_coef × σ_h
+		Then reduce over dynamics heads:
+		  std_coef > 0: max over H (optimistic)
+		  std_coef < 0: min over H (pessimistic)
+		  std_coef = 0: mean over H (neutral)
+		
+		Local bootstrapping: each Ve head bootstraps itself, no value std (σ^v=0).
+		Global bootstrapping: all Ve heads get same target, value std computed across Ve.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -601,7 +635,7 @@ class TDMPC2(torch.nn.Module):
 
 		Returns:
 			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1], Tensor[T, B, 1]]: 
-				(TD-targets per Ve head - all same value, td_mean, td_std).
+				(TD-targets per Ve head, td_mean_log, td_std_log).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -620,54 +654,102 @@ class TDMPC2(torch.nn.Module):
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		
-		# Keep reward with R dimension: [T, R, H, B, 1]
-		# Expand for broadcasting with Ve: [1, T, R, H, B, 1]
-		reward_exp = reward.unsqueeze(0)  # float32[1, T, R, H, B, 1]
-		
-		# Expand terminated: [T, H, B, 1] -> [1, T, 1, H, B, 1] for broadcasting
-		terminated_exp = terminated.unsqueeze(0).unsqueeze(2)  # float32[1, T, 1, H, B, 1]
-		
-		# Expand v_values: [Ve, T, H, B, 1] -> [Ve, T, 1, H, B, 1] for broadcasting
-		v_values_exp = v_values.unsqueeze(2)  # float32[Ve, T, 1, H, B, 1]
-		
-		# Compute TD targets for ALL (R × H × Ve) combinations
-		# Result shape: [Ve, T, R, H, B, 1]
-		td_all = reward_exp + discount * (1 - terminated_exp) * v_values_exp  # float32[Ve, T, R, H, B, 1]
+		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
 		
 		std_coef = float(self.cfg.td_target_std_coef)
 		
 		if self.cfg.local_td_bootstrap:
-			# Local: each Ve head bootstraps itself, reduce only over (R × H)
-			# [Ve, T, R, H, B, 1] -> [Ve, T, R*H, B, 1]
-			td_flat = td_all.view(Ve, T, R * H, B, 1)  # float32[Ve, T, R*H, B, 1]
-			td_mean = td_flat.mean(dim=2)  # float32[Ve, T, B, 1]
-			td_std = td_flat.std(dim=2, unbiased=False)  # float32[Ve, T, B, 1]
-			td_targets = td_mean + std_coef * td_std  # float32[Ve, T, B, 1] - each head has own target
-			# For logging, report mean across Ve heads
-			td_mean_log = td_mean.mean(dim=0)  # float32[T, B, 1]
-			td_std_log = td_std.mean(dim=0)  # float32[T, B, 1]
+			# LOCAL: Each Ve head bootstraps itself
+			# No value std (each head sees only itself), only reward std across R
+			
+			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
+			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
+			r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
+			
+			# v_values: [Ve, T, H, B, 1] - use directly (each Ve head bootstraps itself)
+			# TD_h = r_mean_h + γ * (1-term) * v_ve_h  for each (Ve, H)
+			# We need to broadcast: terminated [T, H, B, 1]
+			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
+			r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+			
+			# TD mean per (Ve, H): μ_{ve,h} = r_mean_h + γ * (1-term) * v_{ve,h}
+			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
+			
+			# TD std per H: σ_h = r_std_h (no value std in local mode)
+			td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
+			
+			# TD_h = μ_h + std_coef * σ_h per dynamics head
+			# For local, we compute this per (Ve, H), then reduce over H
+			# td_std_per_h needs to broadcast to [Ve, T, H, B, 1]
+			td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp  # float32[Ve, T, H, B, 1]
+			
+			# Reduce over dynamics heads H based on sign of std_coef
+			if std_coef > 0:
+				# Optimistic: max over H
+				td_targets, _ = td_per_ve_h.max(dim=2)  # float32[Ve, T, B, 1]
+			elif std_coef < 0:
+				# Pessimistic: min over H
+				td_targets, _ = td_per_ve_h.min(dim=2)  # float32[Ve, T, B, 1]
+			else:
+				# Neutral: mean over H
+				td_targets = td_per_ve_h.mean(dim=2)  # float32[Ve, T, B, 1]
+			
+			# For logging
+			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
+			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
+			
 		else:
-			# Global: reduce across ALL heads (Ve × R × H), all value heads get same target
-			# [Ve, T, R, H, B, 1] -> [Ve*R*H, T, B, 1]
-			td_flat = td_all.permute(0, 2, 3, 1, 4, 5).contiguous().view(Ve * R * H, T, B, 1)  # float32[Ve*R*H, T, B, 1]
-			td_mean = td_flat.mean(dim=0)  # float32[T, B, 1]
-			td_std = td_flat.std(dim=0, unbiased=False)  # float32[T, B, 1]
-			td_reduced = td_mean + std_coef * td_std  # float32[T, B, 1]
+			# GLOBAL: All Ve heads get same target
+			# Compute reward std across R, value std across Ve, per dynamics head H
+			
+			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
+			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
+			r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
+			
+			# v_values: [Ve, T, H, B, 1] - mean and std across Ve per (H, T, B)
+			v_mean_per_h = v_values.mean(dim=0)  # float32[T, H, B, 1]
+			v_std_per_h = v_values.std(dim=0, unbiased=True)  # float32[T, H, B, 1]
+			
+			# TD mean per H: μ_h = r_mean_h + γ * (1-term) * v_mean_h
+			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
+			
+			# TD std per H: σ_h = r_std_h + γ * v_std_h
+			td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h  # float32[T, H, B, 1]
+			
+			# TD_h = μ_h + std_coef * σ_h per dynamics head
+			td_per_h = td_mean_per_h + std_coef * td_std_per_h  # float32[T, H, B, 1]
+			
+			# Reduce over dynamics heads H based on sign of std_coef
+			if std_coef > 0:
+				# Optimistic: max over H
+				td_reduced, _ = td_per_h.max(dim=1)  # float32[T, B, 1]
+			elif std_coef < 0:
+				# Pessimistic: min over H
+				td_reduced, _ = td_per_h.min(dim=1)  # float32[T, B, 1]
+			else:
+				# Neutral: mean over H
+				td_reduced = td_per_h.mean(dim=1)  # float32[T, B, 1]
+			
+			# All Ve heads get same target
 			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-			td_mean_log = td_mean  # float32[T, B, 1]
-			td_std_log = td_std  # float32[T, B, 1]
+			
+			# For logging
+			td_mean_log = td_mean_per_h.mean(dim=1)  # float32[T, B, 1]
+			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
 		
-		return td_targets, td_mean_log, td_std_log 
+		return td_targets, td_mean_log, td_std_log
   
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
 		"""
-		Compute auxiliary multi-gamma TD targets using mean + std_coef × std reduction.
+		Compute auxiliary multi-gamma TD targets using correct optimism.
 		
-		Auxiliary values have no Ve ensemble (only 2 outputs per gamma), so we compute
-		TD for all (R × H) combinations and reduce with mean + td_target_std_coef × std.
+		CORRECT OPTIMISM: For each dynamics head h, compute:
+		  σ_h = σ^r_h  (reward std only, aux values have no Ve ensemble)
+		  TD_h = μ_h + td_target_std_coef × σ_h
+		Then reduce over dynamics heads H based on sign of std_coef.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -676,7 +758,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma, reduced via mean + std_coef × std.
+			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma.
 		"""
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
@@ -695,31 +777,44 @@ class TDMPC2(torch.nn.Module):
 		# Reshape back to [G_aux, T, H, B, 1]
 		v_values = v_values_flat.view(G_aux, T, H, B, 1)  # float32[G_aux, T, H, B, 1]
 		
-		# Compute per-head TD targets for all auxiliary gammas with ALL (R × H) combinations
-		# gammas_aux: [G_aux] -> [G_aux, 1, 1, 1, 1, 1] for broadcasting with 6D tensors
-		# NOTE: gammas_aux already contains the auxiliary discount factors directly (e.g., 0.9, 0.99),
-		# so we do NOT multiply by self.discount (which is the primary γ from episode length).
+		# gammas_aux: auxiliary discount factors (e.g., 0.9, 0.99)
 		gammas_aux = torch.tensor(self._all_gammas[1:], device=next_z.device, dtype=next_z.dtype)  # float32[G_aux]
-		gammas_aux = gammas_aux.view(G_aux, 1, 1, 1, 1, 1)  # float32[G_aux, 1, 1, 1, 1, 1]
 		
-		# Expand reward to [G_aux, T, R, H, B, 1] and v_values to [G_aux, T, 1, H, B, 1]
-		reward_exp = reward.unsqueeze(0)  # float32[1, T, R, H, B, 1]
-		v_values_exp = v_values.unsqueeze(2)  # float32[G_aux, T, 1, H, B, 1]
-		terminated_exp = terminated.unsqueeze(0).unsqueeze(2)  # float32[1, T, 1, H, B, 1]
+		std_coef = float(self.cfg.td_target_std_coef)
 		
-		# Compute TD for all (R × H) combinations per gamma
-		# Broadcasting: [1, T, R, H, B, 1] + [G_aux,1,1,1,1] * [G_aux, T, 1, H, B, 1]
-		td_all = reward_exp + gammas_aux * (1 - terminated_exp) * v_values_exp  # float32[G_aux, T, R, H, B, 1]
+		# CORRECT OPTIMISM: Per dynamics head h
+		# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
+		r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
+		r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
 		
-		# Flatten (R × H) dimensions and compute mean + std_coef × std reduction
-		# [G_aux, T, R, H, B, 1] -> [G_aux, T, R*H, B, 1]
-		td_flat = td_all.view(G_aux, T, R * H, B, 1)  # float32[G_aux, T, R*H, B, 1]
+		# v_values: [G_aux, T, H, B, 1] - already mean over 2 outputs per gamma
+		# No value std for aux (single value per gamma)
 		
-		# Reduce over (R × H) using mean + std_coef × std
-		std_coef = self.cfg.td_target_std_coef
-		td_mean = td_flat.mean(dim=2)  # float32[G_aux, T, B, 1]
-		td_std = td_flat.std(dim=2, unbiased=False)  # float32[G_aux, T, B, 1]
-		td_targets_aux = td_mean + std_coef * td_std  # float32[G_aux, T, B, 1]
+		# TD mean per (G_aux, H): μ_{g,h} = r_mean_h + γ_g * (1-term) * v_{g,h}
+		# gammas_aux: [G_aux] -> [G_aux, 1, 1, 1] for broadcasting
+		gammas_exp = gammas_aux.view(G_aux, 1, 1, 1)  # float32[G_aux, 1, 1, 1]
+		r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
+		
+		td_mean_per_g_h = r_mean_exp + gammas_exp.unsqueeze(-1) * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
+		
+		# TD std per H: σ_h = r_std_h (no value std for aux)
+		td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
+		td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1] - broadcast to G_aux
+		
+		# TD_{g,h} = μ_{g,h} + std_coef * σ_h
+		td_per_g_h = td_mean_per_g_h + std_coef * td_std_exp  # float32[G_aux, T, H, B, 1]
+		
+		# Reduce over dynamics heads H based on sign of std_coef
+		if std_coef > 0:
+			# Optimistic: max over H
+			td_targets_aux, _ = td_per_g_h.max(dim=2)  # float32[G_aux, T, B, 1]
+		elif std_coef < 0:
+			# Pessimistic: min over H
+			td_targets_aux, _ = td_per_g_h.min(dim=2)  # float32[G_aux, T, B, 1]
+		else:
+			# Neutral: mean over H
+			td_targets_aux = td_per_g_h.mean(dim=2)  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
