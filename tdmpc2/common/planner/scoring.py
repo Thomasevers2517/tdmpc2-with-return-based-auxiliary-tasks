@@ -8,8 +8,9 @@ def compute_values(
     actions: torch.Tensor,      # float32[E, T, A]
     world_model,
     task=None,
-    head_reduce: str = "mean",
+    value_std_coef: float = 0.0,
     reward_head_mode: str = "all",
+    use_ema_value: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
@@ -18,31 +19,34 @@ def compute_values(
     
     Value = sum(rewards over T steps) + V(z_last)
     
-    Reduction is applied to both reward heads (R) and dynamics heads (H) using
-    the same head_reduce mode (typically 'max' for optimistic planning).
+    We compute values for ALL (R × H × Ve) combinations, then reduce via:
+      reduced_value = mean + value_std_coef × std
     
-    Value disagreement is computed as std across all (dynamics head × V head) 
-    combinations, capturing joint uncertainty from both sources. This is most
-    meaningful when planner_num_dynamics_heads > 1 and/or num_q > 1.
+    This provides gradients through the std term, allowing the planner to
+    be uncertainty-aware with value_std_coef > 0 (optimistic) or < 0 (pessimistic).
+    
+    Value disagreement is computed as std across all (R × H × Ve) combinations.
 
     Args:
         latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all dynamics heads.
         actions (Tensor[E, T, A]): Action sequences aligned with latents.
         world_model: WorldModel exposing reward() and V().
         task: Optional task index for multitask setups.
-        head_reduce: Aggregation over heads: 'mean' or 'max'. Applied to both R and H.
+        value_std_coef: Coefficient for mean + coef × std reduction.
+            +1.0 = optimistic (mean + std), -1.0 = pessimistic (mean - std), 0.0 = mean only.
         reward_head_mode: 'single' uses only head 0, 'all' uses all reward heads.
             During eval, use 'single' to match single dynamics head for fair comparison.
+        use_ema_value: If True, use EMA target network for V; otherwise use online network.
 
     Returns:
         Tuple[Tensor[E], Tensor[E], Tensor[E], Tensor[E]]: 
-            (values_unscaled, values_scaled, values_std_across_dynamics_heads, value_disagreement).
-            value_disagreement is std across all (H × Q) value estimates per candidate.
+            (values_unscaled, values_scaled, values_std, value_disagreement).
+            values_std and value_disagreement are both std across all (R × H × Ve) combinations.
     """
     H, E, Tp1, L = latents_all.shape  # H=dynamics heads, E=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
     cfg = world_model.cfg
-    Q = cfg.num_q  # number of V ensemble heads
+    Ve = cfg.num_q  # number of V ensemble heads
 
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :-1, :]                         # float32[H, E, T, L]
@@ -58,67 +62,45 @@ def compute_values(
     rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode=reward_head_mode)
     R = rew_logits_all.shape[0]  # number of reward heads
     
-    # Convert to scalar rewards: [R, H*E, T, K] -> [R, H*E, T]
+    # Convert to scalar rewards: [R, H*E, T, K] -> [R, H*E, T, 1] -> [R, H, E, T]
     r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*E, T]
-    # Reshape to [R, H, E, T]
     r_all = r_all.view(R, H, E, T)  # float32[R, H, E, T]
     
-    # Reduce over reward heads (R) per timestep using head_reduce
-    # When R=1 (single head mode), reduction is a no-op
-    if head_reduce == "mean":
-        r_t = r_all.mean(dim=0)  # float32[H, E, T]
-    elif head_reduce == "max":
-        r_t = torch.amax(r_all, dim=0)  # float32[H, E, T]
-    elif head_reduce == "min":
-        r_t = torch.amin(r_all, dim=0)  # float32[H, E, T]
-    else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
+    # Sum rewards over T per (R, H) combination: [R, H, E]
+    returns_rhe = r_all.sum(dim=3)  # float32[R, H, E]
 
-    # Sum rewards (undiscounted) over T and bootstrap with V(z_last).
-    # With V-function, no action needed for bootstrapping.
-    returns_he = r_t.sum(dim=2)                             # float32[H, E] sum of rewards
+    # Get V values for ALL Ve ensemble heads at terminal state
     z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
     z_last_flat = z_last.contiguous().view(H * E, L)        # float32[H*E, L]
     
-    # Get V logits for ALL ensemble heads to compute value disagreement
-    v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=True)  # float32[Q, H*E, K]
-    v_all_qhe = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Q, H*E]
+    # Get V logits for ALL ensemble heads: [Ve, H*E, K] -> [Ve, H*E] -> [Ve, H, E]
+    # use_ema_value=True uses target network (slower-moving, more stable)
+    # use_ema_value=False uses online network (current estimates)
+    v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)  # float32[Ve, H*E, K]
+    v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*E]
+    v_all = v_all.view(Ve, H, E)  # float32[Ve, H, E]
     
-    # Reshape to [Q, H, E] then flatten to [Q*H, E] for disagreement computation
-    v_all_qhe = v_all_qhe.view(Q, H, E)  # float32[Q, H, E]
-    v_all_flat = v_all_qhe.view(Q * H, E)  # float32[Q*H, E]
+    # Compute total value for ALL (R × H × Ve) combinations
+    # returns_rhe: [R, H, E] -> [1, R, H, E] for broadcasting
+    # v_all: [Ve, H, E] -> [Ve, 1, H, E] for broadcasting
+    returns_exp = returns_rhe.unsqueeze(0)  # float32[1, R, H, E]
+    v_exp = v_all.unsqueeze(1)  # float32[Ve, 1, H, E]
     
-    # Value disagreement: std across all Q*H estimates per candidate
-    value_disagreement = v_all_flat.std(dim=0, unbiased=False)  # float32[E]
+    # Total value = reward returns + bootstrap V for each (Ve, R, H) combination
+    values_all = returns_exp + v_exp  # float32[Ve, R, H, E] via broadcasting
     
-    # Bootstrap value: reduce over Q (V heads) using head_reduce, keep H dimension
-    if head_reduce == "mean":
-        v_boot_he = v_all_qhe.mean(dim=0)  # float32[H, E]
-    elif head_reduce == "max":
-        v_boot_he = torch.amax(v_all_qhe, dim=0)  # float32[H, E]
-    elif head_reduce == "min":
-        v_boot_he = torch.amin(v_all_qhe, dim=0)  # float32[H, E]
-    else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
-
-    values_unscaled_he = returns_he + v_boot_he             # float32[H, E]
-    values_scaled_he = values_unscaled_he * 1.0             # float32[H, E]
-
-    # Std across dynamics heads (independent of reduction mode).
-    values_std = values_unscaled_he.std(dim=0, unbiased=False)  # float32[E]
-
-    # Reduce over dynamics heads (H) using head_reduce
-    if head_reduce == "mean":
-        values_unscaled = values_unscaled_he.mean(dim=0)        # float32[E]
-        values_scaled = values_scaled_he.mean(dim=0)            # float32[E]
-    elif head_reduce == "max":
-        values_unscaled = torch.amax(values_unscaled_he, dim=0)  # float32[E]
-        values_scaled = torch.amax(values_scaled_he, dim=0)      # float32[E]
-    elif head_reduce == "min":
-        values_unscaled = torch.amin(values_unscaled_he, dim=0)  # float32[E]
-        values_scaled = torch.amin(values_scaled_he, dim=0)      # float32[E]
-    else:
-        raise ValueError(f"Invalid head_reduce '{head_reduce}'. Expected 'mean', 'max', or 'min'.")
+    # Flatten (Ve × R × H) and compute mean + std_coef × std reduction
+    values_flat = values_all.view(Ve * R * H, E)  # float32[Ve*R*H, E]
+    
+    values_mean = values_flat.mean(dim=0)  # float32[E]
+    values_std = values_flat.std(dim=0, unbiased=False)  # float32[E]
+    
+    # Reduce: mean + value_std_coef × std
+    values_unscaled = values_mean + value_std_coef * values_std  # float32[E]
+    values_scaled = values_unscaled  # Same for now (scaling handled elsewhere)
+    
+    # Value disagreement = std across all (Ve × R × H) combinations
+    value_disagreement = values_std  # Same as values_std now
 
     return values_unscaled, values_scaled, values_std, value_disagreement
 
@@ -139,24 +121,20 @@ def compute_disagreement(final_latents_all: torch.Tensor) -> torch.Tensor:
 def combine_scores(
     values_scaled: torch.Tensor,
     latent_disagreement: Optional[torch.Tensor],
-    value_disagreement: Optional[torch.Tensor],
     lambda_latent: float,
-    lambda_value: float,
 ) -> torch.Tensor:
-    """Combine scaled values with optional disagreement signals into final score.
+    """Combine scaled values with optional latent disagreement signal into final score.
     
-    score = values_scaled + lambda_latent * latent_disagreement + lambda_value * value_disagreement
+    score = values_scaled + lambda_latent * latent_disagreement
     
     Latent disagreement captures uncertainty from dynamics model (different predicted 
-    latent states). Value disagreement captures uncertainty from value estimates across 
-    all dynamics×V head combinations.
+    latent states). Value disagreement is now incorporated directly into values_scaled
+    via the value_std_coef parameter in compute_values.
 
     Args:
-        values_scaled (Tensor[E]): Scaled values.
+        values_scaled (Tensor[E]): Scaled values (already includes value_std_coef × value_std).
         latent_disagreement (Tensor[E] or None): Latent disagreement signal (variance of latents).
-        value_disagreement (Tensor[E] or None): Value disagreement signal (std of V estimates).
         lambda_latent (float): Weight for latent disagreement term.
-        lambda_value (float): Weight for value disagreement term.
 
     Returns:
         Tensor[E]: Combined scores.
@@ -164,6 +142,4 @@ def combine_scores(
     score = values_scaled  # float32[E]
     if latent_disagreement is not None and lambda_latent != 0.0:
         score = score + lambda_latent * latent_disagreement
-    if value_disagreement is not None and lambda_value != 0.0:
-        score = score + lambda_value * value_disagreement
     return score

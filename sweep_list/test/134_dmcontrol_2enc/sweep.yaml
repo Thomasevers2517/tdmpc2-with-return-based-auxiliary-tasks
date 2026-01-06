@@ -1,0 +1,84 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 134: DM-Control Benchmark (2 encoder layers)
+  # 
+  # Goal: Compare 2 vs 3 encoder layers on benchmark suite
+  # Same as sweep 131 but with num_enc_layers=2
+  # 
+  # 9 tasks × 2 seeds = 18 runs
+  #############################################
+
+  task:
+    values:
+      - pendulum-swingup
+      - quadruped-walk
+      - cheetah-run
+      - hopper-hop
+      - reacher-hard
+      - finger-turn_hard
+      - finger-spin
+      - acrobot-swingup
+      - cartpole-swingup_sparse
+
+  seed:
+    values: [1, 2]
+
+  # Key settings: no pessimism
+  td_target_std_coef:
+    value: 0
+  value_std_coef_override:
+    value: 1
+
+  # 2 encoder layers (vs 3 in sweep 131)
+  num_enc_layers:
+    value: 2
+
+  # EMA value planning
+  ema_value_planning:
+    value: true
+
+  # Entropy settings
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  start_entropy_coeff:
+    value: 0.00003
+  entropy_action_dim_power:
+    value: 1.0
+
+  # Architecture
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Training
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true

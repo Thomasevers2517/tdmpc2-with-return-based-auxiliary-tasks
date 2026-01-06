@@ -1,0 +1,104 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 129: High value_update_freq with pessimism ablation
+  # 
+  # Goal: Test if increased pessimism can prevent value overestimation
+  # when using high value update frequency.
+  #
+  # Hypothesis: High value_update_freq causes expected episode reward
+  # to overshoot actual reward (value overestimation). More pessimism
+  # in policy and/or TD targets should prevent this.
+  #
+  # Settings:
+  #   - value_update_freq: 8 (high - the thing we're testing)
+  #   - policy_value_std_coef: [-1, -2] (policy pessimism levels)
+  #   - td_target_std_coef: [0, -0.3, -1] (TD target pessimism levels)
+  #   - Other std_coefs at magnitude 1
+  #
+  # 2 policy × 3 td × 4 seeds = 24 configurations
+  #############################################
+
+  # Sweep variables
+  policy_value_std_coef:
+    values: [-1, -2]
+
+  td_target_std_coef:
+    values: [0, -0.3, -1]
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  # Task
+  task:
+    value: quadruped-walk
+
+  # High value update frequency (the thing we're testing)
+  value_update_freq:
+    value: 8
+
+  # Other std_coefs at magnitude 1 (not using override)
+  optimistic_policy_value_std_coef:
+    value: 1
+  planner_value_std_coef_train:
+    value: 1
+  planner_value_std_coef_eval:
+    value: -1
+
+  # Training
+  steps:
+    value: 100000
+
+  # Architecture - standard settings
+  num_enc_layers:
+    value: 3
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  temperature:
+    value: 0.5
+  jacobian_correction_scale:
+    value: 1.0
+  entropy_action_dim_power:
+    value: 1.0
+
+  # Other standard settings
+  hinge_coef:
+    value: 0.0
+  encoder_consistency_coef:
+    value: 1.0
+
+  # Logging
+  eval_freq:
+    value: 10000
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

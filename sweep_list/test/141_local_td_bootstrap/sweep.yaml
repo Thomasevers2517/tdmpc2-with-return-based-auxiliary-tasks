@@ -1,0 +1,95 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 141: Local TD Bootstrap
+  # 
+  # Goal: Test local TD bootstrapping (each value head bootstraps itself)
+  # with different optimism/pessimism settings
+  # 
+  # local_td_bootstrap: true
+  # td_target_std_coef: [0, -1]
+  # value_std_coef_override: [0, 1]
+  # 
+  # 2 tasks × 2 td_target × 2 value_override × 4 seeds = 32 runs
+  #############################################
+
+  task:
+    values: [acrobot-swingup, quadruped-walk]
+
+  # NEW: Local TD bootstrapping
+  local_td_bootstrap:
+    value: true
+
+  # Sweep: TD target pessimism and value std override
+  td_target_std_coef:
+    values: [0, -1]
+  value_std_coef_override:
+    values: [0, 1]
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  # Ensemble: 2 reward, 4 dynamics, 8 value heads
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+  num_q:
+    value: 8
+
+  # Standard encoder settings
+  num_enc_layers:
+    value: 3
+  num_value_layers:
+    value: 2
+
+  # Hinge off, jacobian on
+  hinge_coef:
+    value: 0
+  jacobian_correction_scale:
+    value: 1.0
+
+  # Multi-gamma (negligible weight)
+  multi_gamma_loss_weight:
+    value: 0.01
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  # EMA planning
+  ema_value_planning:
+    value: true
+
+  # Training (100k for easy tasks)
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true

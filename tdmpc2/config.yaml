@@ -38,39 +38,57 @@ n_mc_samples_target: 1
 # Number of reward ensemble heads for pessimistic reward estimation.
 num_reward_heads: 2
 
-# TD target value head reduction: how value ensemble heads (Ve) are reduced for TD targets.
-# Options:
-#   'min'   - min over all Ve heads (pessimistic)
-#   'mean'  - mean over all Ve heads
-#   'local' - each Ve head bootstraps itself (no Ve reduction)
-td_target_value_reduction: mean
+# ---------------------------------------------------------------------------
+# Head reduction via mean + coef × std
+# ---------------------------------------------------------------------------
+# All head reductions (reward, dynamics, value) use the formula:
+#   reduced_value = mean + std_coef × std
+# where mean and std are computed across ALL head combinations.
+#
+# std_coef interpretation:
+#   -1.0 = pessimistic (mean - 1 std)
+#    0.0 = neutral (mean only)
+#   +1.0 = optimistic (mean + 1 std)
+# ---------------------------------------------------------------------------
 
-# TD target dynamics head reduction: how dynamics heads (H) are reduced for TD targets.
-# Options:
-#   'min'    - min over all dynamics heads (pessimistic)
-#   'mean'   - mean over all dynamics heads
-#   'single' - use a single randomly-selected dynamics head per update (cheapest)
-td_target_dynamics_reduction: mean
+# Global magnitude override for action-selection std_coef parameters.
+# When set (not null), policy and planner std_coef values are replaced with:
+#   sign(original_value) × value_std_coef_override
+# This allows sweeping a single value to control pessimism/optimism uniformly.
+# Original signs are preserved; zero values remain zero.
+# NOTE: Does NOT affect td_target_std_coef (learning target is separate concern).
+# Set to null to use individual std_coef values as-is.
+value_std_coef_override: null
 
-# TD target reward head reduction: how reward heads (R) are reduced for TD targets.
-# Options:
-#   'min'  - min over all reward heads (pessimistic, default)
-#   'mean' - mean over all reward heads
-td_target_reward_reduction: min
+# TD target: coefficient for std across all (R × H × Ve) head combinations
+# Negative = pessimistic TD targets (default: -1.0)
+td_target_std_coef: -1.0
 
-# Aggregation over reward and dynamics heads when computing trajectory values for planning.
-# Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
-planner_head_reduce: max
+# Local vs global TD bootstrapping:
+# - false (global): reduce across ALL heads (Ve × R × H), all value heads get same target
+# - true (local): reduce across (R × H) only, each value head bootstraps itself
+local_td_bootstrap: false
+
+# Whether to use all dynamics heads or single random head for TD target imagination
+# When false, uses single random head (cheaper but H-std is 0)
+td_target_use_all_dynamics_heads: true
+
+# Policy value std coefficients for pessimistic/optimistic policy optimization
+# Pessimistic policy: typically -1.0 (avoid uncertainty)
+# Optimistic policy: typically +1.0 (seek uncertainty for exploration)
+policy_value_std_coef: -1.0
+optimistic_policy_value_std_coef: 1.0
+
+# Planner value std coefficients (separate for train vs eval)
+# Train: optimistic (+1.0) to encourage exploration
+# Eval: pessimistic (-1.0) for robust action selection
+planner_value_std_coef_train: 1.0
+planner_value_std_coef_eval: -1.0
 
 # Evaluation-specific planner head configuration.
-# If true, eval uses all dynamics heads and reduces via min (default).
+# If true, eval uses all dynamics heads.
 # If false, eval uses only head 0 (single head, no reduction needed).
 planner_use_all_heads_eval: true
-
-# Aggregation over reward and dynamics heads when computing policy loss.
-# Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
-# it controls how reward/dynamics head predictions are reduced before policy optimization.
-policy_head_reduce: min
 
 # Std of Gaussian noise added to policy actions when seeding the planner.
 # Applied only when use_policy=True in world_model.rollout_latents.
@@ -83,11 +101,6 @@ planner_action_noise_std: 0.0
 
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0
-
-# Weight for value disagreement term (training only). Set 0.0 to disable.
-# Value disagreement is std of V estimates across all (dynamics heads × V heads).
-# Most meaningful when planner_num_dynamics_heads > 1 and/or num_q > 1.
-planner_lambda_value_disagreement: 0
 
 # When true, policy-seeded trajectories are only eligible for elites during
 # the first MPPI iteration; subsequent iterations rely solely on sampled rollouts.
@@ -131,7 +144,7 @@ detach_imagine_value: false # if true, detach imagined latents when using them f
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
 actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
-ema_value_planning: false # if true, use ema critic for mpc planning
+ema_value_planning: true # If true, use EMA target network for V in planner scoring; if false, use online network
 
 steps: 100_000
 batch_size: 256
@@ -222,18 +235,11 @@ hinge_coef: 0
 # dual policy (optimistic + pessimistic)
 dual_policy_enabled: true        # If true, create pessimistic + optimistic policies
 optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
-optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
 
 # Policy multi-rollout for variance reduction
 # If true, expand each state by num_rollouts and sample multiple actions per state,
 # averaging the loss over rollouts for lower variance policy gradients.
 pi_multi_rollout: false
-
-# Value disagreement penalty for policy optimization
-# Penalizes (positive λ) or rewards (negative λ) actions where dynamics heads disagree on V(z')
-# Scaled by self.scale.value for unit consistency with Q estimates
-policy_lambda_value_disagreement: 0           # Penalty for pessimistic policy (positive = avoid uncertainty)
-optimistic_policy_lambda_value_disagreement: 0.0  # For optimistic policy (negative = seek uncertainty)
 
 # critic
 num_bins: 101
@@ -295,7 +301,7 @@ nvtx_profiler: false           # If true: add lightweight NVTX record_function r
 multi_gamma_gammas: [0.9, 0.95]              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
 joint_aux_dim_mult: 1                                     # Non-empty length ≤ 6. Primary discount auto-prepended internally.
 multi_gamma_head: separate          # Head architecture: 'separate' (one Linear per aux γ). Note: 'joint' is deprecated.
-multi_gamma_loss_weight: 0.01        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
+multi_gamma_loss_weight: 0       # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
 multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics (heavier overhead).
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true

@@ -1,0 +1,96 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 130: Dog-run no decay ablation
+  # 
+  # Goal: Test dog-run without entropy decay or encoder LR step-down.
+  #
+  # Settings:
+  #   - value_std_coef_override: 1
+  #   - td_target_std_coef: [0, -1]
+  #   - No entropy decay (start = end)
+  #   - No encoder LR step-down (enc_lr_step_scale = 1.0)
+  #
+  # 2 td × 2 seeds = 4 configurations
+  #############################################
+
+  # Sweep variables
+  td_target_std_coef:
+    values: [0, -1]
+
+  seed:
+    values: [1, 2]
+
+  # Task
+  task:
+    value: dog-run
+
+  # std_coef settings
+  value_std_coef_override:
+    value: 1
+
+  # Training
+  steps:
+    value: 400000
+
+  # Disable entropy decay (keep constant)
+  start_entropy_coeff:
+    value: 0.00003
+  end_entropy_coeff:
+    value: 0.00003
+
+  # Disable encoder LR step-down (keep at 1.0 = no change)
+  enc_lr_step_scale:
+    value: 1.0
+
+  # Architecture
+  num_enc_layers:
+    value: 2
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings (no action dim scaling)
+  temperature:
+    value: 0.5
+  jacobian_correction_scale:
+    value: 1.0
+  entropy_action_dim_power:
+    value: 1.0
+
+  # Other standard settings
+  hinge_coef:
+    value: 0.0
+  encoder_consistency_coef:
+    value: 1.0
+
+  # Logging
+  eval_freq:
+    value: 20000
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

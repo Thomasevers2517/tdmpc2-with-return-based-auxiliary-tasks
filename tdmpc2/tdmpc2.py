@@ -266,7 +266,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'min'):
+	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default'):
 		"""Select an action.
 
 		If `mpc=True`, uses modular `Planner` over latent space; else falls back to single policy prior.
@@ -276,7 +276,9 @@ class TDMPC2(torch.nn.Module):
 			eval_mode (bool): Evaluation flag (planner switches to value-only scoring / argmax selection).
 			task: Optional task index (unsupported for planner; passed to policy when mpc=False).
 			mpc (bool): Whether to use planning.
-			eval_head_reduce (str): Head reduction mode for eval ('min', 'mean', 'max'). Only used when eval_mode=True and mpc=True.
+			eval_head_reduce (str): Head reduction mode for eval ('default', 'mean').
+				'default' uses planner_value_std_coef_eval (typically pessimistic).
+				'mean' uses value_std_coef=0 for mean-only reduction.
 
 		Returns:
 			Tensor: Action.
@@ -292,10 +294,15 @@ class TDMPC2(torch.nn.Module):
 			if mpc:
 				# Encode observation -> latent start (shape [1,L])
 				z0 = self.model.encode(obs, task_tensor)
+				
+				# Convert eval_head_reduce to value_std_coef_override
+				# 'default' -> None (use config), 'mean' -> 0.0 (mean-only)
+				value_std_coef_override = 0.0 if eval_head_reduce == 'mean' else None
+				
 				chosen_action, planner_info, mean, std = self.planner.plan(
 					z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step,
 					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
-					eval_head_reduce=eval_head_reduce
+					value_std_coef_override=value_std_coef_override
 				)
 
 				# Planner already applies any training noise and clamps
@@ -395,8 +402,10 @@ class TDMPC2(torch.nn.Module):
 		through dynamics. The dynamics, reward, and value function are frozen
 		during policy optimization (SAC-style backprop through frozen model).
 		
-		Uses policy_head_reduce to aggregate over both reward heads (R) and
-		dynamics heads (H) when computing the Q-estimate.
+		Computes Q estimates for ALL (R × H × Ve) head combinations, then reduces
+		using mean + value_std_coef × std. This provides gradients through the
+		uncertainty term, allowing the policy to learn to avoid uncertain regions
+		when value_std_coef < 0 (pessimistic).
 		
 		When num_rollouts > 1, samples multiple actions per state to reduce
 		variance in policy gradients.
@@ -404,9 +413,8 @@ class TDMPC2(torch.nn.Module):
 		Args:
 			z (Tensor[T, B, L]): Current latent states.
 			task: Task identifier for multitask setup.
-			optimistic: If True, use optimistic policy with max reduction and
-				scaled entropy. If False, use pessimistic policy with configured
-				reduction (default min).
+			optimistic: If True, use optimistic policy with +1.0 std_coef and
+				scaled entropy. If False, use pessimistic policy with -1.0 std_coef.
 			
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
@@ -418,15 +426,13 @@ class TDMPC2(torch.nn.Module):
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
 		
-		# Select reduction mode and entropy coefficient based on optimistic flag
+		# Select std_coef based on optimistic flag for mean + coef × std reduction
 		if optimistic:
-			policy_reduce = self.cfg.optimistic_head_reduce  # 'max' or 'mean' for optimistic
+			value_std_coef = self.cfg.optimistic_policy_value_std_coef  # +1.0 for optimistic
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
-			lambda_value_disagreement = self.cfg.optimistic_policy_lambda_value_disagreement
 		else:
-			policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
+			value_std_coef = self.cfg.policy_value_std_coef  # -1.0 for pessimistic
 			entropy_coeff = self.dynamic_entropy_coeff
-			lambda_value_disagreement = self.cfg.policy_lambda_value_disagreement
 			
 		with maybe_range('Agent/update_pi', self.cfg):
 			# Expand z to have N rollouts: [T, B, L] -> [T, B, N, L] -> [T, B*N, L]
@@ -449,57 +455,40 @@ class TDMPC2(torch.nn.Module):
 				task_flat = None
 				gamma = self.discount  # scalar
 			
-			# Predict reward r(z, a) from all reward heads
+			# Predict reward r(z, a) from ALL reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
-			# NOTE: Gradients flow through reward/dynamics/V to the action, but only
-			# policy params are updated (pi_optim only contains policy parameters).
 			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B*N, K]
 			R = reward_logits_all.shape[0]  # number of reward heads
 			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B*N, 1]
 			
-			# Reduce over reward heads using policy_head_reduce
-			if policy_reduce == 'mean':
-				reward_flat = reward_all.mean(dim=0)  # float32[T*B*N, 1]
-			elif policy_reduce == 'min':
-				reward_flat = torch.amin(reward_all, dim=0)  # float32[T*B*N, 1]
-			elif policy_reduce == 'max':
-				reward_flat = torch.amax(reward_all, dim=0)  # float32[T*B*N, 1]
-			else:
-				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
-			
-			# Roll through ALL dynamics heads to get next states z', then reduce V
-			# This adds pessimism/optimism based on policy_head_reduce to prevent policy from exploiting errors
+			# Roll through ALL dynamics heads to get next states z'
 			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B*N, L]
 			H = next_z_all.shape[0]  # number of dynamics heads
 			
-			# Evaluate V(z') for each dynamics head using detached network
-			# Use return_type='min' to also take minimum over V ensemble heads
+			# Evaluate V(z') for each dynamics head using ALL Ve value heads
 			# Reshape to evaluate all heads at once: [H*T*B*N, L]
 			next_z_all_flat = next_z_all.view(H * T * B * N, L)  # float32[H*T*B*N, L]
 			task_flat_expanded = task_flat.repeat(H) if task_flat is not None else None
-			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B*N, 1]
-			v_next_all = v_next_all_flat.view(H, T * B * N, 1)  # float32[H, T*B*N, 1]
+			# return_type='all_values' returns [Ve, H*T*B*N, 1] for all Ve heads
+			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
+			Ve = v_next_all_flat.shape[0]  # number of value heads
+			v_next_all = v_next_all_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
 			
-			# Reduce over dynamics heads using policy_head_reduce
-			if policy_reduce == 'mean':
-				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B*N, 1]
-			elif policy_reduce == 'min':
-				v_next_flat = torch.amin(v_next_all, dim=0)  # float32[T*B*N, 1]
-			elif policy_reduce == 'max':
-				v_next_flat = torch.amax(v_next_all, dim=0)  # float32[T*B*N, 1]
-			else:
-				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
+			# Compute Q for ALL (R × H × Ve) combinations
+			# reward_all: [R, T*B*N, 1] -> [1, 1, R, T*B*N, 1] for broadcasting
+			# v_next_all: [Ve, H, T*B*N, 1] -> [Ve, H, 1, T*B*N, 1] for broadcasting
+			reward_exp = reward_all.unsqueeze(0).unsqueeze(0)  # float32[1, 1, R, T*B*N, 1]
+			v_next_exp = v_next_all.unsqueeze(2)  # float32[Ve, H, 1, T*B*N, 1]
 			
-			# Compute value disagreement across dynamics heads (std of V estimates)
-			# Scale by self.scale.value for unit consistency with q_scaled
-			v_disagreement_flat = v_next_all.std(dim=0)  # float32[T*B*N, 1]
-			v_disagreement_scaled_flat = v_disagreement_flat / self.scale.value.clamp(min=1e-6)  # float32[T*B*N, 1]
-			v_disagreement_scaled = v_disagreement_scaled_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
+			# Q = r + gamma * V(z') for all combinations
+			q_all = reward_exp + gamma * v_next_exp  # float32[Ve, H, R, T*B*N, 1]
 			
-			# Compute Q-like estimate: r(z, a) + γ * V(z')
-			# This is what the action "earns" - immediate reward plus discounted future value
-			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B*N, 1]
-			q_estimate = q_estimate_flat.view(T, B * N, 1)           # float32[T, B*N, 1]
+			# Flatten (Ve × H × R) and reduce with mean + std_coef × std
+			q_flat = q_all.view(Ve * H * R, T * B * N, 1)  # float32[Ve*H*R, T*B*N, 1]
+			q_mean = q_flat.mean(dim=0)  # float32[T*B*N, 1]
+			q_std = q_flat.std(dim=0, unbiased=False)  # float32[T*B*N, 1]
+			q_estimate_flat = q_mean + value_std_coef * q_std  # float32[T*B*N, 1]
+			q_estimate = q_estimate_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
@@ -514,11 +503,11 @@ class TDMPC2(torch.nn.Module):
 			# Entropy from policy (always use scaled_entropy with configurable action_dim power)
 			entropy_term = info["scaled_entropy"]  # float32[T, B*N, 1]
 			
-			# Policy loss: maximize (q_scaled + entropy_coeff * entropy - λ * v_disagreement)
-			# Subtraction: positive λ penalizes uncertainty, negative λ rewards it
+			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
+			# Uncertainty handling is now via value_std_coef in q_estimate computation
 			# Apply rho weighting across time
 			# Average over both B and N dimensions to reduce variance from multiple rollouts
-			objective = q_scaled + entropy_coeff * entropy_term - lambda_value_disagreement * v_disagreement_scaled  # float32[T, B*N, 1]
+			objective = q_scaled + entropy_coeff * entropy_term  # float32[T, B*N, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -533,7 +522,6 @@ class TDMPC2(torch.nn.Module):
 			info_log_std = info["log_std"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			info_presquash_mean = info["presquash_mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			q_estimate_avg = q_estimate.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
-			v_disagreement_scaled_avg = v_disagreement_scaled.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
 
 			info = TensorDict({
 				"pi_loss": pi_loss,
@@ -554,10 +542,9 @@ class TDMPC2(torch.nn.Module):
 				"entropy_coeff": self.dynamic_entropy_coeff,
 				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate_avg.mean(),
-				"pi_reward_mean": reward_flat.mean(),
-				"pi_v_next_mean": v_next_flat.mean(),
-				"pi_value_disagreement": v_disagreement_flat.mean(),
-				"pi_value_disagreement_scaled": v_disagreement_scaled_avg.mean(),
+				"pi_reward_mean": reward_all.mean(),
+				"pi_v_next_mean": v_next_all.mean(),
+				"pi_q_std": q_std.mean(),  # Std across (Ve × H × R) - now used in q_estimate via value_std_coef
 				"pi_num_rollouts": float(N),  # Log how many rollouts used (float for mean() compatibility)
 			}, device=self.device)
 
@@ -602,9 +589,9 @@ class TDMPC2(torch.nn.Module):
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		
-		Reduction behavior controlled by:
-		  - cfg.td_target_value_reduction: 'min'/'mean'/'local' - how Ve heads are reduced
-		  - cfg.td_target_dynamics_reduction: 'min'/'mean'/'single' - how H dynamics heads are reduced
+		Computes TD targets for ALL (R × H × Ve) head combinations, then reduces via:
+		  reduced = mean + td_target_std_coef × std
+		across all combinations.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -614,7 +601,7 @@ class TDMPC2(torch.nn.Module):
 
 		Returns:
 			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1], Tensor[T, B, 1]]: 
-				(TD-targets per Ve head, std across dynamics heads avg over Ve, std across value heads avg over H).
+				(TD-targets per Ve head - all same value, td_mean, td_std).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -634,73 +621,53 @@ class TDMPC2(torch.nn.Module):
 		
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		# Reduce over reward heads (R) based on td_target_reward_reduction config
-		r_reduction = self.cfg.td_target_reward_reduction
-		if r_reduction == 'min':
-			reward_reduced = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
-		elif r_reduction == 'mean':
-			reward_reduced = reward.mean(dim=1)  # float32[T, H, B, 1]
+		# Keep reward with R dimension: [T, R, H, B, 1]
+		# Expand for broadcasting with Ve: [1, T, R, H, B, 1]
+		reward_exp = reward.unsqueeze(0)  # float32[1, T, R, H, B, 1]
+		
+		# Expand terminated: [T, H, B, 1] -> [1, T, 1, H, B, 1] for broadcasting
+		terminated_exp = terminated.unsqueeze(0).unsqueeze(2)  # float32[1, T, 1, H, B, 1]
+		
+		# Expand v_values: [Ve, T, H, B, 1] -> [Ve, T, 1, H, B, 1] for broadcasting
+		v_values_exp = v_values.unsqueeze(2)  # float32[Ve, T, 1, H, B, 1]
+		
+		# Compute TD targets for ALL (R × H × Ve) combinations
+		# Result shape: [Ve, T, R, H, B, 1]
+		td_all = reward_exp + discount * (1 - terminated_exp) * v_values_exp  # float32[Ve, T, R, H, B, 1]
+		
+		std_coef = float(self.cfg.td_target_std_coef)
+		
+		if self.cfg.local_td_bootstrap:
+			# Local: each Ve head bootstraps itself, reduce only over (R × H)
+			# [Ve, T, R, H, B, 1] -> [Ve, T, R*H, B, 1]
+			td_flat = td_all.view(Ve, T, R * H, B, 1)  # float32[Ve, T, R*H, B, 1]
+			td_mean = td_flat.mean(dim=2)  # float32[Ve, T, B, 1]
+			td_std = td_flat.std(dim=2, unbiased=False)  # float32[Ve, T, B, 1]
+			td_targets = td_mean + std_coef * td_std  # float32[Ve, T, B, 1] - each head has own target
+			# For logging, report mean across Ve heads
+			td_mean_log = td_mean.mean(dim=0)  # float32[T, B, 1]
+			td_std_log = td_std.mean(dim=0)  # float32[T, B, 1]
 		else:
-			raise ValueError(f"Unknown td_target_reward_reduction: {r_reduction}. Expected 'min' or 'mean'.")
-		
-		# Expand reward/terminated for broadcasting with Ve: [T, H, B, 1] -> [1, T, H, B, 1]
-		reward_exp = reward_reduced.unsqueeze(0)  # float32[1, T, H, B, 1]
-		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-		
-		# Per-head TD targets: r + γ * (1 - done) * V(s')  ->  [Ve, T, H, B, 1]
-		td_per_head = reward_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
-		
-		# Compute std across dynamics heads H (averaged over Ve) for logging
-		# For each Ve: std over H, then average over Ve
-		td_std_over_h_per_ve = td_per_head.std(dim=2, unbiased=False)  # float32[Ve, T, B, 1]
-		td_std_across_dynamics_heads = td_std_over_h_per_ve.mean(dim=0)  # float32[T, B, 1]
-		
-		# Compute std across value heads Ve (averaged over H) for logging
-		# For each H: std over Ve, then average over H
-		td_std_over_ve_per_h = td_per_head.std(dim=0, unbiased=False)  # float32[T, H, B, 1]
-		td_std_across_value_heads = td_std_over_ve_per_h.mean(dim=1)  # float32[T, B, 1]
-		
-		# Apply reduction based on td_target_value_reduction and td_target_dynamics_reduction
-		# Output is [Ve, T, B, 1]
-		v_reduction = self.cfg.td_target_value_reduction
-		h_reduction = self.cfg.td_target_dynamics_reduction
-		
-		# First reduce dynamics heads (H dimension = 2)
-		if h_reduction == 'single':
-			# H=1 when using single random head, no reduction needed
-			td_h_reduced = td_per_head.squeeze(2)  # float32[Ve, T, B, 1]
-		elif h_reduction == 'min':
-			td_h_reduced = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
-		elif h_reduction == 'mean':
-			td_h_reduced = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
-		else:
-			raise ValueError(f"Unknown td_target_dynamics_reduction: {h_reduction}. Expected 'min', 'mean', or 'single'.")
-		
-		# Then reduce value heads (Ve dimension = 0)
-		if v_reduction == 'local':
-			# Each Ve head bootstraps itself, no reduction
-			td_targets = td_h_reduced  # float32[Ve, T, B, 1]
-		elif v_reduction == 'min':
-			# Min over Ve, then expand back to [Ve, T, B, 1]
-			td_reduced = torch.amin(td_h_reduced, dim=0, keepdim=False)  # float32[T, B, 1]
+			# Global: reduce across ALL heads (Ve × R × H), all value heads get same target
+			# [Ve, T, R, H, B, 1] -> [Ve*R*H, T, B, 1]
+			td_flat = td_all.permute(0, 2, 3, 1, 4, 5).contiguous().view(Ve * R * H, T, B, 1)  # float32[Ve*R*H, T, B, 1]
+			td_mean = td_flat.mean(dim=0)  # float32[T, B, 1]
+			td_std = td_flat.std(dim=0, unbiased=False)  # float32[T, B, 1]
+			td_reduced = td_mean + std_coef * td_std  # float32[T, B, 1]
 			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-		elif v_reduction == 'mean':
-			# Mean over Ve, then expand back to [Ve, T, B, 1]
-			td_reduced = td_h_reduced.mean(dim=0, keepdim=False)  # float32[T, B, 1]
-			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-		else:
-			raise ValueError(f"Unknown td_target_value_reduction: {v_reduction}. Expected 'min', 'mean', or 'local'.")
+			td_mean_log = td_mean  # float32[T, B, 1]
+			td_std_log = td_std  # float32[T, B, 1]
 		
-		return td_targets, td_std_across_dynamics_heads, td_std_across_value_heads 
+		return td_targets, td_mean_log, td_std_log 
   
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
 		"""
-		Compute auxiliary multi-gamma TD targets.
+		Compute auxiliary multi-gamma TD targets using mean + std_coef × std reduction.
 		
-		Auxiliary values have no Ve ensemble, so td_target_value_reduction has no effect.
-		Dynamics head (H) reduction uses td_target_dynamics_reduction.
+		Auxiliary values have no Ve ensemble (only 2 outputs per gamma), so we compute
+		TD for all (R × H) combinations and reduce with mean + td_target_std_coef × std.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -709,7 +676,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma (H dimension reduced).
+			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma, reduced via mean + std_coef × std.
 		"""
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
@@ -722,45 +689,37 @@ class TDMPC2(torch.nn.Module):
 		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
 		
 		# Evaluate auxiliary V on next states using target network
-		# V_aux returns (G_aux, T, H*B, 1) for scalar values
-		v_values_flat = self.model.V_aux(next_z_flat, task, return_type='min', target=True)  # float32[G_aux, T, H*B, 1]
+		# V_aux returns (G_aux, T, H*B, 1) for scalar values (mean over 2 outputs per gamma)
+		v_values_flat = self.model.V_aux(next_z_flat, task, return_type='mean', target=True)  # float32[G_aux, T, H*B, 1]
 		
 		# Reshape back to [G_aux, T, H, B, 1]
 		v_values = v_values_flat.view(G_aux, T, H, B, 1)  # float32[G_aux, T, H, B, 1]
 		
-		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		
-		# Reduce over reward heads (R) based on td_target_reward_reduction config
-		r_reduction = self.cfg.td_target_reward_reduction
-		if r_reduction == 'min':
-			reward_reduced = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
-		elif r_reduction == 'mean':
-			reward_reduced = reward.mean(dim=1)  # float32[T, H, B, 1]
-		else:
-			raise ValueError(f"Unknown td_target_reward_reduction: {r_reduction}. Expected 'min' or 'mean'.")
-		
-		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
-		reward_exp = reward_reduced.unsqueeze(0)  # float32[1, T, H, B, 1]
-		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-		
-		# Compute per-head TD targets for all auxiliary gammas at once
-		# gamma_aux: scalar per g, broadcast over [G_aux, T, H, B, 1]
+		# Compute per-head TD targets for all auxiliary gammas with ALL (R × H) combinations
+		# gammas_aux: [G_aux] -> [G_aux, 1, 1, 1, 1, 1] for broadcasting with 6D tensors
+		# NOTE: gammas_aux already contains the auxiliary discount factors directly (e.g., 0.9, 0.99),
+		# so we do NOT multiply by self.discount (which is the primary γ from episode length).
 		gammas_aux = torch.tensor(self._all_gammas[1:], device=next_z.device, dtype=next_z.dtype)  # float32[G_aux]
-		gammas_aux = gammas_aux.view(G_aux, 1, 1, 1, 1)  # float32[G_aux, 1, 1, 1, 1]
+		gammas_aux = gammas_aux.view(G_aux, 1, 1, 1, 1, 1)  # float32[G_aux, 1, 1, 1, 1, 1]
 		
-		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
+		# Expand reward to [G_aux, T, R, H, B, 1] and v_values to [G_aux, T, 1, H, B, 1]
+		reward_exp = reward.unsqueeze(0)  # float32[1, T, R, H, B, 1]
+		v_values_exp = v_values.unsqueeze(2)  # float32[G_aux, T, 1, H, B, 1]
+		terminated_exp = terminated.unsqueeze(0).unsqueeze(2)  # float32[1, T, 1, H, B, 1]
 		
-		# Reduce H dimension using td_target_dynamics_reduction - output is [G_aux, T, B, 1]
-		h_reduction = self.cfg.td_target_dynamics_reduction
-		if h_reduction == 'single':
-			# H=1 when using single random head, no reduction needed
-			td_targets_aux = td_per_head.squeeze(2)  # float32[G_aux, T, B, 1]
-		elif h_reduction == 'min':
-			td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
-		elif h_reduction == 'mean':
-			td_targets_aux = td_per_head.mean(dim=2)  # float32[G_aux, T, B, 1]
-		else:
-			raise ValueError(f"Unknown td_target_dynamics_reduction: {h_reduction}. Expected 'min', 'mean', or 'single'.")
+		# Compute TD for all (R × H) combinations per gamma
+		# Broadcasting: [1, T, R, H, B, 1] + [G_aux,1,1,1,1] * [G_aux, T, 1, H, B, 1]
+		td_all = reward_exp + gammas_aux * (1 - terminated_exp) * v_values_exp  # float32[G_aux, T, R, H, B, 1]
+		
+		# Flatten (R × H) dimensions and compute mean + std_coef × std reduction
+		# [G_aux, T, R, H, B, 1] -> [G_aux, T, R*H, B, 1]
+		td_flat = td_all.view(G_aux, T, R * H, B, 1)  # float32[G_aux, T, R*H, B, 1]
+		
+		# Reduce over (R × H) using mean + std_coef × std
+		std_coef = self.cfg.td_target_std_coef
+		td_mean = td_flat.mean(dim=2)  # float32[G_aux, T, B, 1]
+		td_std = td_flat.std(dim=2, unbiased=False)  # float32[G_aux, T, B, 1]
+		td_targets_aux = td_mean + std_coef * td_std  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
@@ -1043,16 +1002,15 @@ class TDMPC2(torch.nn.Module):
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
 		
-		# Determine head_mode based on td_target_dynamics_reduction
-		# When 'single', use a randomly-selected dynamics head (cheapest)
-		# Otherwise, use all heads and reduce later
-		h_reduction = self.cfg.td_target_dynamics_reduction
-		if h_reduction == 'single':
-			head_mode = 'random'  # Use single randomly-selected head
-			H = 1  # Only one head in output
-		else:
+		# Determine head_mode based on td_target_use_all_dynamics_heads
+		# When false, use a randomly-selected dynamics head (cheaper but no H-std)
+		# When true, use all heads for full (R × H × Ve) combinations
+		if self.cfg.td_target_use_all_dynamics_heads:
 			head_mode = 'all'
 			H = int(self.cfg.planner_num_dynamics_heads)
+		else:
+			head_mode = 'random'  # Use single randomly-selected head
+			H = 1  # Only one head in output
 		
 		# Multi-head imagination requires rollout_len=1 so all heads share the same action
 		# (policy samples at z[0] before dynamics step)
@@ -1199,15 +1157,15 @@ class TDMPC2(torch.nn.Module):
 				R = rewards_flat.shape[1]
 				terminated_flat = terminated.view(T_imag, H, S * BN, 1)  # [T_imag, H, S*BN, 1]
 				
-				td_targets_flat, td_std_dynamics_flat, td_std_value_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
-				# td_targets_flat: [Ve, T_imag, S*BN, 1]
-				# td_std_dynamics_flat: [T_imag, S*BN, 1] - std across H (dynamics heads), avg over Ve
-				# td_std_value_flat: [T_imag, S*BN, 1] - std across Ve (value heads), avg over H
+				td_targets_flat, td_mean_flat, td_std_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
+				# td_targets_flat: [Ve, T_imag, S*BN, 1] - reduced targets (mean + coef×std)
+				# td_mean_flat: [T_imag, S*BN, 1] - mean across all Ve×R×H combinations
+				# td_std_flat: [T_imag, S*BN, 1] - std across all Ve×R×H combinations
 				
 				# Split back: [Ve, T_imag, S*BN, 1] -> [Ve, T_imag, S, BN, 1]
 				td_targets = td_targets_flat.view(Ve, T_imag, S, BN, 1)
-				td_std_across_dynamics_heads = td_std_dynamics_flat.view(T_imag, S, BN, 1)
-				td_std_across_value_heads = td_std_value_flat.view(T_imag, S, BN, 1)
+				td_mean = td_mean_flat.view(T_imag, S, BN, 1)  # float32[T_imag, S, BN, 1]
+				td_std = td_std_flat.view(T_imag, S, BN, 1)    # float32[T_imag, S, BN, 1]
 
 		with maybe_range('Value/ce', self.cfg):
 			# TD targets: [Ve, T_imag, S, BN, 1], vs: [Ve, T_imag, S, BN, K]
@@ -1235,18 +1193,18 @@ class TDMPC2(torch.nn.Module):
 		
 		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN, 1]
 		
-		# Always log td_target std across dynamics and value heads (important diagnostics)
+		# Log td_target statistics (mean and std across all Ve×R×H combinations)
 		info.update({
-			'td_target_std_across_dynamics_heads': td_std_across_dynamics_heads.mean(),
-			'td_target_std_across_value_heads': td_std_across_value_heads.mean(),
+			'td_target_mean': td_mean.mean(),
+			'td_target_std': td_std.mean(),
 		}, non_blocking=True)
 		
 		if self.log_detailed:
 			info.update({
-				'td_target_mean': td_targets.mean(),
-				'td_target_std': td_targets.std(),
-				'td_target_min': td_targets.min(),
-				'td_target_max': td_targets.max(),
+				'td_target_reduced_mean': td_targets.mean(),
+				'td_target_reduced_std': td_targets.std(),
+				'td_target_reduced_min': td_targets.min(),
+				'td_target_reduced_max': td_targets.max(),
 				'value_pred_mean': value_pred.mean(),
 				'value_pred_std': value_pred.std(),
 				'value_pred_min': value_pred.min(),
@@ -1485,10 +1443,10 @@ class TDMPC2(torch.nn.Module):
 			
 			# imagined_rollout flattens S*B into batch, uses N rollouts per state
 			# Returns tensors with B_expanded = S * B_orig * N
-			# H depends on td_target_dynamics_reduction: 1 if 'single', planner_num_dynamics_heads otherwise
+			# H depends on td_target_use_all_dynamics_heads: 1 if False, planner_num_dynamics_heads if True
 			imagined = self.imagined_rollout(start_z, task=task, rollout_len=T_imag)
 			
-			# Get actual H from returned tensor (may be 1 if td_target_dynamics_reduction='single')
+			# Get actual H from returned tensor (may be 1 if td_target_use_all_dynamics_heads=False)
 			H = imagined['z_seq'].shape[1]
 			
 			# Reshape outputs from [*, B_expanded, *] to [*, S, B, N, *]

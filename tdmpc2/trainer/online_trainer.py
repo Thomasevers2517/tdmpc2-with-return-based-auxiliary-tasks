@@ -52,12 +52,14 @@ class OnlineTrainer(Trainer):
 			steps_per_second=self._step / elapsed_time
 		)
 
-	def eval(self, mpc=True, eval_head_reduce: str = 'min'):
+	def eval(self, mpc=True, eval_head_reduce: str = 'default'):
 		"""Evaluate a TD-MPC2 agent.
 		
 		Args:
 			mpc: If True, use MPC planning. If False, use policy-only.
-			eval_head_reduce: Head reduction mode for eval ('min', 'mean', 'max'). Only used when mpc=True.
+			eval_head_reduce: Head reduction mode for eval.
+				'default' uses planner_value_std_coef_eval (typically pessimistic).
+				'mean' uses value_std_coef=0 for mean-only reduction.
 		"""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
@@ -89,13 +91,13 @@ class OnlineTrainer(Trainer):
 				self.logger.video.save(self._step)
 			if mpc:
 				# Add to appropriate validation buffers based on head reduction mode
-				if eval_head_reduce == 'min':
+				if eval_head_reduce == 'default':
 					self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 					self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
 				elif eval_head_reduce == 'mean' and self.validation_all_mean_head_reduce_buffer is not None:
 					self.validation_all_mean_head_reduce_buffer.add(torch.cat(self.val_tds), end_episode=True)
 					self.validation_recent_mean_head_reduce_buffer.add(torch.cat(self.val_tds), end_episode=True)
-		if mpc and eval_head_reduce == 'min':
+		if mpc and eval_head_reduce == 'default':
 			# Return that validation should run after all evals complete
 			# (validation is now called from train() after all eval modes finish)
 			pass
@@ -148,7 +150,7 @@ class OnlineTrainer(Trainer):
 			if done:
 				if eval_next:
 					# Default eval with min head reduction
-					eval_metrics = self.eval(mpc=True, eval_head_reduce='min')
+					eval_metrics = self.eval(mpc=True, eval_head_reduce='default')
 					eval_metrics.update(self.common_metrics())
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False

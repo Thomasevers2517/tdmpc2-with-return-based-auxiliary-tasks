@@ -503,7 +503,7 @@ class WorldModel(nn.Module):
 		with maybe_range('WM/V_aux', self.cfg):
 			if self._num_aux_gamma == 0:
 				return None
-			assert return_type in {'all','min','avg'}
+			assert return_type in {'all', 'min', 'avg', 'mean'}
 
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
@@ -549,15 +549,17 @@ class WorldModel(nn.Module):
 		Args:
 			z (Tensor[..., L]): Latent state embeddings.
 			task: Task identifier for multitask setup.
-			return_type (str): 'all' returns logits, 'min'/'max'/'avg'/'mean' return scalar values.
+			return_type (str): 'all' returns logits, 'all_values' returns scalar values per head,
+			                   'min'/'max'/'avg'/'mean' return scalar values reduced over heads.
 			target (bool): Use target network.
 			detach (bool): Use detached (non-gradient) network.
 			
 		Returns:
 			Tensor[num_q, ..., K] if return_type='all' (logits).
+			Tensor[num_q, ..., 1] if return_type='all_values' (scalar values per head).
 			Tensor[..., 1] otherwise (values after two-hot inverse, reduced over all num_q heads).
 		"""
-		assert return_type in {'min', 'avg', 'mean', 'max', 'all'}
+		assert return_type in {'min', 'avg', 'mean', 'max', 'all', 'all_values'}
 
 		with maybe_range('WM/V', self.cfg):
 			if self.cfg.multitask:
@@ -579,6 +581,9 @@ class WorldModel(nn.Module):
 
 			# Use ALL num_q ensemble members for reduction (no subsampling)
 			V = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
+			
+			if return_type == 'all_values':
+				return V  # Return scalar values for all heads without reduction
 			if return_type == "min":
 				return torch.amin(V, dim=0)
 			if return_type == "max":

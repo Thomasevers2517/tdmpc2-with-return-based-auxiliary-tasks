@@ -1,0 +1,114 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 143: Dog-Run Config Ablation
+  # 
+  # Goal: Figure out what broke dog-run going from 135c -> 142d
+  # 
+  # Sweep:
+  #   - value_std_coef_override: [0, 1]
+  #   - jacobian_correction_scale: [0, 1] (1 overrides hinge_coef)
+  # 
+  # Fixed:
+  #   - hinge_coef: 0.01 (but overridden when jacobian=1)
+  #   - td_target_std_coef: -1 (pessimistic, like 135c)
+  #   - local_td_bootstrap: true
+  #   - multi_gamma_loss_weight: 0.1
+  # 
+  # 2 value_override × 2 jacobian × 2 seeds = 8 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  # Local TD bootstrapping
+  local_td_bootstrap:
+    value: true
+
+  # TD target: pessimistic (like 135c that worked)
+  td_target_std_coef:
+    value: -1
+
+  # SWEEP 1: value_std_coef_override
+  value_std_coef_override:
+    values: [0, 1]
+
+  # SWEEP 2: jacobian_correction_scale (1 overrides hinge)
+  jacobian_correction_scale:
+    values: [0, 1]
+
+  # Hinge coefficient (overridden when jacobian=1)
+  hinge_coef:
+    value: 0.01
+
+  # Larger ensemble (like 135c and 142d)
+  num_q:
+    value: 8
+  planner_num_dynamics_heads:
+    value: 4
+  num_reward_heads:
+    value: 2
+
+  # Architecture
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+
+  # Multi-gamma: 0.1 (like 135c)
+  multi_gamma_loss_weight:
+    value: 0.1
+
+  seed:
+    values: [1, 2]
+
+  # Policy/planner: neutral (like 135c)
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  # EMA planning
+  ema_value_planning:
+    value: true
+
+  # Training
+  steps:
+    value: 1000000
+  eval_freq:
+    value: 50000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true

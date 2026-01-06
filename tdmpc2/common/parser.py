@@ -146,21 +146,15 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		if cfg.policy_seed_noise_std < 0.0:
 			raise ValueError(f"policy_seed_noise_std must be >= 0.0, got {cfg.policy_seed_noise_std}.")
 
-	# Planner value head reduction mode must be explicitly configured.
-	if not hasattr(cfg, 'planner_head_reduce'):
-		raise AttributeError("Missing cfg.planner_head_reduce; expected 'mean' or 'max'.")
-	if cfg.planner_head_reduce not in {"mean", "max"}:
-		raise ValueError(
-			f"Invalid planner_head_reduce '{cfg.planner_head_reduce}'. Expected 'mean' or 'max'."
-		)
+	# Validate planner value std coefficients are present
+	if not hasattr(cfg, 'planner_value_std_coef_train'):
+		raise AttributeError("Missing cfg.planner_value_std_coef_train; expected float (-1.0 for pessimistic, +1.0 for optimistic).")
+	if not hasattr(cfg, 'planner_value_std_coef_eval'):
+		raise AttributeError("Missing cfg.planner_value_std_coef_eval; expected float (-1.0 for pessimistic, +1.0 for optimistic).")
 
-	# Policy head reduction mode for policy loss computation.
-	if not hasattr(cfg, 'policy_head_reduce'):
-		raise AttributeError("Missing cfg.policy_head_reduce; expected 'mean', 'min', or 'max'.")
-	if cfg.policy_head_reduce not in {"mean", "min", "max"}:
-		raise ValueError(
-			f"Invalid policy_head_reduce '{cfg.policy_head_reduce}'. Expected 'mean', 'min', or 'max'."
-		)
+	# Validate policy value std coefficients are present
+	if not hasattr(cfg, 'policy_value_std_coef'):
+		raise AttributeError("Missing cfg.policy_value_std_coef; expected float (-1.0 for pessimistic, +1.0 for optimistic).")
 
 	# Number of reward heads: default to 1 for backward compatibility
 	if not hasattr(cfg, 'num_reward_heads'):
@@ -193,16 +187,39 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			"all heads are identical at t=0 for value predictions."
 		)
 
-	if cfg.planner_lambda_disagreement == 0:
-		if cfg.planner_num_dynamics_heads > 1:
-			if cfg.planner_head_reduce != "max":
-				print("Warning: planner_num_dynamics_heads > 1 has no effect when planner_lambda_disagreement == 0. Planner valuehead reduce is also not max but mean, so just avging across heads. Setting planner_num_dynamics_heads = 1 to save computation. ")
-				cfg.planner_num_dynamics_heads = 1
-			print("Keeping multiple dynamics heads because taking max among them for exploration. Planner lambda_disagreement is zero tho")
-
  
 	if cfg.final_rho != -1:
 		import math as _math
 		cfg.rho = _math.pow(cfg.final_rho, 1 / cfg.horizon)
 		print(f"Overriding rho schedule to end at final_rho = {cfg.final_rho} at horizon = {cfg.horizon}, setting rho = {cfg.rho:.6f}")
+
+	# ----------------------------------------------------------------------
+	# value_std_coef_override: uniform magnitude for action-selection std_coef params
+	# ----------------------------------------------------------------------
+	# When set (not None), replace magnitude of policy/planner std_coef values
+	# while preserving their signs. Zero values remain zero.
+	# NOTE: td_target_std_coef is NOT affected (learning target is separate).
+	if hasattr(cfg, 'value_std_coef_override') and cfg.value_std_coef_override is not None:
+		magnitude = float(cfg.value_std_coef_override)
+		# Only action-selection params, NOT td_target_std_coef
+		std_coef_params = [
+			'policy_value_std_coef',
+			'optimistic_policy_value_std_coef',
+			'planner_value_std_coef_train',
+			'planner_value_std_coef_eval',
+		]
+		print(f"[value_std_coef_override] Applying magnitude={magnitude} to action-selection std_coef parameters:")
+		for param in std_coef_params:
+			if hasattr(cfg, param):
+				old_val = float(cfg[param])
+				if old_val == 0.0:
+					# Zero stays zero (intentional mean-only)
+					new_val = 0.0
+				else:
+					# Preserve sign, apply override magnitude
+					sign = 1.0 if old_val > 0 else -1.0
+					new_val = sign * magnitude
+				cfg[param] = new_val
+				print(f"  {param}: {old_val} -> {new_val}")
+
 	return cfg_to_dataclass(cfg)
