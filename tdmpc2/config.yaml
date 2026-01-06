@@ -39,30 +39,33 @@ n_mc_samples_target: 1
 num_reward_heads: 2
 
 # ---------------------------------------------------------------------------
-# Head reduction via mean + coef × std
+# Correct Optimism: Head reduction via per-step std, then min/max/mean over dynamics
 # ---------------------------------------------------------------------------
-# All head reductions (reward, dynamics, value) use the formula:
-#   reduced_value = mean + std_coef × std
-# where mean and std are computed across ALL head combinations.
+# For each dynamics head h, compute:
+#   σ_h = sum_t(γ^t * σ^r_h,t) + γ^T * σ^v_h   (reward std + value std)
+#   Q_h = μ_h + std_coef × σ_h
+# Then reduce over dynamics heads:
+#   std_coef > 0 (opt): max over H (optimistic)
+#   std_coef < 0 (pess): min over H (pessimistic)  
+#   std_coef = 0: mean over H (neutral)
 #
-# std_coef interpretation:
-#   -1.0 = pessimistic (mean - 1 std)
-#    0.0 = neutral (mean only)
-#   +1.0 = optimistic (mean + 1 std)
+# std_coef can be:
+#   - numeric: use that value directly (e.g., -1.0, 0.5, 2.0)
+#   - "opt": use +value_std_coef_default (optimistic)
+#   - "pess": use -value_std_coef_default (pessimistic)
 # ---------------------------------------------------------------------------
 
-# Global magnitude override for action-selection std_coef parameters.
-# When set (not null), policy and planner std_coef values are replaced with:
-#   sign(original_value) × value_std_coef_override
-# This allows sweeping a single value to control pessimism/optimism uniformly.
-# Original signs are preserved; zero values remain zero.
-# NOTE: Does NOT affect td_target_std_coef (learning target is separate concern).
-# Set to null to use individual std_coef values as-is.
-value_std_coef_override: null
+# Default magnitude for std_coef when using "opt"/"pess" strings.
+# With "opt" -> +value_std_coef_default, "pess" -> -value_std_coef_default.
+# Allows sweeping magnitude while keeping opt/pess semantics.
+value_std_coef_default: 1.0
 
-# TD target: coefficient for std across all (R × H × Ve) head combinations
-# Negative = pessimistic TD targets (default: -1.0)
-td_target_std_coef: -1.0
+# TD target: coefficient for pessimism/optimism in TD target computation
+# If negative: pessimistic (mean - |c|*std, min over dynamics heads)
+# If zero: neutral (mean only, mean over dynamics heads)
+# If positive: optimistic (mean + c*std, max over dynamics heads)
+# Can also use "pess" or "opt" strings.
+td_target_std_coef: pess
 
 # Local vs global TD bootstrapping:
 # - false (global): reduce across ALL heads (Ve × R × H), all value heads get same target
@@ -74,16 +77,17 @@ local_td_bootstrap: false
 td_target_use_all_dynamics_heads: true
 
 # Policy value std coefficients for pessimistic/optimistic policy optimization
-# Pessimistic policy: typically -1.0 (avoid uncertainty)
-# Optimistic policy: typically +1.0 (seek uncertainty for exploration)
-policy_value_std_coef: -1.0
-optimistic_policy_value_std_coef: 1.0
+# Pessimistic policy: "pess" or negative value (avoid uncertainty, min over dynamics)
+# Optimistic policy: "opt" or positive value (seek uncertainty, max over dynamics)
+# Zero: mean only (mean over dynamics)
+policy_value_std_coef: pess
+optimistic_policy_value_std_coef: opt
 
 # Planner value std coefficients (separate for train vs eval)
-# Train: optimistic (+1.0) to encourage exploration
-# Eval: pessimistic (-1.0) for robust action selection
-planner_value_std_coef_train: 1.0
-planner_value_std_coef_eval: -1.0
+# Train: "opt" or positive (encourage exploration, max over dynamics)
+# Eval: "pess" or negative (robust action selection, min over dynamics)
+planner_value_std_coef_train: opt
+planner_value_std_coef_eval: pess
 
 # Evaluation-specific planner head configuration.
 # If true, eval uses all dynamics heads.

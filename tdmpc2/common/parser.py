@@ -160,6 +160,15 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	if not hasattr(cfg, 'num_reward_heads'):
 		cfg.num_reward_heads = 1
 
+	# Minimum head counts for unbiased std estimation
+	# With unbiased=True, std divides by (n-1), so n must be >= 2
+	assert cfg.num_reward_heads >= 2, (
+		f"num_reward_heads must be >= 2 for unbiased std estimation, got {cfg.num_reward_heads}"
+	)
+	assert cfg.num_q >= 2, (
+		f"num_q (value heads) must be >= 2 for unbiased std estimation, got {cfg.num_q}"
+	)
+
 	# ----------------------------------------------------------------------
 	# Actor-critic source constraints (only 'imagine' mode supported)
 	# ----------------------------------------------------------------------
@@ -194,32 +203,40 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		print(f"Overriding rho schedule to end at final_rho = {cfg.final_rho} at horizon = {cfg.horizon}, setting rho = {cfg.rho:.6f}")
 
 	# ----------------------------------------------------------------------
-	# value_std_coef_override: uniform magnitude for action-selection std_coef params
+	# value_std_coef resolution: convert "opt"/"pess" strings to numeric values
 	# ----------------------------------------------------------------------
-	# When set (not None), replace magnitude of policy/planner std_coef values
-	# while preserving their signs. Zero values remain zero.
-	# NOTE: td_target_std_coef is NOT affected (learning target is separate).
-	if hasattr(cfg, 'value_std_coef_override') and cfg.value_std_coef_override is not None:
-		magnitude = float(cfg.value_std_coef_override)
-		# Only action-selection params, NOT td_target_std_coef
-		std_coef_params = [
-			'policy_value_std_coef',
-			'optimistic_policy_value_std_coef',
-			'planner_value_std_coef_train',
-			'planner_value_std_coef_eval',
-		]
-		print(f"[value_std_coef_override] Applying magnitude={magnitude} to action-selection std_coef parameters:")
-		for param in std_coef_params:
-			if hasattr(cfg, param):
-				old_val = float(cfg[param])
-				if old_val == 0.0:
-					# Zero stays zero (intentional mean-only)
-					new_val = 0.0
-				else:
-					# Preserve sign, apply override magnitude
-					sign = 1.0 if old_val > 0 else -1.0
-					new_val = sign * magnitude
-				cfg[param] = new_val
-				print(f"  {param}: {old_val} -> {new_val}")
+	# All std_coef params can be:
+	#   - numeric: use that value directly
+	#   - "opt": use +value_std_coef_default (optimistic)
+	#   - "pess": use -value_std_coef_default (pessimistic)
+	# The sign determines dynamics head reduction: >0 → max, <0 → min, =0 → mean
+	def resolve_std_coef(value, default_magnitude):
+		"""Convert std_coef value to float, handling 'opt'/'pess' strings."""
+		if isinstance(value, str):
+			if value.lower() == 'opt':
+				return float(default_magnitude)
+			elif value.lower() == 'pess':
+				return -float(default_magnitude)
+			else:
+				raise ValueError(f"Invalid std_coef string '{value}'. Must be 'opt', 'pess', or numeric.")
+		return float(value)
+	
+	# Get default magnitude (must exist)
+	if not hasattr(cfg, 'value_std_coef_default'):
+		cfg.value_std_coef_default = 1.0  # fallback for backward compat
+	default_mag = float(cfg.value_std_coef_default)
+	
+	# Resolve all std_coef parameters
+	std_coef_params = [
+		'policy_value_std_coef',
+		'optimistic_policy_value_std_coef',
+		'planner_value_std_coef_train',
+		'planner_value_std_coef_eval',
+		'td_target_std_coef',
+	]
+	for param in std_coef_params:
+		if hasattr(cfg, param):
+			old_val = cfg[param]
+			cfg[param] = resolve_std_coef(old_val, default_mag)
 
 	return cfg_to_dataclass(cfg)

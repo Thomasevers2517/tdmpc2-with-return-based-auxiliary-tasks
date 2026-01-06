@@ -5,7 +5,7 @@ from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
-def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False):
+def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False, discount: float = 0.99):
     """Core kernel to roll out a single noisy sequence and score it.
 
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
@@ -27,6 +27,7 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         task,
         value_std_coef=value_std_coef,
         use_ema_value=use_ema_value,
+        discount=discount,
     )
     latent_dis = None
     if lat_all.shape[0] > 1:
@@ -119,6 +120,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     value_std_coef: float
     T: int
     use_ema_value: bool = False  # Whether to use EMA target network for V in planning
+    discount: float = 0.99  # Discount factor for compute_values
 
     # Outputs of post-noise analysis (set by compute_post_noise_effects)
     value_chosen_post_noise: Optional[torch.Tensor] = None
@@ -156,7 +158,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
                 impl = torch.compile(_post_noise_effects_impl, mode=getattr(cfg, 'compile_type', 'reduce-overhead'), fullgraph=False)
         except Exception:
             pass
-        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.head_mode, self.value_std_coef, task, float(self.lambda_latent), self.use_ema_value)
+        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.head_mode, self.value_std_coef, task, float(self.lambda_latent), self.use_ema_value, self.discount)
 
         # Store 0-dim tensors
         self.value_chosen_post_noise = vals_scaled.squeeze(0)

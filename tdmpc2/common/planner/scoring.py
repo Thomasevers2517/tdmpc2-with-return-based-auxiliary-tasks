@@ -11,21 +11,22 @@ def compute_values(
     value_std_coef: float = 0.0,
     reward_head_mode: str = "all",
     use_ema_value: bool = False,
+    discount: float = 0.99,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
     without needing to sample or provide an action.
     
-    Value = sum(rewards over T steps) + V(z_last)
+    Value = sum(rewards over T steps) + γ^T * V(z_last)
     
-    We compute values for ALL (R × H × Ve) combinations, then reduce via:
-      reduced_value = mean + value_std_coef × std
-    
-    This provides gradients through the std term, allowing the planner to
-    be uncertainty-aware with value_std_coef > 0 (optimistic) or < 0 (pessimistic).
-    
-    Value disagreement is computed as std across all (R × H × Ve) combinations.
+    CORRECT OPTIMISM: For each dynamics head h, compute:
+      σ_h = sum_t(γ^(t-1) * σ^r_{h,t}) + γ^T * σ^v_h
+      Q_h = μ_h + value_std_coef × σ_h
+    Then reduce over dynamics heads:
+      value_std_coef > 0: max over H (optimistic)
+      value_std_coef < 0: min over H (pessimistic)
+      value_std_coef = 0: mean over H (neutral)
 
     Args:
         latents_all (Tensor[H, E, T+1, L]): Latent rollouts for all dynamics heads.
@@ -33,7 +34,7 @@ def compute_values(
         world_model: WorldModel exposing reward() and V().
         task: Optional task index for multitask setups.
         value_std_coef: Coefficient for mean + coef × std reduction.
-            +1.0 = optimistic (mean + std), -1.0 = pessimistic (mean - std), 0.0 = mean only.
+            >0 = optimistic (max over dynamics), <0 = pessimistic (min over dynamics), 0 = neutral (mean).
         reward_head_mode: 'single' uses only head 0, 'all' uses all reward heads.
             During eval, use 'single' to match single dynamics head for fair comparison.
         use_ema_value: If True, use EMA target network for V; otherwise use online network.
@@ -41,12 +42,20 @@ def compute_values(
     Returns:
         Tuple[Tensor[E], Tensor[E], Tensor[E], Tensor[E]]: 
             (values_unscaled, values_scaled, values_std, value_disagreement).
-            values_std and value_disagreement are both std across all (R × H × Ve) combinations.
+            values_std is the aggregated std per candidate after dynamics reduction.
     """
     H, E, Tp1, L = latents_all.shape  # H=dynamics heads, E=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
     cfg = world_model.cfg
     Ve = cfg.num_q  # number of V ensemble heads
+
+    # Precompute discount powers: γ^0, γ^1, ..., γ^(T-1) for rewards, γ^T for bootstrap
+    # discount_powers[t] = γ^t for t in [0, T-1]
+    device = latents_all.device
+    dtype = latents_all.dtype
+    discount_powers = torch.pow(torch.tensor(discount, device=device, dtype=dtype), 
+                                 torch.arange(T, device=device, dtype=dtype))  # float32[T]
+    discount_T = discount ** T  # γ^T for bootstrap value
 
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :-1, :]                         # float32[H, E, T, L]
@@ -66,41 +75,58 @@ def compute_values(
     r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*E, T]
     r_all = r_all.view(R, H, E, T)  # float32[R, H, E, T]
     
-    # Sum rewards over T per (R, H) combination: [R, H, E]
-    returns_rhe = r_all.sum(dim=3)  # float32[R, H, E]
+    # Per dynamics head h, compute reward mean and std across R reward heads at each timestep
+    # r_all: [R, H, E, T]
+    r_mean_per_h = r_all.mean(dim=0)  # float32[H, E, T] - mean over R
+    r_std_per_h = r_all.std(dim=0, unbiased=True)  # float32[H, E, T] - std over R
 
     # Get V values for ALL Ve ensemble heads at terminal state
     z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
     z_last_flat = z_last.contiguous().view(H * E, L)        # float32[H*E, L]
     
     # Get V logits for ALL ensemble heads: [Ve, H*E, K] -> [Ve, H*E] -> [Ve, H, E]
-    # use_ema_value=True uses target network (slower-moving, more stable)
-    # use_ema_value=False uses online network (current estimates)
     v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)  # float32[Ve, H*E, K]
     v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*E]
     v_all = v_all.view(Ve, H, E)  # float32[Ve, H, E]
     
-    # Compute total value for ALL (R × H × Ve) combinations
-    # returns_rhe: [R, H, E] -> [1, R, H, E] for broadcasting
-    # v_all: [Ve, H, E] -> [Ve, 1, H, E] for broadcasting
-    returns_exp = returns_rhe.unsqueeze(0)  # float32[1, R, H, E]
-    v_exp = v_all.unsqueeze(1)  # float32[Ve, 1, H, E]
+    # Per dynamics head h, compute value mean and std across Ve value heads
+    # v_all: [Ve, H, E]
+    v_mean_per_h = v_all.mean(dim=0)  # float32[H, E] - mean over Ve
+    v_std_per_h = v_all.std(dim=0, unbiased=True)  # float32[H, E] - std over Ve
     
-    # Total value = reward returns + bootstrap V for each (Ve, R, H) combination
-    values_all = returns_exp + v_exp  # float32[Ve, R, H, E] via broadcasting
+    # Compute discounted return mean per dynamics head
+    # μ_h = sum_t(γ^(t-1) * r_mean_{h,t}) + γ^T * v_mean_h
+    # discount_powers: [T], r_mean_per_h: [H, E, T]
+    returns_mean_per_h = (r_mean_per_h * discount_powers).sum(dim=2)  # float32[H, E]
+    total_mean_per_h = returns_mean_per_h + discount_T * v_mean_per_h  # float32[H, E]
     
-    # Flatten (Ve × R × H) and compute mean + std_coef × std reduction
-    values_flat = values_all.view(Ve * R * H, E)  # float32[Ve*R*H, E]
+    # Compute aggregated std per dynamics head (sum of discounted stds)
+    # σ_h = sum_t(γ^(t-1) * σ^r_{h,t}) + γ^T * σ^v_h
+    # discount_powers: [T], r_std_per_h: [H, E, T]
+    reward_std_sum_per_h = (r_std_per_h * discount_powers).sum(dim=2)  # float32[H, E]
+    total_std_per_h = reward_std_sum_per_h + discount_T * v_std_per_h  # float32[H, E]
     
-    values_mean = values_flat.mean(dim=0)  # float32[E]
-    values_std = values_flat.std(dim=0, unbiased=False)  # float32[E]
+    # Compute Q_h = μ_h + value_std_coef × σ_h per dynamics head
+    q_per_h = total_mean_per_h + value_std_coef * total_std_per_h  # float32[H, E]
     
-    # Reduce: mean + value_std_coef × std
-    values_unscaled = values_mean + value_std_coef * values_std  # float32[E]
+    # Reduce over dynamics heads based on sign of value_std_coef
+    if value_std_coef > 0:
+        # Optimistic: max over dynamics heads
+        values_unscaled, _ = q_per_h.max(dim=0)  # float32[E]
+    elif value_std_coef < 0:
+        # Pessimistic: min over dynamics heads
+        values_unscaled, _ = q_per_h.min(dim=0)  # float32[E]
+    else:
+        # Neutral: mean over dynamics heads
+        values_unscaled = q_per_h.mean(dim=0)  # float32[E]
+    
     values_scaled = values_unscaled  # Same for now (scaling handled elsewhere)
     
-    # Value disagreement = std across all (Ve × R × H) combinations
-    value_disagreement = values_std  # Same as values_std now
+    # Value disagreement: std of Q_h across dynamics heads (after std_coef adjustment)
+    value_disagreement = q_per_h.std(dim=0, unbiased=True)  # float32[E]
+    
+    # Return the aggregated std (mean over dynamics heads) for logging
+    values_std = total_std_per_h.mean(dim=0)  # float32[E]
 
     return values_unscaled, values_scaled, values_std, value_disagreement
 
