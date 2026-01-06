@@ -41,7 +41,7 @@ class Planner(torch.nn.Module):
         return shifted
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
+    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None, value_std_coef_override: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
         """Plan an action sequence and return the first action.
 
         Args:
@@ -49,6 +49,8 @@ class Planner(torch.nn.Module):
             task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection, eval temperature.
             step: Global step for detailed logging frequency gating.
+            value_std_coef_override: If provided, overrides the default value_std_coef for this call.
+                Use 0.0 for mean-only reduction (e.g., eval_mean_head_reduce mode).
 
         Returns:
             (Tensor[A], PlannerBasicInfo | PlannerAdvancedInfo, Tensor[T,A], Tensor[T,A])
@@ -66,21 +68,27 @@ class Planner(torch.nn.Module):
         temp = float(self.cfg.temperature)
 
         lambda_latent = 0.0 if eval_mode else float(self.cfg.planner_lambda_disagreement)
-        lambda_value = 0.0 if eval_mode else float(self.cfg.planner_lambda_value_disagreement)
-        # Std bounds: prefer std_min/std_max; fallback to legacy min_std/max_std
 
-        # Head mode and reduction depend on eval vs train
-        # Train: always use all heads with planner_head_reduce
+        # Head mode and value_std_coef depend on eval vs train
+        # Train: always use all heads with planner_value_std_coef_train (optimistic by default: +1.0)
         # Eval: use all heads or single head based on planner_use_all_heads_eval
+        #       value_std_coef from planner_value_std_coef_eval (pessimistic by default: -1.0)
         if eval_mode:
             use_all_heads_eval = bool(self.cfg.planner_use_all_heads_eval)
             head_mode = 'all' if use_all_heads_eval else 'single'
-            head_reduce = self.cfg.planner_head_reduce_eval if use_all_heads_eval else 'mean'
+            value_std_coef = float(self.cfg.planner_value_std_coef_eval) if use_all_heads_eval else 0.0
             reward_head_mode = head_mode  # Match dynamics head mode
         else:
             head_mode = 'all'
-            head_reduce = self.cfg.planner_head_reduce
+            value_std_coef = float(self.cfg.planner_value_std_coef_train)
             reward_head_mode = 'all'
+        
+        # Allow caller to override value_std_coef (e.g., for mean-only eval mode)
+        if value_std_coef_override is not None:
+            value_std_coef = value_std_coef_override
+
+        # Whether to use EMA (target) network for V in planning
+        use_ema_value = bool(self.cfg.ema_value_planning)
 
         policy_elites_first_iter_only = bool(self.cfg.planner_policy_elites_first_iter_only)
 
@@ -110,16 +118,16 @@ class Planner(torch.nn.Module):
                 actions_p,
                 self.world_model,
                 task,
-                head_reduce=head_reduce,
+                value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
+                use_ema_value=use_ema_value,
             )
             latent_dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
                 final_policy = latents_p[:, :, -1, :]
                 latent_dis_p = compute_disagreement(final_policy)
-            scores_p = combine_scores(vals_scaled_p, latent_dis_p, val_dis_p, lambda_latent, lambda_value)
+            scores_p = combine_scores(vals_scaled_p, latent_dis_p, lambda_latent)
             weighted_latent_dis_p = (lambda_latent * latent_dis_p) if latent_dis_p is not None else None
-            weighted_val_dis_p = (lambda_value * val_dis_p) if val_dis_p is not None else None
             policy_cache = dict(
                 latents=latents_p,
                 actions=actions_p,
@@ -129,7 +137,6 @@ class Planner(torch.nn.Module):
                 latent_disagreement=latent_dis_p,
                 value_disagreement=val_dis_p,
                 weighted_latent_dis=weighted_latent_dis_p,
-                weighted_val_dis=weighted_val_dis_p,
                 scores=scores_p,
             )
 
@@ -163,17 +170,17 @@ class Planner(torch.nn.Module):
                 actions_s,
                 self.world_model,
                 task,
-                head_reduce=head_reduce,
+                value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
+                use_ema_value=use_ema_value,
             )
             latent_dis_s = None
             if not eval_mode and latents_s.shape[0] > 1:
                 # Multiple dynamics heads are present; measure disagreement at final latent state.
                 final_s = latents_s[:, :, -1, :]
                 latent_dis_s = compute_disagreement(final_s)
-            scores_s = combine_scores(vals_scaled_s, latent_dis_s, val_dis_s, lambda_latent, lambda_value)
+            scores_s = combine_scores(vals_scaled_s, latent_dis_s, lambda_latent)
             weighted_latent_dis_s = (lambda_latent * latent_dis_s) if latent_dis_s is not None else None
-            weighted_val_dis_s = (lambda_value * val_dis_s) if val_dis_s is not None else None
 
             include_policy = (
                 (policy_cache is not None) and
@@ -199,19 +206,13 @@ class Planner(torch.nn.Module):
                     val_dis = policy_cache['value_disagreement']
                 else:
                     val_dis = val_dis_s
-                # Weighted disagreement concatenation
+                # Weighted latent disagreement concatenation
                 if policy_cache['weighted_latent_dis'] is not None and weighted_latent_dis_s is not None:
                     weighted_latent_dis_all = torch.cat([policy_cache['weighted_latent_dis'], weighted_latent_dis_s], dim=0)
                 elif policy_cache['weighted_latent_dis'] is not None:
                     weighted_latent_dis_all = policy_cache['weighted_latent_dis']
                 else:
                     weighted_latent_dis_all = weighted_latent_dis_s
-                if policy_cache['weighted_val_dis'] is not None and weighted_val_dis_s is not None:
-                    weighted_val_dis_all = torch.cat([policy_cache['weighted_val_dis'], weighted_val_dis_s], dim=0)
-                elif policy_cache['weighted_val_dis'] is not None:
-                    weighted_val_dis_all = policy_cache['weighted_val_dis']
-                else:
-                    weighted_val_dis_all = weighted_val_dis_s
                 scores = torch.cat([policy_cache['scores'], scores_s], dim=0)
             else:
                 latents_cat = latents_s
@@ -221,7 +222,6 @@ class Planner(torch.nn.Module):
                 latent_dis = latent_dis_s
                 val_dis = val_dis_s
                 weighted_latent_dis_all = weighted_latent_dis_s
-                weighted_val_dis_all = weighted_val_dis_s
                 scores = scores_s
 
             elite_scores, elite_indices = torch.topk(scores, K, largest=True, sorted=True)
@@ -309,7 +309,6 @@ class Planner(torch.nn.Module):
             value_disagreement_chosen=value_disagreement_chosen,
             score_chosen=scores.index_select(0, chosen_idx).squeeze(0),
             weighted_latent_disagreement_chosen=(weighted_latent_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_latent_dis_all is not None else None,
-            weighted_value_disagreement_chosen=(weighted_val_dis_all.index_select(0, chosen_idx).squeeze(0)) if weighted_val_dis_all is not None else None,
             value_elite_mean=value_elite_mean,
             value_elite_std=value_elite_std,
             value_elite_max=value_elite_max,
@@ -324,7 +323,6 @@ class Planner(torch.nn.Module):
             scores_all=scores,
             values_scaled_all=vals_scaled,
             weighted_latent_disagreements_all=weighted_latent_dis_all,
-            weighted_value_disagreements_all=weighted_val_dis_all,
         )
 
 
@@ -357,10 +355,10 @@ class Planner(torch.nn.Module):
                 z0=z0.detach() if z0.dim() == 1 else z0.squeeze(0).detach(),
                 task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
-                lambda_value=float(self.cfg.planner_lambda_value_disagreement) if not eval_mode else 0.0,
                 head_mode=head_mode,
-                head_reduce=head_reduce,
+                value_std_coef=value_std_coef,
                 T=T,
+                use_ema_value=use_ema_value,
             )
             # Compute post-noise effects once (no-grad), available for logger + wandb
             with torch.no_grad():

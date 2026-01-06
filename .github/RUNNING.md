@@ -6,7 +6,7 @@ Environment setup (Conda)
 
 ```bash
 # If the environment already exists
-conda activate tdmpc2
+conda activate tdmpc2-new
 
 # If you need to create it (one-time)
 conda env create -f docker/environment.yaml -n tdmpc2
@@ -45,7 +45,7 @@ CUDA_VISIBLE_DEVICES=1 python tdmpc2/train.py \
 ### 1. Create the W&B Sweep
 
 ```bash
-conda activate tdmpc2
+conda activate tdmpc2-new
 python utils/create_sweep.py sweep_list/test/YOUR_SWEEP_NAME --wandb-project tdmpc2-tdmpc2
 ```
 

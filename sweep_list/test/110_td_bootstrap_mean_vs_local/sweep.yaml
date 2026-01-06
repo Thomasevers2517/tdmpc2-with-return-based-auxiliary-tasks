@@ -1,0 +1,116 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 110: TD Target Dynamics Reduction - Mean vs Single
+  # 
+  # Compare td_target_dynamics_reduction: mean vs single
+  # with td_target_value_reduction: mean (fixed)
+  #
+  # - mean: average over all dynamics heads
+  # - single: use single random dynamics head (cheaper)
+  #
+  # Total: 3 tasks × 2 dynamics × 8 seeds = 48 runs
+  #############################################
+
+  task:
+    values:
+      - hopper-hop
+      - quadruped-walk
+      - acrobot-swingup
+
+  # TD target value reduction: mean (fixed)
+  td_target_value_reduction:
+    value: mean
+
+  # Dynamics reduction: mean vs single
+  td_target_dynamics_reduction:
+    values:
+      - mean
+      - single
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
+
+  # Architecture (current defaults)
+  num_q:
+    value: 8
+  num_enc_layers:
+    value: 3
+
+  # Fixed config
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  compile:
+    value: true
+  dual_policy_enabled:
+    value: true
+  eval_mean_head_reduce:
+    value: true
+
+  # Entropy (current defaults)
+  entropy_action_dim_power:
+    value: 1.0
+  start_entropy_coeff:
+    value: 3e-5
+  end_entropy_coeff:
+    value: 1e-6
+  start_dynamic_entropy_ratio:
+    value: 0.5
+
+  # Policy - use all heads for pessimism
+  policy_lambda_value_disagreement:
+    value: 0
+  optimistic_policy_lambda_value_disagreement:
+    value: 0.0
+  policy_head_reduce:
+    value: min
+
+  # Planner
+  planner_num_dynamics_heads:
+    value: 4
+  planner_head_reduce:
+    value: max
+  planner_use_all_heads_eval:
+    value: true
+
+  # Dynamics prior
+  dynamics_prior_enabled:
+    value: true
+  dynamics_prior_scale:
+    value: 1.0
+
+  # Other (current defaults)
+  tau:
+    value: 0.003
+  temperature:
+    value: 0.5
+  hot_buffer_enabled:
+    value: false
+  value_update_freq:
+    value: 2
+
+  # Multi-gamma
+  multi_gamma_loss_weight:
+    value: 0.01
+  multi_gamma_gammas:
+    value: [0.9, 0.95]
+  auxiliary_value_ema:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

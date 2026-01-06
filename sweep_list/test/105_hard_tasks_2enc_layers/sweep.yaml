@@ -1,0 +1,73 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Sweep 105: Hard Tasks with 2 Encoder Layers
+  # 
+  # Goal: Verify current config on harder tasks (dog-run, 
+  #       humanoid-walk) with 2 encoder layers and test
+  #       planner action noise for exploration.
+  #
+  # Tasks: dog-run, humanoid-walk
+  # Seeds: 2 per config
+  # Steps: 500k
+  # Total: 2 tasks × 2 noise × 2 seeds = 8 runs
+  #############################################
+
+  task:
+    values:
+      - dog-run
+      - humanoid-walk
+
+  seed:
+    values: [1, 2]
+
+  #############################################
+  # KEY CONFIG: 2 encoder layers + action noise sweep
+  #############################################
+
+  num_enc_layers:
+    value: 2
+
+  planner_action_noise_std:
+    values: [0, 0.1]
+
+  # Larger reward head (original TD-MPC2 style)
+  reward_dim_div:
+    value: 1
+
+  num_reward_layers:
+    value: 2
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 500000
+  eval_freq:
+    value: 25000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

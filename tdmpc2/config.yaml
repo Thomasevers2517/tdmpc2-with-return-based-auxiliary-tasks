@@ -11,6 +11,7 @@ episodic: false
 checkpoint: ???
 eval_episodes: 5
 eval_freq: 10000
+eval_mean_head_reduce: true  # If true, also run evaluation with mean head reduction (in addition to default min)
 
 
 critic_type: V  # 'V' (state value) only. 'Q' is not implemented.
@@ -35,24 +36,59 @@ n_mc_samples_target: 1
 
 
 # Number of reward ensemble heads for pessimistic reward estimation.
-# When > 1, rewards are predicted by multiple heads and reduced via planner_head_reduce (planning)
-# or policy_head_reduce (policy loss). TD targets always use min over reward heads (pessimistic).
-num_reward_heads: 1
+num_reward_heads: 2
 
-# Aggregation over reward and dynamics heads when computing trajectory values for planning.
-# Options: 'mean' or 'max'. Applied to both reward heads (R) and dynamics heads (H).
-planner_head_reduce: max
+# ---------------------------------------------------------------------------
+# Head reduction via mean + coef × std
+# ---------------------------------------------------------------------------
+# All head reductions (reward, dynamics, value) use the formula:
+#   reduced_value = mean + std_coef × std
+# where mean and std are computed across ALL head combinations.
+#
+# std_coef interpretation:
+#   -1.0 = pessimistic (mean - 1 std)
+#    0.0 = neutral (mean only)
+#   +1.0 = optimistic (mean + 1 std)
+# ---------------------------------------------------------------------------
+
+# Global magnitude override for action-selection std_coef parameters.
+# When set (not null), policy and planner std_coef values are replaced with:
+#   sign(original_value) × value_std_coef_override
+# This allows sweeping a single value to control pessimism/optimism uniformly.
+# Original signs are preserved; zero values remain zero.
+# NOTE: Does NOT affect td_target_std_coef (learning target is separate concern).
+# Set to null to use individual std_coef values as-is.
+value_std_coef_override: null
+
+# TD target: coefficient for std across all (R × H × Ve) head combinations
+# Negative = pessimistic TD targets (default: -1.0)
+td_target_std_coef: -1.0
+
+# Local vs global TD bootstrapping:
+# - false (global): reduce across ALL heads (Ve × R × H), all value heads get same target
+# - true (local): reduce across (R × H) only, each value head bootstraps itself
+local_td_bootstrap: false
+
+# Whether to use all dynamics heads or single random head for TD target imagination
+# When false, uses single random head (cheaper but H-std is 0)
+td_target_use_all_dynamics_heads: true
+
+# Policy value std coefficients for pessimistic/optimistic policy optimization
+# Pessimistic policy: typically -1.0 (avoid uncertainty)
+# Optimistic policy: typically +1.0 (seek uncertainty for exploration)
+policy_value_std_coef: -1.0
+optimistic_policy_value_std_coef: 1.0
+
+# Planner value std coefficients (separate for train vs eval)
+# Train: optimistic (+1.0) to encourage exploration
+# Eval: pessimistic (-1.0) for robust action selection
+planner_value_std_coef_train: 1.0
+planner_value_std_coef_eval: -1.0
 
 # Evaluation-specific planner head configuration.
-# If true, eval uses all dynamics heads and reduces via planner_head_reduce_eval.
+# If true, eval uses all dynamics heads.
 # If false, eval uses only head 0 (single head, no reduction needed).
 planner_use_all_heads_eval: true
-planner_head_reduce_eval: min  # Reduction over heads during eval: 'min' | 'max' | 'mean'
-
-# Aggregation over reward and dynamics heads when computing policy loss.
-# Options: 'mean', 'min', or 'max'. This does NOT create multiple policy heads—
-# it controls how reward/dynamics head predictions are reduced before policy optimization.
-policy_head_reduce: min
 
 # Std of Gaussian noise added to policy actions when seeding the planner.
 # Applied only when use_policy=True in world_model.rollout_latents.
@@ -66,11 +102,6 @@ planner_action_noise_std: 0.0
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0
 
-# Weight for value disagreement term (training only). Set 0.0 to disable.
-# Value disagreement is std of V estimates across all (dynamics heads × V heads).
-# Most meaningful when planner_num_dynamics_heads > 1 and/or num_q > 1.
-planner_lambda_value_disagreement: 0
-
 # When true, policy-seeded trajectories are only eligible for elites during
 # the first MPPI iteration; subsequent iterations rely solely on sampled rollouts.
 planner_policy_elites_first_iter_only: false
@@ -82,9 +113,11 @@ planner_num_dynamics_heads: 4
 
 # Frozen random prior network for dynamics heads to encourage ensemble diversity.
 # The prior is added BEFORE SimNorm so the main network can learn to compensate.
-dynamics_prior_enabled: false      # If true, add frozen prior to each dynamics head
+dynamics_prior_enabled: true      # If true, add frozen prior to each dynamics head
 dynamics_prior_hidden_dim: 32      # Hidden dimension for prior MLP (small for efficiency)
 dynamics_prior_scale: 1.0          # Scale factor for prior output (prior uses Tanh, so in [-1, 1])
+dynamics_dropout: 0.0              # Dropout rate for dynamics head (applied to first hidden layer)
+dynamics_num_layers: 2             # Number of hidden layers in dynamics head MLP
 
 train_act_std_coeff: 0 # multiplier of the noise added to training env actions
 
@@ -96,19 +129,22 @@ buffer_update_interval: 1  # number of env steps between buffer additions when n
 # per_priority: recency # recency | consistency
 
 utd_ratio: 4  # World model updates per environment step
-value_update_freq: -1  # Value updates per env step. -1 means same as utd_ratio.
+value_update_freq: 2  # Value updates per env step. -1 means same as utd_ratio.
 pi_update_freq: 1  # Policy updates per env step.
 
 num_rollouts: 4 # number of parallel rollouts to do in imagination for each starting state
 pred_from: rollout # rollout | true_state (controls reward/termination prediction source)
+
+# actor-critic source settings (ONLY IMAGINE SUPPORTED CURRENTLY)
 ac_source: imagine # replay_rollout | imagine (controls critic/policy source)
 aux_value_source: imagine # replay_true | replay_rollout | imagine
+
 imagination_horizon: 1 
 detach_imagine_value: false # if true, detach imagined latents when using them for actor/critic updates
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
 actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
-ema_value_planning: false # if true, use ema critic for mpc planning
+ema_value_planning: true # If true, use EMA target network for V in planner scoring; if false, use online network
 
 steps: 100_000
 batch_size: 256
@@ -119,6 +155,7 @@ consistency_coef: 20
 policy_coef: 1
 
 encoder_consistency_coef: 1  # small loss to backprop consistency through the encoder, dreamer style. main loss is 20
+encoder_consistency_warmup_ratio: 0.0  # Fraction of training to disable encoder consistency (0.1 = first 10%)
 
 imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts, only used if ac_source or aux_value_source is imagine
 
@@ -129,23 +166,23 @@ enc_lr_scale: 0.3
 # At (1 - enc_lr_step_ratio) * steps, encoder LR is multiplied by enc_lr_step_scale
 # Set enc_lr_step_scale=0.0 to freeze encoder (similar to old detaching behavior)
 # Set enc_lr_step_scale=0.1 for 10× reduction instead of full freeze
+# IMPORTANT: enc_lr_step_ratio controls WHEN the step happens:
+#   0.0 = step at end (never freeze during training)
+#   0.5 = step at halfway (default)
+#   1.0 = step at start (freeze immediately)
 enc_lr_step_ratio: 0.5          # Fraction of training after which to step-change LR (0.5 = halfway)
 enc_lr_step_scale: 0.0          # Multiplier for encoder LR after step (0.0 = freeze)
 pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize training.
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
 tau: 0.003
-policy_ema_enabled: false
-policy_ema_tau: 0.05
-encoder_ema_enabled: false #adds significant memory and compute overhead for encoding intensive observations like RGB
-encoder_ema_tau: 0.05
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 1000_000
 
 # Hot buffer (recent transitions) for mixed sampling
-hot_buffer_enabled: true         # When true, also store recent transitions in a small buffer
+hot_buffer_enabled: false         # When true, also store recent transitions in a small buffer
 hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
 hot_buffer_size: 5               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
@@ -159,26 +196,34 @@ data_dir: ???
 # planning
 eval_mpc: true
 train_mpc: true
-iterations: 6
+iterations: 9
 num_samples: 1024
 num_elites: 64
 num_pi_trajs: 512
 horizon: 3
 min_std: 0
 max_std: 1
-temperature: 0.1
+temperature: 0.5
 
 # actor
 log_std_min: -10
 log_std_max: 2
 end_entropy_coeff: 1e-6
-start_entropy_coeff: 1e-4
+start_entropy_coeff: 3e-5
 # Entropy scaling by action dimension.
 # scaled_entropy = entropy * (action_dim ** entropy_action_dim_power)
 # power=0: no extra scaling (entropy ~ D from Gaussian sum)
 # power=1: multiply by D (entropy ~ D², original TD-MPC2 intent)
 # power=0.5: compromise (entropy ~ D^1.5)
 entropy_action_dim_power: 1.0
+# Jacobian correction scale: controls how much tanh Jacobian affects entropy calculation.
+# The Jacobian correction accounts for the change of variables when squashing actions via tanh.
+# 1.0 = mathematically correct (full penalty for confidence near ±1)
+# 0.5 = half penalty (more lenient on action saturation)
+# 0.0 = no Jacobian penalty (legacy TD-MPC2 behavior - ignores tanh compression)
+# Setting to 0.0 reproduces the old buggy behavior which may help tasks requiring
+# extreme/saturated actions (e.g., dog-run) by not penalizing confidence near boundaries.
+jacobian_correction_scale: 1.0
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 0.5
 dynamic_entropy_schedule : exponential  # linear | exponential
@@ -190,13 +235,11 @@ hinge_coef: 0
 # dual policy (optimistic + pessimistic)
 dual_policy_enabled: true        # If true, create pessimistic + optimistic policies
 optimistic_entropy_mult: 1.0      # Multiply entropy coeff by this for optimistic policy
-optimistic_head_reduce: max       # Reduction for optimistic policy: 'max' or 'mean'
 
-# Value disagreement penalty for policy optimization
-# Penalizes (positive λ) or rewards (negative λ) actions where dynamics heads disagree on V(z')
-# Scaled by self.scale.value for unit consistency with Q estimates
-policy_lambda_value_disagreement: 1           # Penalty for pessimistic policy (positive = avoid uncertainty)
-optimistic_policy_lambda_value_disagreement: 0.0  # For optimistic policy (negative = seek uncertainty)
+# Policy multi-rollout for variance reduction
+# If true, expand each state by num_rollouts and sample multiple actions per state,
+# averaging the loss over rollouts for lower variance policy gradients.
+pi_multi_rollout: false
 
 # critic
 num_bins: 101
@@ -205,18 +248,22 @@ vmax: +10
 
 # architecture
 model_size: ???
-num_enc_layers: 2
+num_enc_layers: 3 # 3 seemed good on easy, but breaks dog if reward head size is not reduced.
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
-num_q: 2
+num_q: 8
 dropout: 0.01
+encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (train + eval mode for stable targets)
+reward_dropout_enabled: false  # Whether to apply dropout to reward heads (uses same dropout rate as value heads)
 simnorm_dim: 8
 
-reward_dim_div: 1 # reward MLP dimension is mlp_dim divided by this value
+reward_dim_div: 32 # reward MLP dimension is mlp_dim divided by this value
+num_reward_layers: 1 # number of hidden layers in reward MLP (1 or 2)
 value_dim_div: 1 # value (V) MLP dimension is mlp_dim divided by this value
+num_value_layers: 2 # number of hidden layers in value (V) MLP
 # logging
 wandb_project: test_auxiliary
 wandb_entity: thomasevers9
@@ -254,7 +301,7 @@ nvtx_profiler: false           # If true: add lightweight NVTX record_function r
 multi_gamma_gammas: [0.9, 0.95]              # Auxiliary discounts ONLY (do not include primary). Empty => feature disabled.
 joint_aux_dim_mult: 1                                     # Non-empty length ≤ 6. Primary discount auto-prepended internally.
 multi_gamma_head: separate          # Head architecture: 'separate' (one Linear per aux γ). Note: 'joint' is deprecated.
-multi_gamma_loss_weight: 0.01        # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
+multi_gamma_loss_weight: 0       # Scalar weight applied to MEAN auxiliary loss (after averaging over aux gammas & time).
 multi_gamma_debug_logging: true    # If True: emit richer per-gamma diagnostics (heavier overhead).
 multi_gamma_log_num_examples: 4    # Max examples included in debug snapshots (targets vs preds) when debug logging.
 auxiliary_value_ema: true

@@ -5,7 +5,7 @@ from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
-def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, head_reduce: str, task, lambda_latent: float, lambda_value: float):
+def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False):
     """Core kernel to roll out a single noisy sequence and score it.
 
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
@@ -25,14 +25,15 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         noisy_seq.unsqueeze(0),
         world_model,
         task,
-        head_reduce=head_reduce,
+        value_std_coef=value_std_coef,
+        use_ema_value=use_ema_value,
     )
     latent_dis = None
     if lat_all.shape[0] > 1:
         final_all = lat_all[:, 0, -1, :]  # [H,L]
         # Compute disagreement with E=1; returns shape [1]
         latent_dis = compute_disagreement(final_all.unsqueeze(1))
-    score = combine_scores(vals_scaled, latent_dis, val_dis, lambda_latent, lambda_value)
+    score = combine_scores(vals_scaled, latent_dis, lambda_latent)
     return vals_scaled, latent_dis, val_dis, score
 
 
@@ -46,7 +47,6 @@ class PlannerBasicInfo:
         value_disagreement_chosen: Value disagreement (std across H×Q heads) of chosen (None if not computed).
         score_chosen: Combined score of the chosen sequence.
         weighted_latent_disagreement_chosen: Weighted latent disagreement (lambda * dis) of chosen.
-        weighted_value_disagreement_chosen: Weighted value disagreement (lambda * dis) of chosen.
         value_elite_mean: Mean value over elite set.
         value_elite_std: Std of value over elite set.
         value_elite_max: Max value over elite set.
@@ -61,14 +61,12 @@ class PlannerBasicInfo:
         scores_all: Combined scores for all candidates; Tensor[E].
         values_scaled_all: Scaled values for all candidates; Tensor[E].
         weighted_latent_disagreements_all: Weighted latent disagreements for all candidates; Tensor[E].
-        weighted_value_disagreements_all: Weighted value disagreements for all candidates; Tensor[E].
     """
     value_chosen: torch.Tensor  # 0-dim tensor
     latent_disagreement_chosen: Optional[torch.Tensor]
     value_disagreement_chosen: Optional[torch.Tensor]
     score_chosen: torch.Tensor  # 0-dim tensor
     weighted_latent_disagreement_chosen: Optional[torch.Tensor]
-    weighted_value_disagreement_chosen: Optional[torch.Tensor]
     value_elite_mean: torch.Tensor
     value_elite_std: torch.Tensor
     value_elite_max: torch.Tensor
@@ -83,7 +81,6 @@ class PlannerBasicInfo:
     scores_all: torch.Tensor  # (E,)
     values_scaled_all: torch.Tensor  # (E,)
     weighted_latent_disagreements_all: Optional[torch.Tensor]  # (E,)
-    weighted_value_disagreements_all: Optional[torch.Tensor]  # (E,)
 
 
 @dataclass
@@ -118,10 +115,10 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     z0: torch.Tensor  # (L,)
     task: Optional[torch.Tensor]
     lambda_latent: float
-    lambda_value: float
     head_mode: str
-    head_reduce: str
+    value_std_coef: float
     T: int
+    use_ema_value: bool = False  # Whether to use EMA target network for V in planning
 
     # Outputs of post-noise analysis (set by compute_post_noise_effects)
     value_chosen_post_noise: Optional[torch.Tensor] = None
@@ -159,7 +156,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
                 impl = torch.compile(_post_noise_effects_impl, mode=getattr(cfg, 'compile_type', 'reduce-overhead'), fullgraph=False)
         except Exception:
             pass
-        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.head_mode, self.head_reduce, task, float(self.lambda_latent), float(self.lambda_value))
+        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.head_mode, self.value_std_coef, task, float(self.lambda_latent), self.use_ema_value)
 
         # Store 0-dim tensors
         self.value_chosen_post_noise = vals_scaled.squeeze(0)
@@ -204,29 +201,26 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
                 lat_dis = float(latent_dis_i[idx].item()) if has_latent_dis else 0.0
                 v_dis = float(val_dis_i[idx].item()) if has_val_dis else 0.0
                 wd_lat = float(self.lambda_latent * lat_dis) if has_latent_dis else 0.0
-                wd_val = float(self.lambda_value * v_dis) if has_val_dis else 0.0
                 sc = float(scores_i[idx].item())
                 act = self.actions_all[i, idx]  # (T,A)
                 # Slice first num_action dims
                 sl = act[:, :min(num_action, A)]  # (T,num_action)
                 act_str = "; ".join([f"t{t}:[{_fmt_vec(sl[t])}]" for t in range(T)])
-                lines.append(f"  {tag:<6} idx={idx:>4} | val={val:+.3f} lat_dis={lat_dis:+.3f} val_dis={v_dis:+.3f} wd_lat={wd_lat:+.3f} wd_val={wd_val:+.3f} sc={sc:+.3f} | actions {act_str}")
+                lines.append(f"  {tag:<6} idx={idx:>4} | val={val:+.3f} lat_dis={lat_dis:+.3f} val_dis={v_dis:+.3f} wd_lat={wd_lat:+.3f} sc={sc:+.3f} | actions {act_str}")
 
         # Final chosen (pre-noise) and post-noise summary
         val_pre = float(self.value_chosen.item())
         lat_dis_pre = float(self.latent_disagreement_chosen.item()) if self.latent_disagreement_chosen is not None else 0.0
         val_dis_pre = float(self.value_disagreement_chosen.item()) if self.value_disagreement_chosen is not None else 0.0
         wd_lat_pre = float(self.weighted_latent_disagreement_chosen.item()) if self.weighted_latent_disagreement_chosen is not None else (self.lambda_latent * lat_dis_pre)
-        wd_val_pre = float(self.weighted_value_disagreement_chosen.item()) if self.weighted_value_disagreement_chosen is not None else (self.lambda_value * val_dis_pre)
         sc_pre = float(self.score_chosen.item())
         lines.append("Chosen (pre-noise): "
-                     f"val={val_pre:+.3f} lat_dis={lat_dis_pre:+.3f} val_dis={val_dis_pre:+.3f} wd_lat={wd_lat_pre:+.3f} wd_val={wd_val_pre:+.3f} sc={sc_pre:+.3f}")
+                     f"val={val_pre:+.3f} lat_dis={lat_dis_pre:+.3f} val_dis={val_dis_pre:+.3f} wd_lat={wd_lat_pre:+.3f} sc={sc_pre:+.3f}")
         if self.value_chosen_post_noise is not None:
             val_post = float(self.value_chosen_post_noise.item())
             lat_dis_post = float(self.latent_disagreement_chosen_post_noise.item()) if self.latent_disagreement_chosen_post_noise is not None else 0.0
             val_dis_post = float(self.value_disagreement_chosen_post_noise.item()) if self.value_disagreement_chosen_post_noise is not None else 0.0
             wd_lat_post = float(self.lambda_latent * lat_dis_post)
-            wd_val_post = float(self.lambda_value * val_dis_post)
             sc_post = float(self.score_chosen_post_noise.item())
             # Noise stats
             nz = self.action_noise
@@ -236,6 +230,6 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
             std_mean = float(std0.mean().item())
             std_max = float(std0.max().item())
             lines.append("Chosen (post-noise): "
-                         f"val={val_post:+.3f} lat_dis={lat_dis_post:+.3f} val_dis={val_dis_post:+.3f} wd_lat={wd_lat_post:+.3f} wd_val={wd_val_post:+.3f} sc={sc_post:+.3f} | noise ||·||={nz_norm:.3f} max|·|={nz_max:.3f} | std0 mean={std_mean:.3f} max={std_max:.3f}")
+                         f"val={val_post:+.3f} lat_dis={lat_dis_post:+.3f} val_dis={val_dis_post:+.3f} wd_lat={wd_lat_post:+.3f} sc={sc_post:+.3f} | noise ||·||={nz_norm:.3f} max|·|={nz_max:.3f} | std0 mean={std_mean:.3f} max={std_max:.3f}")
 
         return "\n".join(lines)

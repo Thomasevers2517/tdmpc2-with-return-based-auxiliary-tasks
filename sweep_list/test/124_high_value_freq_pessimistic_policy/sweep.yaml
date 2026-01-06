@@ -1,0 +1,102 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 124: High value_update_freq + extra pessimistic policy
+  # 
+  # Goal: Test if making policy more pessimistic combats value
+  # overestimation from high value update frequency.
+  #
+  # Hypothesis: High value_update_freq causes policy to overfit to
+  # value errors. More pessimistic policy (avoiding uncertainty)
+  # might prevent this.
+  #
+  # Settings:
+  #   - value_update_freq: 8 (high)
+  #   - All std_coefs at magnitude 1 EXCEPT policy
+  #   - policy_value_std_coef: sweep [-1, -2, -3] (increasingly pessimistic)
+  #
+  # 3 policy_std × 8 seeds = 24 configurations
+  #############################################
+
+  # Sweep variables
+  policy_value_std_coef:
+    values: [-1, -2, -3]
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
+
+  # Task
+  task:
+    value: quadruped-walk
+
+  # Training
+  steps:
+    value: 100000
+
+  # High value update frequency (the thing we're testing against)
+  value_update_freq:
+    value: 8
+
+  # Other std_coefs at standard magnitude 1 (NOT using override)
+  td_target_std_coef:
+    value: -1
+  optimistic_policy_value_std_coef:
+    value: 1
+  planner_value_std_coef_train:
+    value: 1
+  planner_value_std_coef_eval:
+    value: -1
+
+  # Architecture - standard settings
+  num_enc_layers:
+    value: 3
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  temperature:
+    value: 0.5
+  jacobian_correction_scale:
+    value: 1.0
+  entropy_action_dim_power:
+    value: 1.0
+
+  # Other standard settings
+  hinge_coef:
+    value: 0.0
+  encoder_consistency_coef:
+    value: 1.0
+
+  # Logging
+  eval_freq:
+    value: 10000
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

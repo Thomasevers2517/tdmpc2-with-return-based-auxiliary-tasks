@@ -1,0 +1,98 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 137: Jacobian Correction Scale Ablation
+  # 
+  # Goal: Test effect of jacobian_correction_scale on action saturation
+  # Lower values = less penalty for extreme actions (tanh saturation)
+  # 
+  # jacobian_correction_scale: [1, 0.4, 0.1, 0]
+  # 
+  # 4 configs × 4 seeds = 16 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  jacobian_correction_scale:
+    values: [1, 0.4, 0.1, 0]
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  # Standard baseline settings
+  num_enc_layers:
+    value: 3
+  num_value_layers:
+    value: 2
+
+  # TD target: pessimistic
+  td_target_std_coef:
+    value: -1
+
+  # Policy/Planner: NEUTRAL
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+
+  # Standard ensemble
+  num_q:
+    value: 8
+  planner_num_dynamics_heads:
+    value: 4
+  num_reward_heads:
+    value: 2
+
+  # Hinge off (testing jacobian instead)
+  hinge_coef:
+    value: 0
+
+  # Multi-gamma
+  multi_gamma_loss_weight:
+    value: 0.1
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  # EMA planning
+  ema_value_planning:
+    value: true
+
+  # Training (100k for easy tasks)
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true

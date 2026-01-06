@@ -1,0 +1,55 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 108b: Dog-Run Legacy Entropy + Hinge Loss
+  # 
+  # Test the legacy TD-MPC2 behavior (jacobian_correction_scale=0)
+  # combined with hinge loss enabled.
+  #
+  # jacobian_correction_scale=0.0 reproduces old TD-MPC2 behavior.
+  # hinge_coef=0.01 adds explicit saturation penalty.
+  #
+  # Total: 1 config × 2 seeds = 2 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  # Legacy behavior: no Jacobian penalty
+  jacobian_correction_scale:
+    value: 0.0
+
+  # Hinge loss enabled
+  hinge_coef:
+    value: 0.01
+
+  seed:
+    values: [1, 2]
+
+  # Fixed config
+  steps:
+    value: 500000
+  eval_freq:
+    value: 20000
+  compile:
+    value: true
+  dual_policy_enabled:
+    value: true
+  eval_mean_head_reduce:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

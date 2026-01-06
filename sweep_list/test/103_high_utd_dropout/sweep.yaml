@@ -1,0 +1,77 @@
+program: tdmpc2/train.py
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+metric:
+  name: eval/episode_reward
+  goal: maximize
+parameters:
+  #############################################
+  # Sweep 103: High UTD with Dropout
+  # 
+  # Hypothesis: With dynamics dropout and reward dropout enabled,
+  # we might be able to use higher UTD (12) while maintaining
+  # generalization. Testing if dropout helps avoid overfitting
+  # at higher update-to-data ratios. Using 3 dynamics layers
+  # to compensate for information loss from dropout.
+  #
+  # Config:
+  # - dynamics_num_layers: 3
+  # - dynamics_dropout: 0.05
+  # - utd_ratio: 12
+  # - reward_dropout_enabled: true
+  #
+  # Task: quadruped-walk
+  # Seeds: 8
+  # Total: 8 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
+
+  #############################################
+  # KEY CONFIG: High UTD with dropout
+  #############################################
+
+  utd_ratio:
+    value: 12
+
+  dynamics_num_layers:
+    value: 3
+
+  dynamics_dropout:
+    value: 0.05
+
+  reward_dropout_enabled:
+    value: true
+
+  #############################################
+  # FIXED CONFIG (standard settings)
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+
+  # Compilation
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead

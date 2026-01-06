@@ -1,0 +1,106 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 128: Pessimistic policy std_coef on dog-run
+  # 
+  # Goal: Test strongly pessimistic policy to avoid model error exploitation.
+  # Matching previous successful settings with legacy entropy config.
+  #
+  # Settings:
+  #   - policy_value_std_coef: [-1, -2, -3] (increasingly pessimistic policy)
+  #   - td_target_std_coef: [0, -1] (mean-only vs pessimistic targets)
+  #   - Other std_coefs at magnitude 1
+  #   - Legacy entropy settings (no action dim scaling, no jacobian)
+  #
+  # 3 policy × 2 td × 2 seeds = 12 configurations
+  #############################################
+
+  # Sweep variables
+  policy_value_std_coef:
+    values: [-1, -2, -3]
+
+  td_target_std_coef:
+    values: [0, -1]
+
+  seed:
+    values: [1, 2]
+
+  # Task
+  task:
+    value: dog-run
+
+  # Other std_coefs at magnitude 1 (not using override since we're sweeping policy separately)
+  optimistic_policy_value_std_coef:
+    value: 1
+  planner_value_std_coef_train:
+    value: 1
+  planner_value_std_coef_eval:
+    value: -1
+
+  # Training
+  steps:
+    value: 400000
+
+  # Update frequencies
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 4
+  pi_update_freq:
+    value: 1
+
+  # Architecture
+  num_enc_layers:
+    value: 2
+  num_q:
+    value: 2
+  num_reward_heads:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Legacy entropy settings (matching previous successful runs)
+  start_entropy_coeff:
+    value: 0.003
+  entropy_action_dim_power:
+    value: 0
+  jacobian_correction_scale:
+    value: 0
+  temperature:
+    value: 0.5
+
+  # Hinge loss
+  hinge_coef:
+    value: 0.01
+
+  # Other standard settings
+  encoder_consistency_coef:
+    value: 1.0
+
+  # Logging
+  eval_freq:
+    value: 20000
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

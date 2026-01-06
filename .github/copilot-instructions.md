@@ -71,3 +71,4 @@ Debugging / Understanding
 
 When uncertain: ask, propose, then implement.
 
+Check Running.MD for how to run experiments.

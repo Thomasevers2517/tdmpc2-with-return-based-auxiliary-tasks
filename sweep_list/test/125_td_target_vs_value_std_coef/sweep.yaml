@@ -1,0 +1,89 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 125: TD target pessimism × value std_coef override
+  # 
+  # Goal: Separate TD target pessimism (learning signal) from
+  # action-selection pessimism/optimism (behavior).
+  #
+  # Hypothesis: TD target pessimism is a different concern than
+  # policy/planner pessimism. We can tune them independently.
+  #
+  # Settings:
+  #   - td_target_std_coef: [0, -1] (mean-only vs pessimistic targets)
+  #   - value_std_coef_override: [1, 2, 3] (action-selection magnitude)
+  #
+  # 2 td × 3 value_override × 6 seeds = 36 configurations
+  #############################################
+
+  # Sweep variables
+  td_target_std_coef:
+    values: [0, -1]
+
+  value_std_coef_override:
+    values: [1, 2, 3]
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
+
+  # Task
+  task:
+    value: quadruped-walk
+
+  # Training
+  steps:
+    value: 100000
+
+  # Architecture - standard settings
+  num_enc_layers:
+    value: 3
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Entropy settings
+  start_entropy_coeff:
+    value: 0.00003
+  temperature:
+    value: 0.5
+  jacobian_correction_scale:
+    value: 1.0
+  entropy_action_dim_power:
+    value: 1.0
+
+  # Other standard settings
+  hinge_coef:
+    value: 0.0
+  encoder_consistency_coef:
+    value: 1.0
+
+  # Logging
+  eval_freq:
+    value: 10000
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

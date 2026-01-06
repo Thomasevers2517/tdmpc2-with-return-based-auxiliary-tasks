@@ -1,0 +1,107 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 133: Dog-Run No Pessimism/Optimism Ablation
+  # 
+  # Goal: Test if removing pessimism/optimism from acting helps on dog-run
+  # Motivated by old successful runs (TBU sweep) that had no pessimism
+  # 
+  # Key insight: Old runs had TD target pessimism but neutral policy/planner
+  # 
+  # Config:
+  #   - TD target: pessimistic (-1)
+  #   - Policy: neutral (0)
+  #   - Planner train: neutral (0)
+  #   - Planner eval: test [0, -1] (neutral vs pessimistic)
+  #   - Smaller ensemble: 2Q, 2 dynamics heads
+  #   - Multi-gamma loss weight back to 1
+  #
+  # 2 planner_eval × 4 seeds = 8 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  # TD target: keep pessimistic (like old runs)
+  td_target_std_coef:
+    value: -1
+
+  # Policy: NEUTRAL (no pessimism/optimism when acting)
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 0
+
+  # Planner train: NEUTRAL
+  planner_value_std_coef_train:
+    value: 0
+
+  # Planner eval: test neutral vs pessimistic
+  planner_value_std_coef_eval:
+    values: [0, -1]
+
+  # Smaller ensemble (closer to old setup)
+  num_q:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 2
+  num_reward_heads:
+    value: 1
+
+  # Multi-gamma back to higher weight
+  multi_gamma_loss_weight:
+    value: 0.1
+
+  seed:
+    values: [1, 2]
+
+  # Architecture (2 layers like old runs)
+  num_enc_layers:
+    value: 2
+
+  # Planner
+  planner_use_all_heads_eval:
+    value: true
+
+  # Hinge coefficient (like old runs)
+  hinge_coef:
+    value: 0.01
+
+  # Entropy settings (standard)
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+  jacobian_correction_scale:
+    value: 0.0
+
+  # EMA planning
+  ema_value_planning:
+    value: true
+
+  # Training
+  steps:
+    value: 1000000
+  eval_freq:
+    value: 50000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
+  compile:
+    value: true

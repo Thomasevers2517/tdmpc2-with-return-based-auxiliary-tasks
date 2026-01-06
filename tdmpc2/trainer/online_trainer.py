@@ -33,6 +33,14 @@ class OnlineTrainer(Trainer):
 
 		self.validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
 		self.recent_validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
+		
+		# Optional mean head reduction eval buffers (created if eval_mean_head_reduce=true)
+		if self.cfg.eval_mean_head_reduce:
+			self.validation_all_mean_head_reduce_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
+			self.validation_recent_mean_head_reduce_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
+		else:
+			self.validation_all_mean_head_reduce_buffer = None
+			self.validation_recent_mean_head_reduce_buffer = None
 
 	def common_metrics(self):
 		"""Return a dictionary of current metrics."""
@@ -44,8 +52,15 @@ class OnlineTrainer(Trainer):
 			steps_per_second=self._step / elapsed_time
 		)
 
-	def eval(self, mpc=True):
-		"""Evaluate a TD-MPC2 agent."""
+	def eval(self, mpc=True, eval_head_reduce: str = 'default'):
+		"""Evaluate a TD-MPC2 agent.
+		
+		Args:
+			mpc: If True, use MPC planning. If False, use policy-only.
+			eval_head_reduce: Head reduction mode for eval.
+				'default' uses planner_value_std_coef_eval (typically pessimistic).
+				'mean' uses value_std_coef=0 for mean-only reduction.
+		"""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
 		# self.validation_buffer.empty()
@@ -58,7 +73,7 @@ class OnlineTrainer(Trainer):
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, planner_info = self.agent.act(obs, eval_mode=True, mpc=mpc)
+				action, planner_info = self.agent.act(obs, eval_mode=True, mpc=mpc, eval_head_reduce=eval_head_reduce)
 				action = action.cpu()
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
@@ -75,14 +90,17 @@ class OnlineTrainer(Trainer):
 			if self.cfg.save_video:
 				self.logger.video.save(self._step)
 			if mpc:
-				self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
-				self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
-		if mpc:
-			val_info_rand, val_info_recent = self.validate()
-			val_info_rand.update(self.common_metrics())
-			val_info_recent.update(self.common_metrics())
-			self.logger.log(val_info_rand, 'validation_all')
-			self.logger.log(val_info_recent, 'validation_recent') 
+				# Add to appropriate validation buffers based on head reduction mode
+				if eval_head_reduce == 'default':
+					self.validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
+					self.recent_validation_buffer.add(torch.cat(self.val_tds), end_episode=True)
+				elif eval_head_reduce == 'mean' and self.validation_all_mean_head_reduce_buffer is not None:
+					self.validation_all_mean_head_reduce_buffer.add(torch.cat(self.val_tds), end_episode=True)
+					self.validation_recent_mean_head_reduce_buffer.add(torch.cat(self.val_tds), end_episode=True)
+		if mpc and eval_head_reduce == 'default':
+			# Return that validation should run after all evals complete
+			# (validation is now called from train() after all eval modes finish)
+			pass
 	
 		return dict(
 			episode_reward=np.nanmean(ep_rewards),
@@ -131,14 +149,35 @@ class OnlineTrainer(Trainer):
 			# Reset environment
 			if done:
 				if eval_next:
-					eval_metrics = self.eval(mpc=True)
+					# Default eval with min head reduction
+					eval_metrics = self.eval(mpc=True, eval_head_reduce='default')
 					eval_metrics.update(self.common_metrics())
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
 
+					# Policy-only eval (no MPC)
 					policy_eval_metrics = self.eval(mpc=False)
 					policy_eval_metrics.update(self.common_metrics())
 					self.logger.log(policy_eval_metrics, 'policy_eval')
+					
+					# Optional: mean head reduction eval
+					if self.cfg.eval_mean_head_reduce:
+						eval_mean_metrics = self.eval(mpc=True, eval_head_reduce='mean')
+						eval_mean_metrics.update(self.common_metrics())
+						self.logger.log(eval_mean_metrics, 'eval_mean_head_reduce')
+					
+					# Run validation on all buffers after all evals complete
+					val_info_rand, val_info_recent, val_info_mean_all, val_info_mean_recent = self.validate()
+					val_info_rand.update(self.common_metrics())
+					val_info_recent.update(self.common_metrics())
+					self.logger.log(val_info_rand, 'validation_all')
+					self.logger.log(val_info_recent, 'validation_recent')
+					# Log mean head reduce validation if buffers exist and were populated
+					if val_info_mean_all is not None:
+						val_info_mean_all.update(self.common_metrics())
+						val_info_mean_recent.update(self.common_metrics())
+						self.logger.log(val_info_mean_all, 'validation_all_mean_head_reduce')
+						self.logger.log(val_info_mean_recent, 'validation_recent_mean_head_reduce')
      
 
 				if self._step > 0:
@@ -222,8 +261,21 @@ class OnlineTrainer(Trainer):
 		self.logger.finish(self.agent)
 
 	def validate(self):
+		"""Validate on all validation buffers (min head reduce + optionally mean head reduce)."""
 		import math
-		random_val_info= self.agent.validate(self.validation_buffer, num_batches=1)
-		val_info_recent = self.agent.validate(self.recent_validation_buffer, num_batches=math.floor(self.cfg.eval_episodes*self.cfg.episode_length / self.cfg.batch_size))
+		num_batches_recent = math.floor(self.cfg.eval_episodes * self.cfg.episode_length / self.cfg.batch_size)
+		
+		# Min head reduce buffers (always present)
+		random_val_info = self.agent.validate(self.validation_buffer, num_batches=1)
+		val_info_recent = self.agent.validate(self.recent_validation_buffer, num_batches=num_batches_recent)
 		self.recent_validation_buffer.empty()
-		return random_val_info, val_info_recent
+		
+		# Mean head reduce buffers (optional)
+		val_info_mean_all = None
+		val_info_mean_recent = None
+		if self.validation_all_mean_head_reduce_buffer is not None:
+			val_info_mean_all = self.agent.validate(self.validation_all_mean_head_reduce_buffer, num_batches=1)
+			val_info_mean_recent = self.agent.validate(self.validation_recent_mean_head_reduce_buffer, num_batches=num_batches_recent)
+			self.validation_recent_mean_head_reduce_buffer.empty()
+		
+		return random_val_info, val_info_recent, val_info_mean_all, val_info_mean_recent

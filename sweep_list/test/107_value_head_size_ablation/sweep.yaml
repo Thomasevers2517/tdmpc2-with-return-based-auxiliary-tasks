@@ -1,0 +1,86 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 107: Value Head Size Ablation
+  # 
+  # Hypothesis: Since we now use state-value V(s) instead of Q(s,a),
+  # the value head doesn't need to process actions. A smaller value
+  # head might stabilize encoder representations and justify having
+  # a larger encoder (3 layers).
+  #
+  # Config:
+  # - value_dim_div: [1, 8, 32] (hidden dim = 512, 64, 16)
+  # - num_value_layers: [1, 2]
+  #
+  # Task: quadruped-walk
+  # Seeds: 6
+  # Total: 3 × 2 × 6 = 36 runs
+  #############################################
+
+  task:
+    value: quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
+
+  #############################################
+  # KEY CONFIG: Value head size sweep
+  #############################################
+
+  value_dim_div:
+    values: [1, 8, 32]
+
+  num_value_layers:
+    values: [1, 2]
+
+  #############################################
+  # FIXED CONFIG (standard settings)
+  #############################################
+
+  # Encoder: 3 layers (hypothesis: smaller value head justifies this)
+  num_enc_layers:
+    value: 3
+
+  # Reward head: small (div=32, 1 layer)
+  reward_dim_div:
+    value: 32
+  num_reward_layers:
+    value: 1
+
+  # Dynamics
+  planner_num_dynamics_heads:
+    value: 4
+  dynamics_num_layers:
+    value: 2
+  dynamics_dropout:
+    value: 0.0
+
+  # Training
+  compile:
+    value: true
+  dual_policy_enabled:
+    value: true
+  eval_mean_head_reduce:
+    value: true
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

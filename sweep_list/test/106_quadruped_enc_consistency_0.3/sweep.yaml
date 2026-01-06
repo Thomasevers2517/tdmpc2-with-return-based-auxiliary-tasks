@@ -1,0 +1,54 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - quadruped-walk
+  encoder_consistency_coef:
+    values:
+      - 0.3
+  # Architecture
+  num_enc_layers:
+    values:
+      - 3
+  planner_num_dynamics_heads:
+    values:
+      - 4
+  dynamics_num_layers:
+    values:
+      - 2
+  dynamics_dropout:
+    values:
+      - 0.0
+  reward_dim_div:
+    values:
+      - 32
+  num_reward_layers:
+    values:
+      - 1
+  # Training
+  compile:
+    values:
+      - true
+  dual_policy_enabled:
+    values:
+      - true
+  eval_mean_head_reduce:
+    values:
+      - true
+  seed:
+    values:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8

@@ -1,0 +1,61 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 108a: Dog-Run Jacobian Correction Scale
+  # 
+  # Test different Jacobian correction scales to see if
+  # reducing the penalty for action saturation helps dog-run.
+  #
+  # jacobian_correction_scale:
+  #   1.0 = correct entropy (full Jacobian penalty near ±1)
+  #   0.5 = half penalty
+  #   0.1 = small penalty
+  #   0.01 = very small penalty
+  #   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
+  #
+  # hinge_coef=0 (no hinge loss)
+  #
+  # Total: 5 jacobian × 2 seeds = 10 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  # Jacobian correction scale variations
+  jacobian_correction_scale:
+    values: [1.0, 0.5, 0.1, 0.01, 0.0]
+
+  # No hinge loss
+  hinge_coef:
+    value: 0
+
+  seed:
+    values: [1, 2]
+
+  # Fixed config
+  steps:
+    value: 500000
+  eval_freq:
+    value: 20000
+  compile:
+    value: true
+  dual_policy_enabled:
+    value: true
+  eval_mean_head_reduce:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

@@ -54,15 +54,19 @@ class WorldModel(nn.Module):
 		prior_enabled = cfg.dynamics_prior_enabled
 		prior_hidden_dim = cfg.dynamics_prior_hidden_dim
 		prior_scale = cfg.dynamics_prior_scale
+		# Dynamics head config: layer count and dropout
+		dynamics_num_layers = int(getattr(cfg, 'dynamics_num_layers', 2))
+		dynamics_dropout = float(getattr(cfg, 'dynamics_dropout', 0.0))
 		self._dynamics_heads = nn.ModuleList([
 			layers.DynamicsHeadWithPrior(
 				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				mlp_dims=2 * [cfg.mlp_dim],
+				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
 				out_dim=cfg.latent_dim,
 				cfg=cfg,
 				prior_enabled=prior_enabled,
 				prior_hidden_dim=prior_hidden_dim,
 				prior_scale=prior_scale,
+				dropout=dynamics_dropout,
 			)
 			for _ in range(h_total)
 		])
@@ -73,11 +77,15 @@ class WorldModel(nn.Module):
 		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
 		# Ensemble stores params in TensorDictParams which apply() does not traverse.
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
+		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
+		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
+		reward_dropout = cfg.dropout if getattr(cfg, 'reward_dropout_enabled', False) else 0.0
 		self._reward_heads = nn.ModuleList([
 			layers.mlp(
 				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				2 * [cfg.mlp_dim // cfg.reward_dim_div],
+				num_reward_layers * [reward_hidden_dim],  # [dim] or [dim, dim]
 				max(cfg.num_bins, 1),
+				dropout=reward_dropout,
 			)
 			for _ in range(num_reward_heads)
 		])
@@ -93,24 +101,11 @@ class WorldModel(nn.Module):
 		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
 		v_input_dim = cfg.latent_dim + cfg.task_dim
 		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div  # Allow smaller V networks via value_dim_div
-		v_mlps = [layers.mlp(v_input_dim, 2*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
+		num_value_layers = cfg.num_value_layers  # Number of hidden layers (default 2)
+		v_mlps = [layers.mlp(v_input_dim, num_value_layers*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
 		for mlp in v_mlps:
 			mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
-		self._target_encoder = None
-		self._target_pi = None
-		self.encoder_target_max_delta = 0.0
-		self.policy_target_max_delta = 0.0
-		if cfg.encoder_ema_enabled:
-			self._target_encoder = deepcopy(self._encoder)
-			for param in self._target_encoder.parameters():
-				param.requires_grad_(False)
-			self._target_encoder.eval()
-		if cfg.policy_ema_enabled:
-			self._target_pi = deepcopy(self._pi)
-			for param in self._target_pi.parameters():
-				param.requires_grad_(False)
-			self._target_pi.eval()
 
 		# ------------------------------------------------------------------
 		# Auxiliary multi-gamma state-value heads (training-only)
@@ -134,14 +129,14 @@ class WorldModel(nn.Module):
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
 			# Auxiliary V heads: input is latent only (no action)
-			# Use same v_mlp_dim as primary V heads for consistency
+			# Use same v_mlp_dim and num_value_layers as primary V heads for consistency
 			aux_in_dim = cfg.latent_dim + (cfg.task_dim if cfg.multitask else 0)
 			aux_v_mlp_dim = v_mlp_dim  # Already computed above as cfg.mlp_dim // cfg.value_dim_div
 			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Vs = layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
+				self._aux_joint_Vs = layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
 			elif cfg.multi_gamma_head == 'separate':
 				self._aux_separate_Vs = torch.nn.ModuleList([
-					layers.mlp(aux_in_dim, 2*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
+					layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
 					for _ in range(self._num_aux_gamma)
 				])
 			else:
@@ -149,8 +144,9 @@ class WorldModel(nn.Module):
 
 		self.apply(init.weight_init)
 		reward_weights = [head[-1].weight for head in self._reward_heads]
-		init.zero_(reward_weights + [self._Vs.params["2", "weight"]])
-		self.reset_policy_encoder_targets()
+		# Last layer index = num_value_layers (e.g., 1 hidden → layers 0,1 → output is "1")
+		v_output_layer_key = str(num_value_layers)
+		init.zero_(reward_weights + [self._Vs.params[v_output_layer_key, "weight"]])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
@@ -310,24 +306,6 @@ class WorldModel(nn.Module):
 			online_vec = parameters_to_vector(source_params).detach()
 			target_vec = parameters_to_vector(target_params).detach()
 			return torch.max(torch.abs(online_vec - target_vec))
-
-	def soft_update_policy_encoder_targets(self):
-		updates = {}
-		if self._target_encoder is not None:
-			updates['encoder'] = self._soft_update_module(self._target_encoder, self._encoder, float(self.cfg.encoder_ema_tau))
-			self.encoder_target_max_delta = updates['encoder']
-		if self._target_pi is not None:
-			updates['policy'] = self._soft_update_module(self._target_pi, self._pi, float(self.cfg.policy_ema_tau))
-			self.policy_target_max_delta = updates['policy']
-		return updates
-
-	def reset_policy_encoder_targets(self):
-		if self._target_encoder is not None:
-			self._target_encoder.load_state_dict(self._encoder.state_dict())
-			self.encoder_target_max_delta = 0.0
-		if self._target_pi is not None:
-			self._target_pi.load_state_dict(self._pi.state_dict())
-			self.policy_target_max_delta = 0.0
 				
 	def task_emb(self, x, task):
 		"""
@@ -344,18 +322,13 @@ class WorldModel(nn.Module):
 			emb = emb.repeat(x.shape[0], 1)
 		return torch.cat([x, emb], dim=-1)
 
-	def encode(self, obs, task, use_ema=False):
+	def encode(self, obs, task):
 		"""
 		Encodes an observation into its latent representation.
 		This implementation assumes a single state-based observation.
 		"""
 		with maybe_range('WM/encode', self.cfg):
-			if use_ema:
-				if self._target_encoder is None:
-					raise RuntimeError('Encoder target requested but not initialized')
-				encoder = self._target_encoder
-			else:
-				encoder = self._encoder
+			encoder = self._encoder
 			if self.cfg.multitask:
 				obs = self.task_emb(obs, task)
 			if self.cfg.obs == 'rgb' and obs.ndim == 5:
@@ -446,7 +419,7 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(logits)
 		
 
-	def pi(self, z, task, use_ema=False, search_noise=False, optimistic=False):
+	def pi(self, z, task, search_noise=False, optimistic=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
@@ -455,16 +428,11 @@ class WorldModel(nn.Module):
 		Args:
 			z: Latent state tensor.
 			task: Task identifier for multitask setup.
-			use_ema: If True, use target (EMA) policy.
 			search_noise: Unused (legacy parameter).
 			optimistic: If True and dual_policy_enabled, use optimistic policy.
 		"""
 		with maybe_range('WM/pi', self.cfg):
-			if use_ema:
-				if self._target_pi is None:
-					raise RuntimeError('Policy target requested but not initialized')
-				module = self._target_pi
-			elif optimistic and self.cfg.dual_policy_enabled:
+			if optimistic and self.cfg.dual_policy_enabled:
 				module = self._pi_optimistic
 			else:
 				module = self._pi
@@ -485,24 +453,26 @@ class WorldModel(nn.Module):
 				action_dims = None
 
 			# Compute Gaussian log prob before squashing
-			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1], ~D scaling from sum
+			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action and apply squash (tanh) with Jacobian correction
+			# Sample action and apply squash (tanh) with configurable Jacobian correction
+			# jacobian_correction_scale controls how much we penalize action saturation:
+			#   1.0 = correct entropy (full Jacobian penalty near ±1)
+			#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
 			action = mean + eps * log_std.exp()
 			presquash_mean = mean
-			mean, action, log_prob = math.squash(mean, action, log_prob_presquash)
+			jacobian_scale = float(self.cfg.jacobian_correction_scale)
+			mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
 			
-			# Entropy with configurable action dimension scaling
-			# entropy_action_dim_power controls how entropy scales with action_dim:
-			#   0.0 = no extra scaling (entropy ~ D from Gaussian sum)
-			#   1.0 = multiply by D (entropy ~ D², like original TD-MPC2)
-			#   0.5 = multiply by sqrt(D) (entropy ~ D^1.5, compromise)
-			entropy = -log_prob  # float32[..., 1], correct squashed entropy
+			# Entropy and scaled_entropy for policy loss
+			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)
+			# When jacobian_scale=1, log_prob includes full Jacobian correction (correct)
+			entropy = -log_prob
 			entropy_multiplier = torch.tensor(
-				action_dim, dtype=entropy.dtype, device=entropy.device
-			).pow(self.cfg.entropy_action_dim_power)  # float32 scalar tensor
-			scaled_entropy = entropy * entropy_multiplier  # float32[..., 1]
+				action_dim, dtype=log_prob.dtype, device=log_prob.device
+			).pow(self.cfg.entropy_action_dim_power)
+			scaled_entropy = entropy * entropy_multiplier
 			
 			info = TensorDict({
 				"presquash_mean": presquash_mean,
@@ -533,7 +503,7 @@ class WorldModel(nn.Module):
 		with maybe_range('WM/V_aux', self.cfg):
 			if self._num_aux_gamma == 0:
 				return None
-			assert return_type in {'all','min','avg'}
+			assert return_type in {'all', 'min', 'avg', 'mean'}
 
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
@@ -579,15 +549,17 @@ class WorldModel(nn.Module):
 		Args:
 			z (Tensor[..., L]): Latent state embeddings.
 			task: Task identifier for multitask setup.
-			return_type (str): 'all' returns logits, 'min'/'max'/'avg'/'mean' return scalar values.
+			return_type (str): 'all' returns logits, 'all_values' returns scalar values per head,
+			                   'min'/'max'/'avg'/'mean' return scalar values reduced over heads.
 			target (bool): Use target network.
 			detach (bool): Use detached (non-gradient) network.
 			
 		Returns:
 			Tensor[num_q, ..., K] if return_type='all' (logits).
+			Tensor[num_q, ..., 1] if return_type='all_values' (scalar values per head).
 			Tensor[..., 1] otherwise (values after two-hot inverse, reduced over all num_q heads).
 		"""
-		assert return_type in {'min', 'avg', 'mean', 'max', 'all'}
+		assert return_type in {'min', 'avg', 'mean', 'max', 'all', 'all_values'}
 
 		with maybe_range('WM/V', self.cfg):
 			if self.cfg.multitask:
@@ -609,6 +581,9 @@ class WorldModel(nn.Module):
 
 			# Use ALL num_q ensemble members for reduction (no subsampling)
 			V = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
+			
+			if return_type == 'all_values':
+				return V  # Return scalar values for all heads without reduction
 			if return_type == "min":
 				return torch.amin(V, dim=0)
 			if return_type == "max":
@@ -666,8 +641,12 @@ class WorldModel(nn.Module):
 		elif head_mode == 'all':
 			H_sel = H_total
 			head_indices = list(range(H_total))
+		elif head_mode == 'random':
+			# Randomly select one dynamics head per update (for single-head imagination)
+			H_sel = 1
+			head_indices = [torch.randint(0, H_total, (1,)).item()]
 		else:
-			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
+			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single', 'all', or 'random'.")
 
 		# Determine action dim
 		if not use_policy:
@@ -691,7 +670,7 @@ class WorldModel(nn.Module):
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, use_ema=getattr(self.cfg, 'policy_ema_enabled', False), optimistic=use_optimistic_policy)
+							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy)
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
