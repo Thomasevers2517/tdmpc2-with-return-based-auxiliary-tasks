@@ -13,6 +13,9 @@ eval_episodes: 5
 eval_freq: 10000
 eval_mean_head_reduce: true  # If true, also run evaluation with mean head reduction (in addition to default min)
 
+# KNN entropy for measuring observation diversity in replay buffer
+knn_entropy_k: 5  # k for k-th nearest neighbor entropy estimator
+knn_entropy_dim: 128  # output dimension of frozen random encoder
 
 critic_type: V  # 'V' (state value) only. 'Q' is not implemented.
 pi_rollout_horizon: 1  # Number of steps to rollout for model-based policy optimization

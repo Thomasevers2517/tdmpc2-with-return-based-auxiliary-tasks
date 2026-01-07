@@ -168,6 +168,23 @@ class TDMPC2(torch.nn.Module):
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
+		
+		# Frozen random encoder for KNN entropy estimation (observation diversity metric)
+		# Only for state observations (not pixels)
+		if self.cfg.obs == 'state':
+			obs_dim = list(self.cfg.obs_shape.values())[0][0]  # Get first obs modality dim
+			knn_entropy_dim = int(getattr(self.cfg, 'knn_entropy_dim', 128))
+			self._knn_encoder = torch.nn.Sequential(
+				torch.nn.Linear(obs_dim, 256),
+				torch.nn.Tanh(),
+				torch.nn.Linear(256, knn_entropy_dim),
+			).to(self.device)
+			# Freeze encoder
+			for p in self._knn_encoder.parameters():
+				p.requires_grad_(False)
+			self._knn_encoder.eval()
+		else:
+			self._knn_encoder = None
 		self.register_buffer(
 			"dynamic_entropy_coeff",
 			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
@@ -1746,6 +1763,18 @@ class TDMPC2(torch.nn.Module):
 
 		# Log current encoder LR for W&B tracking
 		info['encoder_lr'] = self.optim.param_groups[0]['lr']
+
+		# KNN entropy logging (sparse, only when log_detailed)
+		if self.log_detailed and self._knn_encoder is not None:
+			with torch.no_grad():
+				# obs: [T+1, B, obs_dim], take first timestep
+				obs_flat = obs[0]  # float32[B, obs_dim]
+				# Encode with frozen random encoder
+				encoded = self._knn_encoder(obs_flat)  # float32[B, knn_entropy_dim]
+				# Compute KNN entropy
+				knn_k = int(getattr(self.cfg, 'knn_entropy_k', 5))
+				batch_knn_entropy = math.compute_knn_entropy(encoded, k=knn_k)
+				info['batch_knn_entropy'] = batch_knn_entropy.item()
 
 		return info
 

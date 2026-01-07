@@ -132,3 +132,38 @@ def termination_statistics(pred, target, eps=1e-9):
 	f1 = 2 * (precision * recall) / (precision + recall + eps)
 	return TensorDict({'termination_rate': rate,
 			'termination_f1': f1})
+
+
+def compute_knn_entropy(x: torch.Tensor, k: int = 5) -> torch.Tensor:
+	"""Compute k-NN entropy estimator: mean(log(dist_to_kth_neighbor + 1)).
+	
+	Measures diversity/spread of points in representation space.
+	Higher entropy indicates more diverse/spread-out observations.
+	
+	Args:
+		x (Tensor[B, D]): Encoded representations.
+		k (int): Find k-th nearest neighbor (excluding self).
+	
+	Returns:
+		Tensor[]: Scalar mean entropy estimate.
+	"""
+	B, D = x.shape
+	if B <= k:
+		# Not enough points to compute k-th neighbor
+		return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+	
+	# Compute pairwise L2 distances: dists[i,j] = ||x_i - x_j||_2
+	# Shape: [B, B]
+	dists = torch.cdist(x, x, p=2)  # float32[B, B]
+	
+	# Exclude self: set diagonal to inf so self isn't picked as neighbor
+	dists.fill_diagonal_(float('inf'))
+	
+	# Find k-th smallest distance for each point (k-th nearest neighbor)
+	# torch.kthvalue returns (values, indices) for k-th smallest along dim
+	kth_dists, _ = torch.kthvalue(dists, k=k, dim=1)  # float32[B]
+	
+	# Entropy estimate: log(dist + 1) per the RE3 paper formula
+	entropy_per_point = torch.log(kth_dists + 1)  # float32[B]
+	
+	return entropy_per_point.mean()  # scalar
