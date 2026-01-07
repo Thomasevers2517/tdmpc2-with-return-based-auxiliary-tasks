@@ -1,8 +1,97 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import from_modules
 from copy import deepcopy
+
+
+class MLPWithPrior(nn.Module):
+	"""
+	MLP with an optional frozen random prior for ensemble diversity.
+	
+	Combines a trainable main MLP with a frozen prior network. The prior output
+	is L2-normalized and scaled, then added to the main output. This encourages
+	diverse representations across ensemble members even when the main networks
+	would otherwise collapse to similar predictions (e.g., in sparse reward settings).
+	
+	The prior_scale is dimension-aware: it controls the per-dimension perturbation
+	magnitude. With prior_scale=1.0, each output dimension gets ~1.0 perturbation.
+	
+	Args:
+		in_dim (int): Input dimension.
+		hidden_dims (list[int]): Hidden layer dimensions for main MLP.
+		out_dim (int): Output dimension.
+		prior_hidden_div (int): Divisor for prior hidden dim (prior_hidden = hidden_dim // div).
+		prior_scale (float): Per-dimension perturbation magnitude. 0 = no prior.
+		act: Optional activation for output layer (e.g., SimNorm for dynamics).
+		dropout (float): Dropout probability for main MLP.
+	"""
+	
+	def __init__(
+		self,
+		in_dim: int,
+		hidden_dims: list,
+		out_dim: int,
+		prior_hidden_div: int = 4,
+		prior_scale: float = 1.0,
+		act=None,
+		dropout: float = 0.,
+	):
+		super().__init__()
+		self.prior_scale = prior_scale
+		self.out_dim = out_dim
+		
+		# Main MLP (trainable)
+		self.main_mlp = mlp(in_dim, hidden_dims, out_dim, act=act, dropout=dropout)
+		
+		# Prior MLP (frozen) - only if prior_scale > 0
+		if prior_scale > 0 and len(hidden_dims) > 0:
+			prior_hidden = max(hidden_dims[0] // prior_hidden_div, 8)  # min 8 to avoid degenerate priors
+			prior_dims = [prior_hidden] * len(hidden_dims)
+			# Build prior MLP manually with ReLU activations (no LayerNorm)
+			prior_layers = []
+			dims = [in_dim] + prior_dims + [out_dim]
+			for i in range(len(dims) - 1):
+				prior_layers.append(nn.Linear(dims[i], dims[i+1]))
+				if i < len(dims) - 2:  # No activation on output
+					prior_layers.append(nn.ReLU())
+			self.prior_mlp = nn.Sequential(*prior_layers)
+			# Initialize with Kaiming (preserves variance through ReLU layers)
+			for m in self.prior_mlp.modules():
+				if isinstance(m, nn.Linear):
+					nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+					nn.init.zeros_(m.bias)
+			# Freeze prior
+			for p in self.prior_mlp.parameters():
+				p.requires_grad_(False)
+		else:
+			self.prior_mlp = None
+	
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		"""
+		Forward pass: main_mlp(x) + normalized_prior(x) * scale * sqrt(out_dim).
+		
+		Args:
+			x (Tensor[..., in_dim]): Input tensor.
+		
+		Returns:
+			Tensor[..., out_dim]: Output with prior perturbation.
+		"""
+		out = self.main_mlp(x)  # float32[..., out_dim]
+		
+		if self.prior_scale > 0 and self.prior_mlp is not None:
+			prior_out = self.prior_mlp(x)  # float32[..., out_dim]
+			# L2 normalize, then scale by sqrt(out_dim) so prior_scale is per-dimension
+			prior_out = prior_out / (prior_out.norm(dim=-1, keepdim=True) + 1e-6)
+			prior_out = prior_out * (self.prior_scale * math.sqrt(self.out_dim))
+			out = out + prior_out
+		
+		return out
+	
+	def __repr__(self):
+		prior_info = f", prior_scale={self.prior_scale}" if self.prior_scale > 0 else ""
+		return f"MLPWithPrior(main_mlp={self.main_mlp}{prior_info})"
 
 
 class Ensemble(nn.Module):
@@ -147,9 +236,8 @@ def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0., dropout_layer=0):
 class DynamicsHeadWithPrior(nn.Module):
 	"""
 	Dynamics head with an optional frozen random prior for ensemble diversity.
-
-	Combines a trainable main MLP with a frozen prior network. The prior output
-	is added BEFORE SimNorm, allowing the main network to learn to compensate.
+	
+	Uses MLPWithPrior internally, then applies SimNorm to the output.
 	This encourages diverse representations across ensemble members.
 
 	Args:
@@ -157,9 +245,8 @@ class DynamicsHeadWithPrior(nn.Module):
 		mlp_dims (list[int]): Hidden dimensions for the main MLP.
 		out_dim (int): Output dimension (latent_dim).
 		cfg: Config object with simnorm_dim and prior settings.
-		prior_enabled (bool): Whether to add the frozen prior network.
-		prior_hidden_dim (int): Hidden dimension for prior MLP.
-		prior_scale (float): Scale factor for prior output.
+		prior_hidden_div (int): Divisor for prior hidden dim.
+		prior_scale (float): Per-dimension perturbation magnitude. 0 = no prior.
 		dropout (float): Dropout probability for first layer.
 	"""
 
@@ -169,40 +256,33 @@ class DynamicsHeadWithPrior(nn.Module):
 		mlp_dims: list,
 		out_dim: int,
 		cfg,
-		prior_enabled: bool = False,
-		prior_hidden_dim: int = 32,
+		prior_hidden_div: int = 4,
 		prior_scale: float = 1.0,
 		dropout: float = 0.,
 	):
 		super().__init__()
-		self.prior_enabled = prior_enabled
 		self.prior_scale = prior_scale
-
-		# Main trainable MLP (without final activation - SimNorm applied after sum)
-		self.main_mlp = mlp(in_dim, mlp_dims, out_dim, act=None, dropout=dropout)
-
-		# Frozen prior network: small MLP with Tanh to bound outputs to [-1, 1]
-		if prior_enabled:
-			self.prior_mlp = nn.Sequential(
-				nn.Linear(in_dim, prior_hidden_dim),
-				nn.ReLU(),
-				nn.Linear(prior_hidden_dim, prior_hidden_dim),
-				nn.ReLU(),
-				nn.Linear(prior_hidden_dim, out_dim),
-				nn.Tanh(),  # Bound to [-1, 1]
-			)
-			# Freeze prior parameters
-			for param in self.prior_mlp.parameters():
-				param.requires_grad = False
-		else:
-			self.prior_mlp = None
-
-		# SimNorm applied after summing main + prior
+		
+		# MLPWithPrior handles main + prior combination
+		self.mlp_with_prior = MLPWithPrior(
+			in_dim=in_dim,
+			hidden_dims=mlp_dims,
+			out_dim=out_dim,
+			prior_hidden_div=prior_hidden_div,
+			prior_scale=prior_scale,
+			act=None,  # No activation before SimNorm
+			dropout=dropout,
+		)
+		
+		# SimNorm applied after MLPWithPrior
 		self.simnorm = SimNorm(cfg)
+		
+		# Expose main_mlp for weight_init compatibility
+		self.main_mlp = self.mlp_with_prior.main_mlp
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""
-		Forward pass: main_mlp(x) + prior_scale * prior_mlp(x), then SimNorm.
+		Forward pass: MLPWithPrior(x), then SimNorm.
 
 		Args:
 			x (Tensor[..., in_dim]): Input tensor.
@@ -210,18 +290,12 @@ class DynamicsHeadWithPrior(nn.Module):
 		Returns:
 			Tensor[..., out_dim]: Normalized dynamics prediction.
 		"""
-		out = self.main_mlp(x)  # float32[..., out_dim]
-
-		if self.prior_enabled and self.prior_mlp is not None:
-			# Prior output is in [-1, 1] due to Tanh, scaled by prior_scale
-			prior_out = self.prior_mlp(x)  # float32[..., out_dim]
-			out = out + self.prior_scale * prior_out
-
+		out = self.mlp_with_prior(x)  # float32[..., out_dim]
 		return self.simnorm(out)
 
 	def __repr__(self):
-		prior_info = f", prior_enabled={self.prior_enabled}, prior_scale={self.prior_scale}" if self.prior_enabled else ""
-		return f"DynamicsHeadWithPrior(main_mlp={self.main_mlp}{prior_info})"
+		prior_info = f", prior_scale={self.prior_scale}" if self.prior_scale > 0 else ""
+		return f"DynamicsHeadWithPrior({self.mlp_with_prior}{prior_info})"
 
 
 def conv(in_shape, num_channels, out_dim, act=None):

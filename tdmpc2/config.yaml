@@ -118,11 +118,12 @@ planner_policy_elites_first_iter_only: false
 # During eval, uses all heads or single head based on planner_use_all_heads_eval.
 planner_num_dynamics_heads: 4
 
-# Frozen random prior network for dynamics heads to encourage ensemble diversity.
-# The prior is added BEFORE SimNorm so the main network can learn to compensate.
-dynamics_prior_enabled: true      # If true, add frozen prior to each dynamics head
-dynamics_prior_hidden_dim: 32      # Hidden dimension for prior MLP (small for efficiency)
-dynamics_prior_scale: 1.0          # Scale factor for prior output (prior uses Tanh, so in [-1, 1])
+# Frozen random prior networks for ensemble diversity (dynamics, value, reward).
+# Prior is L2-normalized and added to main network output.
+# prior_scale is dimension-aware: 1.0 means ~1.0 perturbation per output dimension.
+# Typical logit range is ~[-3, 3], so prior_scale in {0.1, 1.0, 3.0} is reasonable.
+prior_hidden_div: 4                # prior_hidden_dim = network_hidden_dim // div
+prior_scale: 1.0                   # Per-dimension perturbation magnitude. 0 = no prior.
 dynamics_dropout: 0.0              # Dropout rate for dynamics head (applied to first hidden layer)
 dynamics_num_layers: 2             # Number of hidden layers in dynamics head MLP
 

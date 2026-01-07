@@ -118,7 +118,7 @@ class TDMPC2(torch.nn.Module):
 		param_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': lr_encoder},
 			{'params': self.model._dynamics_heads.parameters(), 'lr': lr_dynamics},
-			{'params': self.model._reward_heads.parameters(), 'lr': lr_reward},
+			{'params': self.model._Rs.parameters(), 'lr': lr_reward},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else [], 'lr': self.cfg.lr},
 			{'params': self.model._Vs.parameters(), 'lr': lr_value},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else [], 'lr': self.cfg.lr}
@@ -350,7 +350,7 @@ class TDMPC2(torch.nn.Module):
 		# dynamics (all heads)
 		groups["dynamics"] = list(self.model._dynamics_heads.parameters())
 		# reward
-		groups["reward"] = list(self.model._reward_heads.parameters())
+		groups["reward"] = list(self.model._Rs.parameters())
 		# termination (optional)
 		if self.cfg.episodic:
 			groups["termination"] = list(self.model._termination.parameters())
