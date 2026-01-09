@@ -79,6 +79,7 @@ class WorldModel(nn.Module):
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
 		reward_dropout = cfg.dropout if getattr(cfg, 'reward_dropout_enabled', False) else 0.0
+		prior_logit_scale = getattr(cfg, 'prior_logit_scale', 5.0)  # Default 5.0 for backward compat
 		reward_mlps = [
 			layers.MLPWithPrior(
 				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
@@ -86,7 +87,10 @@ class WorldModel(nn.Module):
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
 				prior_scale=prior_scale,
+				prior_logit_scale=prior_logit_scale,
 				dropout=reward_dropout,
+				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
+				cfg=cfg,
 			)
 			for _ in range(num_reward_heads)
 		]
@@ -111,7 +115,10 @@ class WorldModel(nn.Module):
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
 				prior_scale=prior_scale,
+				prior_logit_scale=prior_logit_scale,
 				dropout=cfg.dropout,
+				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
+				cfg=cfg,
 			)
 			for _ in range(cfg.num_q)
 		]

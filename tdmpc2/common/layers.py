@@ -4,28 +4,40 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import from_modules
 from copy import deepcopy
+from common.math import two_hot
 
 
 class MLPWithPrior(nn.Module):
 	"""
-	MLP with an optional frozen random prior for ensemble diversity.
+	MLP with an optional random prior for ensemble diversity.
 	
-	Combines a trainable main MLP with a frozen prior network. The prior output
-	is L2-normalized and scaled, then added to the main output. This encourages
-	diverse representations across ensemble members even when the main networks
-	would otherwise collapse to similar predictions (e.g., in sparse reward settings).
+	Combines a trainable main MLP with a prior network whose output is detached
+	(no gradient flow). This encourages diverse representations across ensemble
+	members even when the main networks would otherwise collapse to similar
+	predictions (e.g., in sparse reward settings).
 	
-	The prior_scale is dimension-aware: it controls the per-dimension perturbation
-	magnitude. With prior_scale=1.0, each output dimension gets ~1.0 perturbation.
+	Based on "Randomized Prior Functions for Deep Reinforcement Learning" (Osband et al.):
+	- Prior network uses same architecture as main network but with smaller hidden dims
+	- Initialized with Xavier/Glorot initialization (as per the paper)
+	- Output is detached (no gradient flow), scaled by prior_scale, and added to main output
+	
+	NOTE: Prior params are kept trainable (requires_grad=True) to avoid issues with
+	torch.compile + vmap. Gradients are blocked by detaching the output in forward().
 	
 	Args:
 		in_dim (int): Input dimension.
 		hidden_dims (list[int]): Hidden layer dimensions for main MLP.
 		out_dim (int): Output dimension.
 		prior_hidden_div (int): Divisor for prior hidden dim (prior_hidden = hidden_dim // div).
-		prior_scale (float): Per-dimension perturbation magnitude. 0 = no prior.
+		prior_scale (float): Scale factor for prior scalar value. 0 = no prior.
+		prior_logit_scale (float): Multiplier for prior two-hot logits (distributional mode only).
+			Main MLP outputs logits typically in [-5, +5], while two_hot outputs [0, 1].
+			This parameter scales the two-hot output to match main MLP magnitude.
 		act: Optional activation for output layer (e.g., SimNorm for dynamics).
 		dropout (float): Dropout probability for main MLP.
+		distributional (bool): If True, prior outputs a scalar that gets two-hot encoded.
+			This ensures the prior stays within the symlog bounds and is numerically stable.
+		cfg: Config object with num_bins, vmin, vmax for two_hot encoding (required if distributional=True).
 	"""
 	
 	def __init__(
@@ -35,42 +47,56 @@ class MLPWithPrior(nn.Module):
 		out_dim: int,
 		prior_hidden_div: int = 4,
 		prior_scale: float = 1.0,
+		prior_logit_scale: float = 5.0,
 		act=None,
 		dropout: float = 0.,
+		distributional: bool = False,
+		cfg=None,
 	):
 		super().__init__()
 		self.prior_scale = prior_scale
+		self.prior_logit_scale = prior_logit_scale
 		self.out_dim = out_dim
+		self.distributional = distributional
+		self.cfg = cfg
 		
 		# Main MLP (trainable)
 		self.main_mlp = mlp(in_dim, hidden_dims, out_dim, act=act, dropout=dropout)
 		
-		# Prior MLP (frozen) - only if prior_scale > 0
+		# Prior MLP - only if prior_scale > 0
+		# NOTE: We keep requires_grad=True (default) to avoid issues with torch.compile + vmap.
+		# Gradients are blocked by detaching the output in forward(), so prior params won't update.
 		if prior_scale > 0 and len(hidden_dims) > 0:
 			prior_hidden = max(hidden_dims[0] // prior_hidden_div, 8)  # min 8 to avoid degenerate priors
 			prior_dims = [prior_hidden] * len(hidden_dims)
+			# For distributional mode, prior outputs a scalar (1 dim) that gets two-hot encoded
+			prior_out_dim = 1 if distributional else out_dim
 			# Build prior MLP manually with ReLU activations (no LayerNorm)
 			prior_layers = []
-			dims = [in_dim] + prior_dims + [out_dim]
+			dims = [in_dim] + prior_dims + [prior_out_dim]
 			for i in range(len(dims) - 1):
 				prior_layers.append(nn.Linear(dims[i], dims[i+1]))
 				if i < len(dims) - 2:  # No activation on output
 					prior_layers.append(nn.ReLU())
 			self.prior_mlp = nn.Sequential(*prior_layers)
-			# Initialize with Kaiming (preserves variance through ReLU layers)
+			# Initialize with Xavier/Glorot (as per Osband et al. "Randomized Prior Functions")
+			# Xavier maintains variance ~1 through linear layers, suitable for networks
+			# that output logits (where we don't want variance explosion)
 			for m in self.prior_mlp.modules():
 				if isinstance(m, nn.Linear):
-					nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+					nn.init.xavier_normal_(m.weight)
 					nn.init.zeros_(m.bias)
-			# Freeze prior
-			for p in self.prior_mlp.parameters():
-				p.requires_grad_(False)
+			# DO NOT freeze with requires_grad_(False) - causes issues with torch.compile + vmap
+			# Instead, we detach the output in forward() to prevent gradient flow
 		else:
 			self.prior_mlp = None
 	
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""
-		Forward pass: main_mlp(x) + normalized_prior(x) * scale * sqrt(out_dim).
+		Forward pass: main_mlp(x) + detach(prior_mlp(x)) * prior_scale.
+		
+		For distributional mode:
+			main_mlp(x) + two_hot(detach(prior_mlp(x)) * prior_scale)
 		
 		Args:
 			x (Tensor[..., in_dim]): Input tensor.
@@ -80,43 +106,104 @@ class MLPWithPrior(nn.Module):
 		"""
 		out = self.main_mlp(x)  # float32[..., out_dim]
 		
-		if self.prior_scale > 0 and self.prior_mlp is not None:
-			prior_out = self.prior_mlp(x)  # float32[..., out_dim]
-			# L2 normalize, then scale by sqrt(out_dim) so prior_scale is per-dimension
-			prior_out = prior_out / (prior_out.norm(dim=-1, keepdim=True) + 1e-6)
-			prior_out = prior_out * (self.prior_scale * math.sqrt(self.out_dim))
-			out = out + prior_out
+		# Note: prior_mlp is None when prior_scale=0, so this branch is static
+		# and should be optimized away by torch.compile
+		if self.prior_mlp is not None:
+			# Compute prior output and detach to prevent gradient flow.
+			# This is the key: detach() blocks gradients so prior params won't be updated,
+			# but keeps requires_grad=True which plays nicely with torch.compile + vmap.
+			prior_out = self.prior_mlp(x).detach()  # float32[..., 1] if distributional else [..., out_dim]
+			
+			if self.distributional:
+				# Prior outputs scalar, scale it, then convert to two-hot distribution
+				# This ensures prior stays within symlog bounds [-10, 10] -> symexp ~[-22k, +22k]
+				prior_scalar = prior_out * self.prior_scale  # float32[..., 1]
+				# two_hot expects [B, 1], so flatten leading dims, apply, then reshape back
+				leading_shape = prior_scalar.shape[:-1]  # e.g., (B, T) or (B,)
+				prior_scalar_flat = prior_scalar.view(-1, 1)  # float32[N, 1]
+				prior_logits_flat = two_hot(prior_scalar_flat, self.cfg)  # float32[N, num_bins]
+				prior_logits = prior_logits_flat.view(*leading_shape, -1)  # float32[..., num_bins]
+				# Scale two_hot output to match main MLP logit magnitude
+				# two_hot outputs [0, 1], main MLP outputs ~[-5, +5], so we scale up
+				out = out + prior_logits * self.prior_logit_scale
+			else:
+				# Original mode: directly add scaled prior output
+				out = out + prior_out * self.prior_scale
 		
 		return out
 	
 	def __repr__(self):
 		prior_info = f", prior_scale={self.prior_scale}" if self.prior_scale > 0 else ""
-		return f"MLPWithPrior(main_mlp={self.main_mlp}{prior_info})"
+		dist_info = ", distributional=True" if self.distributional else ""
+		return f"MLPWithPrior(main_mlp={self.main_mlp}{prior_info}{dist_info})"
 
 
 class Ensemble(nn.Module):
 	"""
 	Vectorized ensemble of modules.
+	
+	Uses tensordict's from_modules for parameter storage (supporting tuple-indexing,
+	.data, .clone(), .lerp_() for EMA updates), but uses torch.func.functional_call
+	for the forward pass instead of to_module() mutation.
+	
+	This is more compatible with torch.compile because functional_call doesn't
+	mutate the module - it's a pure function that takes params as input.
+	
+	The previous approach used `with params.to_module(self.module)` which mutates
+	the module's parameters inside vmap. This can cause issues with torch.compile
+	because the compiler traces a static graph and mutation patterns are fragile.
+	
+	With functional_call:
+	- No mutation: params are passed explicitly to each forward call
+	- Compile-friendly: torch.func is designed for this pattern
+	- Same storage: TensorDictParams still handles param storage, indexing, EMA
 	"""
 
 	def __init__(self, modules, **kwargs):
 		super().__init__()
-		# combine_state_for_ensemble causes graph breaks
+		# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
 		self.params = from_modules(*modules, as_module=True)
-		with self.params[0].data.to("meta").to_module(modules[0]):
-			self.module = deepcopy(modules[0])
+		
+		# Create template module on meta device (no memory, just structure)
+		# IMPORTANT: Store via __dict__ to avoid registering as submodule.
+		# This prevents .to(device) from trying to move the meta tensor (which would fail).
+		template = deepcopy(modules[0])
+		template = template.to("meta")
+		self.__dict__["_module"] = template
+		
 		self._repr = str(modules[0])
 		self._n = len(modules)
 
 	def __len__(self):
 		return self._n
 
-	def _call(self, params, *args, **kwargs):
-		with params.to_module(self.module):
-			return self.module(*args, **kwargs)
+	@property
+	def module(self):
+		"""Template module (on meta device). Exposed for backward compatibility."""
+		return self._module
 
 	def forward(self, *args, **kwargs):
-		return torch.vmap(self._call, (0, None), randomness="different")(self.params, *args, **kwargs)
+		"""
+		Vectorized forward pass using functional_call.
+		
+		Instead of mutating self.module with to_module(), we use functional_call
+		which is a pure function: functional_call(module, params, args) runs the
+		module's forward with the given params without modifying the module.
+		"""
+		from torch.func import functional_call
+		
+		module = self._module  # Template module on meta device (not registered as submodule)
+		
+		def call_single(params_slice):
+			# params_slice is a TensorDict with params for one ensemble member
+			# Convert to flat dict format for functional_call: {"layer.weight": tensor, ...}
+			# flatten_keys(".") converts ("main_mlp", "0", "weight") -> "main_mlp.0.weight"
+			params_dict = dict(params_slice.flatten_keys(".").items())
+			# functional_call runs module.forward with the given params (no mutation)
+			return functional_call(module, params_dict, args, kwargs)
+		
+		# vmap over the first dimension of self.params (the ensemble dimension)
+		return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
 
 	def __repr__(self):
 		return f'Vectorized {len(self)}x ' + self._repr

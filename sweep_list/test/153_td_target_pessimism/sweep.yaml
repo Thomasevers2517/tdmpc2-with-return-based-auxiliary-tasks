@@ -8,37 +8,51 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 149: Prior Scale Ablation
+  # Sweep 153: TD Target Pessimism with Prior
   # 
-  # Goal: Find prior_scale that doesn't break dense reward
-  #       while potentially helping sparse reward tasks
+  # Goal: Test if slight pessimism in TD targets improves
+  #       learning by avoiding uncertain value estimates
+  # 
+  # Hypothesis: value_std hovers around 0.5, so:
+  #   - td_target_std_coef=0.1 → subtract 0.05 per step
+  #   - Over ~100 steps with γ≈0.99, cumulative effect is ~5 lower value
+  #   - This should lead to more conservative, stable learning
   # 
   # Sweep:
-  #   - prior_scale: [0, 0.01, 0.1, 0.5, 2.0]
-  #   - prior_hidden_div: [4, 16]
-  #   - tasks: quadruped-walk (dense), cartpole-swingup_sparse (sparse)
-  #   - 1 seed per config
+  #   - td_target_std_coef: [0, 0.1, 0.5] (neutral → slight pess → more pess)
+  #   - prior_scale: 1, prior_logit_scale: 1, prior_hidden_div: 16
+  #   - task: quadruped-walk only
+  #   - 8 seeds
   #
-  # 5 prior_scale × 2 prior_hidden_div × 2 tasks × 1 seed = 20 runs
+  # 3 td_target_std_coef × 8 seeds = 24 runs
   #############################################
 
   task:
     values:
       - quadruped-walk
-      # - cartpole-swingup_sparse
 
   seed:
-    values: [1]
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
 
   #############################################
-  # PRIOR SCALE SWEEP (main focus)
+  # TD TARGET PESSIMISM (main focus)
+  #############################################
+
+  td_target_std_coef:
+    values: [0, -0.1, -0.5]
+
+  #############################################
+  # PRIOR SETTINGS (fixed)
   #############################################
 
   prior_scale:
-    values: [0.00001, 1.0]
+    value: 1
+
+  prior_logit_scale:
+    value: 1
 
   prior_hidden_div:
-    values: [8, 16]
+    value: 16
 
   #############################################
   # CORRECT OPTIMISM SETTINGS (baseline)
@@ -46,8 +60,6 @@ parameters:
 
   value_std_coef_default:
     value: 1
-  td_target_std_coef:
-    values: [0]
   policy_value_std_coef:
     value: 0
   optimistic_policy_value_std_coef:
@@ -104,9 +116,9 @@ parameters:
   multi_gamma_loss_weight:
     value: 0.01
   utd_ratio:
-    value: 1
+    value: 4
   value_update_freq:
-    value: 1
+    value: 2
 
   #############################################
   # PLANNER
@@ -122,7 +134,10 @@ parameters:
   eval_mean_head_reduce:
     value: true
   compile:
-    value: false
+    value: true
+
+  dropout:
+    value: 0  # Disabled for compile + vmap + functional_call compatibility
 
   enable_wandb:
     value: true

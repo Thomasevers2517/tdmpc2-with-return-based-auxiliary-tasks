@@ -73,7 +73,7 @@ td_target_std_coef: pess
 # Local vs global TD bootstrapping:
 # - false (global): reduce across ALL heads (Ve × R × H), all value heads get same target
 # - true (local): reduce across (R × H) only, each value head bootstraps itself
-local_td_bootstrap: false
+local_td_bootstrap: true
 
 # Whether to use all dynamics heads or single random head for TD target imagination
 # When false, uses single random head (cheaper but H-std is 0)
@@ -122,8 +122,9 @@ planner_num_dynamics_heads: 4
 # Prior is L2-normalized and added to main network output.
 # prior_scale is dimension-aware: 1.0 means ~1.0 perturbation per output dimension.
 # Typical logit range is ~[-3, 3], so prior_scale in {0.1, 1.0, 3.0} is reasonable.
-prior_hidden_div: 4                # prior_hidden_dim = network_hidden_dim // div
-prior_scale: 1.0                   # Per-dimension perturbation magnitude. 0 = no prior.
+prior_hidden_div: 16                # prior_hidden_dim = network_hidden_dim // div
+prior_scale: 1.0                   # Scalar value the prior network targets (symlog scale). 0 = no prior.
+prior_logit_scale: 1.0             # Multiplier for prior two-hot logits (controls influence strength on output distribution).
 dynamics_dropout: 0.0              # Dropout rate for dynamics head (applied to first hidden layer)
 dynamics_num_layers: 2             # Number of hidden layers in dynamics head MLP
 
@@ -256,14 +257,14 @@ vmax: +10
 
 # architecture
 model_size: ???
-num_enc_layers: 3 # 3 seemed good on easy, but breaks dog if reward head size is not reduced.
+num_enc_layers: 2 
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
 num_q: 8
-dropout: 0.01
+dropout: 0  # Disabled for compile + vmap + functional_call compatibility
 encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (train + eval mode for stable targets)
 reward_dropout_enabled: false  # Whether to apply dropout to reward heads (uses same dropout rate as value heads)
 simnorm_dim: 8
