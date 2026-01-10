@@ -64,11 +64,23 @@ num_reward_heads: 2
 value_std_coef_default: 1.0
 
 # TD target: coefficient for pessimism/optimism in TD target computation
-# If negative: pessimistic (mean - |c|*std, min over dynamics heads)
-# If zero: neutral (mean only, mean over dynamics heads)
-# If positive: optimistic (mean + c*std, max over dynamics heads)
+# Controls reward uncertainty adjustment: TD = μ + std_coef * σ
+# Negative: pessimistic about reward uncertainty (subtract std)
+# Positive: optimistic about reward uncertainty (add std)
+# Zero: neutral (mean only)
 # Can also use "pess" or "opt" strings.
 td_target_std_coef: pess
+
+# How to reduce over dynamics heads H in TD target computation.
+# Options:
+#   - "from_std_coef": use sign of td_target_std_coef (default, legacy)
+#       > 0: max over H, < 0: min over H, = 0: mean over H
+#   - "min": always min over dynamics heads (pessimistic about dynamics)
+#   - "max": always max over dynamics heads (optimistic about dynamics)
+#   - "mean": always mean over dynamics heads (neutral about dynamics)
+# Use case: td_target_std_coef=-1 (pessimistic about reward) with
+# td_target_dynamics_reduction="mean" to NOT be pessimistic about dynamics.
+td_target_dynamics_reduction: from_std_coef
 
 # Local vs global TD bootstrapping:
 # - false (global): reduce across ALL heads (Ve × R × H), all value heads get same target
@@ -193,7 +205,7 @@ buffer_size: 1000_000
 # Hot buffer (recent transitions) for mixed sampling
 hot_buffer_enabled: false         # When true, also store recent transitions in a small buffer
 hot_buffer_ratio: 0.01           # Fraction of each training batch drawn from the hot buffer (e.g., 0.25 for 25%)
-hot_buffer_size: 5               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
+hot_buffer_size: 50               # Capacity in transitions for the hot buffer (e.g., 500). Must be >0 when enabled
 
 pin_memory: true
 prefetch: 1
@@ -234,7 +246,7 @@ entropy_action_dim_power: 1.0
 # extreme/saturated actions (e.g., dog-run) by not penalizing confidence near boundaries.
 jacobian_correction_scale: 1.0
 end_dynamic_entropy_ratio: 1
-start_dynamic_entropy_ratio: 0.5
+start_dynamic_entropy_ratio: 0.5 # if set to 0.8, at 80% of training steps the entropy coeff will start to decay linearly.
 dynamic_entropy_schedule : exponential  # linear | exponential
 
 hinge_power: 4

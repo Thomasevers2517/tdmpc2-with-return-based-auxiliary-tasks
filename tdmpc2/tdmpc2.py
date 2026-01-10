@@ -701,15 +701,17 @@ class TDMPC2(torch.nn.Module):
 			td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
 			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp  # float32[Ve, T, H, B, 1]
 			
-			# Reduce over dynamics heads H based on sign of std_coef
-			if std_coef > 0:
-				# Optimistic: max over H
+			# Determine dynamics reduction method
+			dyn_reduction = self.cfg.td_target_dynamics_reduction
+			if dyn_reduction == "from_std_coef":
+				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+			
+			# Reduce over dynamics heads H
+			if dyn_reduction == "max":
 				td_targets, _ = td_per_ve_h.max(dim=2)  # float32[Ve, T, B, 1]
-			elif std_coef < 0:
-				# Pessimistic: min over H
+			elif dyn_reduction == "min":
 				td_targets, _ = td_per_ve_h.min(dim=2)  # float32[Ve, T, B, 1]
-			else:
-				# Neutral: mean over H
+			else:  # "mean"
 				td_targets = td_per_ve_h.mean(dim=2)  # float32[Ve, T, B, 1]
 			
 			# For logging
@@ -737,15 +739,17 @@ class TDMPC2(torch.nn.Module):
 			# TD_h = μ_h + std_coef * σ_h per dynamics head
 			td_per_h = td_mean_per_h + std_coef * td_std_per_h  # float32[T, H, B, 1]
 			
-			# Reduce over dynamics heads H based on sign of std_coef
-			if std_coef > 0:
-				# Optimistic: max over H
+			# Determine dynamics reduction method
+			dyn_reduction = self.cfg.td_target_dynamics_reduction
+			if dyn_reduction == "from_std_coef":
+				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+			
+			# Reduce over dynamics heads H
+			if dyn_reduction == "max":
 				td_reduced, _ = td_per_h.max(dim=1)  # float32[T, B, 1]
-			elif std_coef < 0:
-				# Pessimistic: min over H
+			elif dyn_reduction == "min":
 				td_reduced, _ = td_per_h.min(dim=1)  # float32[T, B, 1]
-			else:
-				# Neutral: mean over H
+			else:  # "mean"
 				td_reduced = td_per_h.mean(dim=1)  # float32[T, B, 1]
 			
 			# All Ve heads get same target
@@ -822,15 +826,17 @@ class TDMPC2(torch.nn.Module):
 		# TD_{g,h} = μ_{g,h} + std_coef * σ_h
 		td_per_g_h = td_mean_per_g_h + std_coef * td_std_exp  # float32[G_aux, T, H, B, 1]
 		
-		# Reduce over dynamics heads H based on sign of std_coef
-		if std_coef > 0:
-			# Optimistic: max over H
+		# Determine dynamics reduction method
+		dyn_reduction = self.cfg.td_target_dynamics_reduction
+		if dyn_reduction == "from_std_coef":
+			dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+		
+		# Reduce over dynamics heads H
+		if dyn_reduction == "max":
 			td_targets_aux, _ = td_per_g_h.max(dim=2)  # float32[G_aux, T, B, 1]
-		elif std_coef < 0:
-			# Pessimistic: min over H
+		elif dyn_reduction == "min":
 			td_targets_aux, _ = td_per_g_h.min(dim=2)  # float32[G_aux, T, B, 1]
-		else:
-			# Neutral: mean over H
+		else:  # "mean"
 			td_targets_aux = td_per_g_h.mean(dim=2)  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux

@@ -1,7 +1,7 @@
 #! /bin/bash
 
 #SBATCH -p cbuild
-#SBATCH -t 04:00:00
+#SBATCH -t 24:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=t.evers-2@student.tudelft.nl
 

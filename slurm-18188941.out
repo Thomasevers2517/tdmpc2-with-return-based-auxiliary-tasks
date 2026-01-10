@@ -1,3 +1,0 @@
-srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
-[2026-01-09T02:07:20.021] error: *** JOB 18188941 ON srv4 CANCELLED AT 2026-01-09T02:07:20 DUE TO TIME LIMIT ***
-[2026-01-09T02:07:20.022] error: *** STEP 18188941.0 ON srv4 CANCELLED AT 2026-01-09T02:07:20 DUE TO TIME LIMIT ***
