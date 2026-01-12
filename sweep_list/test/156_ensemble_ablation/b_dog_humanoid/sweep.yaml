@@ -8,74 +8,77 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 155e: TD target with mean dynamics reduction
+  # Sweep 156b: Dog-run + humanoid-walk planner optimism ablation
   # 
-  # Goal: Test pessimism about reward uncertainty while being
-  #       neutral about dynamics (mean over dynamics heads)
+  # Goal: Test latest config on harder DMC tasks,
+  # ablate planner_value_std_coef_train (0 vs 0.3).
   # 
-  # Key changes:
-  #   - td_target_dynamics_reduction: mean (not from_std_coef)
-  #   - td_target_std_coef: 0, -0.3, -1 (reward pessimism sweep)
+  # Key sweep:
+  #   - task: dog-run, humanoid-walk
+  #   - planner_value_std_coef_train: 0, 0.3
   # 
-  # Tasks: quadruped-walk, hopper-hop
-  # Seeds: 5
-  # Total: 2 tasks × 2 std_coef × 5 seeds = 20 runs
+  # Seeds: 2
+  # Total: 2 tasks × 2 values × 2 seeds = 8 runs
   #############################################
 
   task:
     values:
-      - quadruped-walk
-      - hopper-hop
+      - dog-run
+      - humanoid-walk
 
   seed:
-    values: [1, 2, 3, 4, 5]
+    values: [1, 2]
 
   #############################################
-  # TD TARGET SETTINGS - KEY CHANGES
+  # PLANNER STD COEF - KEY SWEEP
+  #############################################
+
+  planner_value_std_coef_train:
+    values: [0, 0.3]
+  planner_value_std_coef_eval:
+    value: -1
+
+  #############################################
+  # TD TARGET SETTINGS (neutral)
   #############################################
 
   td_target_dynamics_reduction:
     value: mean
   td_target_std_coef:
-    values: [0, -1]
+    value: 0
 
   #############################################
-  # ENTROPY SETTINGS (default)
+  # POLICY STD COEF SETTINGS
   #############################################
 
-  start_entropy_coeff:
-    value: 0.00003
-  start_dynamic_entropy_ratio:
-    value: 0.5
-  entropy_action_dim_power:
-    value: 1.0
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 1
 
   #############################################
   # PRIOR SETTINGS
   #############################################
 
   prior_scale:
-    value: 1
+    value: 0.1
   prior_logit_scale:
     value: 1
   prior_hidden_div:
     value: 16
 
   #############################################
-  # CORRECT OPTIMISM SETTINGS
+  # ENTROPY SETTINGS (no decay)
   #############################################
 
-  value_std_coef_default:
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
     value: 1
-  policy_value_std_coef:
-    value: 0
-  optimistic_policy_value_std_coef:
+  end_dynamic_entropy_ratio:
     value: 1
-  planner_value_std_coef_train:
-    value: opt
-  planner_value_std_coef_eval:
-    value: pess
-
+  entropy_action_dim_power:
+    value: 1.0
   jacobian_correction_scale:
     value: 1
   hinge_coef:
@@ -97,17 +100,19 @@ parameters:
     value: 2
   planner_num_dynamics_heads:
     value: 4
+  enc_lr_step_ratio:
+    value: 0.5
 
   #############################################
   # TRAINING
   #############################################
 
   steps:
-    value: 100000
+    value: 1000000
   eval_freq:
     value: 10000
   multi_gamma_loss_weight:
-    value: 0.01
+    value: 0
   utd_ratio:
     value: 4
   value_update_freq:
@@ -120,7 +125,7 @@ parameters:
   #############################################
 
   iterations:
-    value: 9
+    value: 6
   num_samples:
     value: 1024
   planner_use_all_heads_eval:

@@ -78,7 +78,7 @@ def compute_values(
     # Per dynamics head h, compute reward mean and std across R reward heads at each timestep
     # r_all: [R, H, E, T]
     r_mean_per_h = r_all.mean(dim=0)  # float32[H, E, T] - mean over R
-    r_std_per_h = r_all.std(dim=0, unbiased=True)  # float32[H, E, T] - std over R
+    r_std_per_h = r_all.std(dim=0, unbiased=(R > 1))  # float32[H, E, T] - std over R
 
     # Get V values for ALL Ve ensemble heads at terminal state
     z_last = latents_all[:, :, -1, :]                       # float32[H, E, L]
@@ -92,7 +92,7 @@ def compute_values(
     # Per dynamics head h, compute value mean and std across Ve value heads
     # v_all: [Ve, H, E]
     v_mean_per_h = v_all.mean(dim=0)  # float32[H, E] - mean over Ve
-    v_std_per_h = v_all.std(dim=0, unbiased=True)  # float32[H, E] - std over Ve
+    v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, E] - std over Ve
     
     # Compute discounted return mean per dynamics head
     # μ_h = sum_t(γ^(t-1) * r_mean_{h,t}) + γ^T * v_mean_h
@@ -123,7 +123,7 @@ def compute_values(
     values_scaled = values_unscaled  # Same for now (scaling handled elsewhere)
     
     # Value disagreement: std of Q_h across dynamics heads (after std_coef adjustment)
-    value_disagreement = q_per_h.std(dim=0, unbiased=True)  # float32[E]
+    value_disagreement = q_per_h.std(dim=0, unbiased=(H > 1))  # float32[E]
     
     # Return the aggregated std (mean over dynamics heads) for logging
     values_std = total_std_per_h.mean(dim=0)  # float32[E]

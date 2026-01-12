@@ -502,11 +502,11 @@ class TDMPC2(torch.nn.Module):
 			
 			# Reward mean and std across R reward heads (same for all dynamics heads)
 			reward_mean = reward_all.mean(dim=0)  # float32[T*B*N, 1]
-			reward_std = reward_all.std(dim=0, unbiased=True)  # float32[T*B*N, 1]
+			reward_std = reward_all.std(dim=0, unbiased=(R > 1))  # float32[T*B*N, 1]
 			
 			# Value mean and std across Ve value heads, per dynamics head h
 			v_mean_per_h = v_next_all.mean(dim=0)  # float32[H, T*B*N, 1]
-			v_std_per_h = v_next_all.std(dim=0, unbiased=True)  # float32[H, T*B*N, 1]
+			v_std_per_h = v_next_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
 			
 			# Q_h = (r_mean + γ * v_mean_h) + std_coef * (r_std + γ * v_std_h)
 			# Total mean per dynamics head: μ_h = r_mean + γ * v_mean_h
@@ -532,7 +532,7 @@ class TDMPC2(torch.nn.Module):
 			q_estimate = q_estimate_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
 			
 			# For logging: std across dynamics heads (disagreement)
-			q_std = q_per_h.std(dim=0, unbiased=True)  # float32[T*B*N, 1]
+			q_std = q_per_h.std(dim=0, unbiased=(H > 1))  # float32[T*B*N, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
@@ -681,7 +681,7 @@ class TDMPC2(torch.nn.Module):
 			
 			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
 			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
+			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
 			
 			# v_values: [Ve, T, H, B, 1] - use directly (each Ve head bootstraps itself)
 			# TD_h = r_mean_h + γ * (1-term) * v_ve_h  for each (Ve, H)
@@ -724,11 +724,11 @@ class TDMPC2(torch.nn.Module):
 			
 			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
 			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
+			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
 			
 			# v_values: [Ve, T, H, B, 1] - mean and std across Ve per (H, T, B)
 			v_mean_per_h = v_values.mean(dim=0)  # float32[T, H, B, 1]
-			v_std_per_h = v_values.std(dim=0, unbiased=True)  # float32[T, H, B, 1]
+			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))  # float32[T, H, B, 1]
 			
 			# TD mean per H: μ_h = r_mean_h + γ * (1-term) * v_mean_h
 			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
@@ -806,7 +806,7 @@ class TDMPC2(torch.nn.Module):
 		# CORRECT OPTIMISM: Per dynamics head h
 		# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
 		r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-		r_std_per_h = reward.std(dim=1, unbiased=True)  # float32[T, H, B, 1]
+		r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
 		
 		# v_values: [G_aux, T, H, B, 1] - already mean over 2 outputs per gamma
 		# No value std for aux (single value per gamma)

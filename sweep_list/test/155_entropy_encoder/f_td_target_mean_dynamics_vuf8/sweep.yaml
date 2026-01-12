@@ -19,18 +19,18 @@ parameters:
   #   - td_target_std_coef: 0, -0.3, -1 (reward pessimism sweep)
   #   - value_update_freq: 8 (vs default 2)
   # 
-  # Tasks: acrobot-swingup, hopper-hop
-  # Seeds: 3
-  # Total: 2 tasks × 3 std_coef × 3 seeds = 18 runs
+  # Tasks: quadruped-walk, hopper-hop
+  # Seeds: 5
+  # Total: 2 tasks × 2 std_coef × 5 seeds = 20 runs
   #############################################
 
   task:
     values:
-      - acrobot-swingup
+      - quadruped-walk
       - hopper-hop
 
   seed:
-    values: [1, 2, 3]
+    values: [1, 2, 3, 4, 5]
 
   #############################################
   # TD TARGET SETTINGS - KEY CHANGES
@@ -39,7 +39,7 @@ parameters:
   td_target_dynamics_reduction:
     value: mean
   td_target_std_coef:
-    values: [0, -0.3, -1]
+    values: [0, -0.3]
 
   #############################################
   # VALUE UPDATE FREQ - KEY CHANGE

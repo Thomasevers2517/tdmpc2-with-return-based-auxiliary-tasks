@@ -160,14 +160,7 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	if not hasattr(cfg, 'num_reward_heads'):
 		cfg.num_reward_heads = 1
 
-	# Minimum head counts for unbiased std estimation
-	# With unbiased=True, std divides by (n-1), so n must be >= 2
-	assert cfg.num_reward_heads >= 2, (
-		f"num_reward_heads must be >= 2 for unbiased std estimation, got {cfg.num_reward_heads}"
-	)
-	assert cfg.num_q >= 2, (
-		f"num_q (value heads) must be >= 2 for unbiased std estimation, got {cfg.num_q}"
-	)
+	# Note: std estimation is now adaptive - uses unbiased=True when n>=2, biased otherwise
 
 	# ----------------------------------------------------------------------
 	# Actor-critic source constraints (only 'imagine' mode supported)

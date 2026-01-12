@@ -8,36 +8,47 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 155e: TD target with mean dynamics reduction
+  # Sweep 155g: Minimum prior_scale for sparse reward tasks
   # 
-  # Goal: Test pessimism about reward uncertainty while being
-  #       neutral about dynamics (mean over dynamics heads)
+  # Goal: Find how small prior_scale can be while still preventing
+  #       reward collapse on sparse reward tasks. The prior network
+  #       prevents the model from just outputting zeros when no
+  #       rewards are seen early in training, but it may hurt
+  #       performance on dense reward tasks.
   # 
-  # Key changes:
-  #   - td_target_dynamics_reduction: mean (not from_std_coef)
-  #   - td_target_std_coef: 0, -0.3, -1 (reward pessimism sweep)
+  # Key sweep:
+  #   - prior_scale: 0, 0.1, 0.3, 1
   # 
-  # Tasks: quadruped-walk, hopper-hop
-  # Seeds: 5
-  # Total: 2 tasks × 2 std_coef × 5 seeds = 20 runs
+  # Task: cartpole-swingup-sparse (needs prior to avoid reward collapse)
+  # Seeds: 3
+  # Total: 1 task × 4 prior_scale × 3 seeds = 12 runs
   #############################################
 
   task:
-    values:
-      - quadruped-walk
-      - hopper-hop
+    value: cartpole-swingup-sparse
 
   seed:
-    values: [1, 2, 3, 4, 5]
+    values: [1, 2, 3]
 
   #############################################
-  # TD TARGET SETTINGS - KEY CHANGES
+  # PRIOR SETTINGS - KEY SWEEP
+  #############################################
+
+  prior_scale:
+    values: [0, 0.1, 0.3, 1]
+  prior_logit_scale:
+    value: 1
+  prior_hidden_div:
+    value: 16
+
+  #############################################
+  # TD TARGET SETTINGS
   #############################################
 
   td_target_dynamics_reduction:
     value: mean
   td_target_std_coef:
-    values: [0, -1]
+    value: 0
 
   #############################################
   # ENTROPY SETTINGS (default)
@@ -49,17 +60,6 @@ parameters:
     value: 0.5
   entropy_action_dim_power:
     value: 1.0
-
-  #############################################
-  # PRIOR SETTINGS
-  #############################################
-
-  prior_scale:
-    value: 1
-  prior_logit_scale:
-    value: 1
-  prior_hidden_div:
-    value: 16
 
   #############################################
   # CORRECT OPTIMISM SETTINGS
