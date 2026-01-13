@@ -175,9 +175,9 @@ class TDMPC2(torch.nn.Module):
 			obs_dim = list(self.cfg.obs_shape.values())[0][0]  # Get first obs modality dim
 			knn_entropy_dim = int(getattr(self.cfg, 'knn_entropy_dim', 128))
 			self._knn_encoder = torch.nn.Sequential(
-				torch.nn.Linear(obs_dim, 256),
-				torch.nn.Tanh(),
-				torch.nn.Linear(256, knn_entropy_dim),
+				torch.nn.Linear(obs_dim, 64),
+				torch.nn.ReLU(),
+				torch.nn.Linear(64, knn_entropy_dim),
 			).to(self.device)
 			# Freeze encoder
 			for p in self._knn_encoder.parameters():
@@ -226,8 +226,8 @@ class TDMPC2(torch.nn.Module):
 			self.optim_step = optim_step
 			self.pi_optim_step = pi_optim_step
 
-
-			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=True)
+			# Use dynamic=False to avoid symbolic shapes which conflict with vmap in reward/V heads
+			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=False)
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses

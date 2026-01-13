@@ -8,42 +8,43 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 159b: Dog-run with global TD bootstrap + pessimism
+  # Sweep 160: Dog bootstrap × dynamics reduction sweep
   # 
-  # Goal: Test if local TD bootstrap is limiting signal propagation.
-  # Use global bootstrap (all value heads share same target) with
-  # pessimistic std_coef.
+  # Goal: Sweep local_td_bootstrap and td_target_dynamics_reduction
+  # on dog tasks with 4 reward heads to find what helps performance.
   # 
-  # Key settings:
-  #   - local_td_bootstrap: false (global)
-  #   - td_target_std_coef: -1 (pessimistic)
+  # Key sweeps:
+  #   - local_td_bootstrap: [false, true]
+  #   - td_target_dynamics_reduction: [mean, min]
+  #   - td_target_std_coef: -1 (fixed, pessimistic)
+  #   - num_reward_heads: 4
   # 
-  # Task: dog-run
+  # Tasks: dog-run, dog-walk
   # Seeds: 2
-  # Total: 1 task × 2 seeds = 2 runs
+  # Total: 2 tasks × 2 bootstrap × 2 reduction × 2 seeds = 16 runs
   #############################################
 
   task:
-    value: dog-run
+    values: [dog-run, dog-walk]
 
   seed:
     values: [1, 2]
 
   #############################################
-  # TD BOOTSTRAP - KEY SETTING
+  # TD BOOTSTRAP - SWEEP
   #############################################
 
   local_td_bootstrap:
-    value: false
-  td_target_std_coef:
-    value: -1
+    values: [false, true]
 
   #############################################
-  # TD TARGET SETTINGS
+  # TD TARGET SETTINGS - SWEEP REDUCTION
   #############################################
 
   td_target_dynamics_reduction:
-    value: mean
+    values: [mean, min]
+  td_target_std_coef:
+    value: -1
 
   #############################################
   # PLANNER STD COEF SETTINGS
@@ -94,7 +95,7 @@ parameters:
     value: true
 
   #############################################
-  # ARCHITECTURE
+  # ARCHITECTURE - 4 REWARD HEADS
   #############################################
 
   num_enc_layers:
@@ -104,7 +105,7 @@ parameters:
   num_q:
     value: 8
   num_reward_heads:
-    value: 2
+    value: 4
   planner_num_dynamics_heads:
     value: 4
   enc_lr_step_ratio:
