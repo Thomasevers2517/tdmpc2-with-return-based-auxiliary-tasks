@@ -287,7 +287,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default'):
+	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default', enable_detailed_logging: bool = False):
 		"""Select an action.
 
 		If `mpc=True`, uses modular `Planner` over latent space; else falls back to single policy prior.
@@ -300,6 +300,8 @@ class TDMPC2(torch.nn.Module):
 			eval_head_reduce (str): Head reduction mode for eval ('default', 'mean').
 				'default' uses planner_value_std_coef_eval (typically pessimistic).
 				'mean' uses value_std_coef=0 for mean-only reduction.
+			enable_detailed_logging (bool): Whether to collect detailed planner info.
+				Caller should compute this outside act() based on step to avoid graph breaks.
 
 		Returns:
 			Tensor: Action.
@@ -319,13 +321,6 @@ class TDMPC2(torch.nn.Module):
 				# Convert eval_head_reduce to value_std_coef_override
 				# 'default' -> None (use config), 'mean' -> 0.0 (mean-only)
 				value_std_coef_override = 0.0 if eval_head_reduce == 'mean' else None
-				
-				# Determine if detailed logging is enabled for this step
-				enable_detailed_logging = (
-					self.cfg.log_detail_freq > 0 and
-					(self._step is not None) and
-					(self._step % self.cfg.log_detail_freq == 0)
-				)
 				
 				# Planner now returns batch dimension: action [B, A], mean [B, T, A], std [B, T, A]
 				# For acting (B=1), squeeze the batch dim

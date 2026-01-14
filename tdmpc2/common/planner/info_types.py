@@ -103,6 +103,8 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         latent_disagreements_all: Optional[torch.Tensor]  # float32[I, E]
         value_disagreements_all: Optional[torch.Tensor]  # float32[I, E]
         raw_scores: float32[I, E]
+        mean_all: float32[I, T, A] - Distribution mean per iteration
+        std_all: float32[I, T, A] - Distribution std per iteration
     """
     actions_all: torch.Tensor
     latents_all: torch.Tensor
@@ -111,6 +113,8 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     latent_disagreements_all: Optional[torch.Tensor]
     value_disagreements_all: Optional[torch.Tensor]
     raw_scores: torch.Tensor
+    mean_all: torch.Tensor  # [I, T, A] - Distribution mean per iteration
+    std_all: torch.Tensor   # [I, T, A] - Distribution std per iteration
 
     # Analysis context (advanced-only)
     action_seq_chosen: torch.Tensor  # (T,A)
@@ -176,6 +180,9 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         by `raw_scores`. For each selected candidate, print value, disagreement (if any),
         weighted disagreement, total score, and a slice of its action sequence limited to
         the first `num_action` action dimensions.
+        
+        Also shows the distribution mean and std for the first `num_action` action dims
+        at each timestep.
         """
         lines = []
         I = self.actions_all.shape[0]
@@ -183,6 +190,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         T, A = self.actions_all.shape[2], self.actions_all.shape[3]
         has_latent_dis = (self.latent_disagreements_all is not None)
         has_val_dis = (self.value_disagreements_all is not None)
+        num_action_show = min(num_action, A)
 
         def _fmt_vec(x: torch.Tensor) -> str:
             # Small vector formatter for action slices
@@ -190,6 +198,17 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
 
         for i in range(I):
             lines.append(f"Iteration {i} | candidates={E}")
+            
+            # Show distribution mean/std for first num_action dims at each timestep
+            mean_i = self.mean_all[i]  # [T, A]
+            std_i = self.std_all[i]    # [T, A]
+            dist_parts = []
+            for t in range(T):
+                m_slice = mean_i[t, :num_action_show]
+                s_slice = std_i[t, :num_action_show]
+                dist_parts.append(f"t{t}: μ=[{_fmt_vec(m_slice)}] σ=[{_fmt_vec(s_slice)}]")
+            lines.append(f"  dist: {' | '.join(dist_parts)}")
+            
             scores_i = self.raw_scores[i]            # (E,)
             vals_i = self.values_all_scaled[i]       # (E,)
             latent_dis_i = self.latent_disagreements_all[i] if has_latent_dis else None  # (E,)

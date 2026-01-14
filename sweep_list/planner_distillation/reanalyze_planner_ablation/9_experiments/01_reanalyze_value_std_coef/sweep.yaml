@@ -8,39 +8,38 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep: Optimistic Entropy Multiplier (Replicate Sweep 6 Setup)
+  # Sweep 9.1: Reanalyze Value Std Coef
   # 
-  # Goal: Keep sweep 6 config exactly, only sweep optimistic_entropy_mult.
-  #       Sweep 6 showed high entropy helps - now test if optimistic mult matters.
+  # Goal: Test pessimistic vs neutral reanalyze policy targets
+  #       reanalyze_value_std_coef=0 (neutral) vs -1 (pessimistic)
   # 
-  # Key sweeps:
-  #   - optimistic_entropy_mult: [3, 10]
-  # 
-  # Fixed (matching sweep 6):
-  #   - start_entropy_coeff: 3e-3
-  #   - value_update_freq: 8
-  #   - num_samples: 1024, num_pi_trajs: 512 (high policy seeding)
-  #   - reanalyze_batch_size: 64
-  # 
-  # Tasks: quadruped-walk, dog-stand
+  # Tasks: dog-stand, quadruped-walk
   # Seeds: 2
-  # Total: 2 mult × 2 tasks × 2 seeds = 8 runs
+  # Steps: 100k
+  # Total: 2 coefs × 2 tasks × 2 seeds = 8 runs
   #############################################
 
   task:
-    values: [quadruped-walk, dog-stand]
+    values: [dog-stand, quadruped-walk]
 
   seed:
     values: [1, 2]
 
   #############################################
-  # ENTROPY SETTINGS - SWEEP
+  # SWEEP PARAMETER
+  #############################################
+
+  reanalyze_value_std_coef:
+    values: [0, -1]
+
+  #############################################
+  # ENTROPY SETTINGS (default)
   #############################################
 
   start_entropy_coeff:
     value: 0.003
   optimistic_entropy_mult:
-    values: [3, 10]
+    value: 3
   start_dynamic_entropy_ratio:
     value: 1
   end_dynamic_entropy_ratio:
@@ -53,7 +52,7 @@ parameters:
     value: 0
 
   #############################################
-  # PLANNER - SAME AS SWEEP 6 (high policy seeding)
+  # PLANNER
   #############################################
 
   num_samples:
@@ -72,7 +71,7 @@ parameters:
   reanalyze_interval:
     value: 10
   reanalyze_batch_size:
-    value: 64
+    value: 128
   reanalyze_horizon:
     value: 3
   reanalyze_iterations:
@@ -118,26 +117,6 @@ parameters:
     value: true
 
   #############################################
-  # POLICY STD COEF SETTINGS
-  #############################################
-
-  policy_value_std_coef:
-    value: 0
-  optimistic_policy_value_std_coef:
-    value: 1
-
-  #############################################
-  # PRIOR SETTINGS
-  #############################################
-
-  prior_scale:
-    value: 0.1
-  prior_logit_scale:
-    value: 1
-  prior_hidden_div:
-    value: 16
-
-  #############################################
   # ARCHITECTURE
   #############################################
 
@@ -146,11 +125,9 @@ parameters:
   num_value_layers:
     value: 2
   num_q:
-    value: 2
+    value: 4
   num_reward_heads:
     value: 2
-  enc_lr_step_ratio:
-    value: 0.5
   planner_num_dynamics_heads:
     value: 2
 
@@ -162,12 +139,10 @@ parameters:
     value: 100000
   eval_freq:
     value: 10000
-  multi_gamma_loss_weight:
-    value: 0
   utd_ratio:
     value: 4
   value_update_freq:
-    value: 1
+    value: 2
   pi_update_freq:
     value: 1
 
@@ -175,12 +150,8 @@ parameters:
   # LOGGING
   #############################################
 
-  eval_mean_head_reduce:
-    value: false
   compile:
     value: true
-  dropout:
-    value: 0
   enable_wandb:
     value: true
   wandb_project:

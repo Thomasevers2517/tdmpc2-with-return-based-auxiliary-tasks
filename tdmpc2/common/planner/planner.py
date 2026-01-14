@@ -202,7 +202,8 @@ class Planner(torch.nn.Module):
             )
 
         # Containers for per-iteration histories (for advanced logging, only for B=1)
-        enable_detailed_logging = (B == 1)
+        # Only collect history when explicitly requested AND batch size is 1
+        enable_detailed_logging = enable_detailed_logging and (B == 1)
         actions_hist = [] if enable_detailed_logging else None
         latents_hist = [] if enable_detailed_logging else None
         values_unscaled_hist = [] if enable_detailed_logging else None
@@ -210,6 +211,8 @@ class Planner(torch.nn.Module):
         latent_disagreement_hist = [] if enable_detailed_logging else None
         value_disagreement_hist = [] if enable_detailed_logging else None
         scores_hist = [] if enable_detailed_logging else None
+        mean_hist = [] if enable_detailed_logging else None  # Track mean per iteration
+        std_hist = [] if enable_detailed_logging else None   # Track std per iteration
 
         # Iterative refinement
         for it in range(iterations):
@@ -316,6 +319,8 @@ class Planner(torch.nn.Module):
                 values_unscaled_hist.append(vals_unscaled.detach()) # [1, E]
                 values_scaled_hist.append(vals_scaled.detach())     # [1, E]
                 scores_hist.append(scores.detach())                 # [1, E]
+                mean_hist.append(mean.detach())                     # [1, T, A]
+                std_hist.append(std.detach())                       # [1, T, A]
                 if latent_dis is not None:
                     latent_disagreement_hist.append(latent_dis.detach())  # [1, E]
                 if val_dis is not None:
@@ -423,6 +428,8 @@ class Planner(torch.nn.Module):
             values_all_unscaled = torch.stack(values_unscaled_hist, dim=0).squeeze(1)  # [I, E]
             values_all_scaled = torch.stack(values_scaled_hist, dim=0).squeeze(1)      # [I, E]
             raw_scores = torch.stack(scores_hist, dim=0).squeeze(1)                  # [I, E]
+            mean_all = torch.stack(mean_hist, dim=0).squeeze(1)                      # [I, T, A]
+            std_all = torch.stack(std_hist, dim=0).squeeze(1)                        # [I, T, A]
             latent_disagreements_all = torch.stack(latent_disagreement_hist, dim=0).squeeze(1) if len(latent_disagreement_hist) > 0 else None
             value_disagreements_all = torch.stack(value_disagreement_hist, dim=0).squeeze(1) if len(value_disagreement_hist) > 0 else None
 
@@ -435,6 +442,8 @@ class Planner(torch.nn.Module):
                 latent_disagreements_all=latent_disagreements_all,
                 value_disagreements_all=value_disagreements_all,
                 raw_scores=raw_scores,
+                mean_all=mean_all,
+                std_all=std_all,
                 action_seq_chosen=chosen_seq[0].detach(),  # [T, A]
                 action_noise=(noise_vec_first[0].detach() if noise_vec_first is not None else None),
                 std_first_action=std_first[0].detach(),
