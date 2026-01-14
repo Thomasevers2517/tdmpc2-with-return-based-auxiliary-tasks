@@ -5,8 +5,11 @@ from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
-def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False, discount: float = 0.99):
+def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False, discount: torch.Tensor = None):
     """Core kernel to roll out a single noisy sequence and score it.
+
+    Args:
+        discount: float32[] scalar tensor on device.
 
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
              value_disagreement: Tensor[1], score: Tensor[1]).
@@ -120,7 +123,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     value_std_coef: float
     T: int
     use_ema_value: bool = False  # Whether to use EMA target network for V in planning
-    discount: float = 0.99  # Discount factor for compute_values
+    discount: torch.Tensor = None  # float32[] scalar tensor on device for compute_values
 
     # Outputs of post-noise analysis (set by compute_post_noise_effects)
     value_chosen_post_noise: Optional[torch.Tensor] = None

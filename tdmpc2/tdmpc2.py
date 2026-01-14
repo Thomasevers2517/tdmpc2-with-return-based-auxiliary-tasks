@@ -163,10 +163,12 @@ class TDMPC2(torch.nn.Module):
 		self._enc_lr_stepped = False  # Track if step-change has been applied
 
 		self.model.eval()
-		self.scale = RunningScale(cfg)
+		self.scale = RunningScale(cfg)  # For Q-values in SVG
+		self.kl_scale = RunningScale(cfg)  # Separate scale for KL divergence in distillation
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
+		self._last_reanalyze_step = -1  # Track last env step where reanalyze was performed
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
 		
 		# Frozen random encoder for KNN entropy estimation (observation diversity metric)
@@ -228,6 +230,8 @@ class TDMPC2(torch.nn.Module):
 
 			# Use dynamic=False to avoid symbolic shapes which conflict with vmap in reward/V heads
 			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=False)
+			# Compile planner.plan instead of reanalyze - reanalyze interacts with threading
+			self.planner.plan = torch.compile(self.planner.plan, mode=self.cfg.compile_type, dynamic=False)
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
@@ -316,10 +320,18 @@ class TDMPC2(torch.nn.Module):
 				# 'default' -> None (use config), 'mean' -> 0.0 (mean-only)
 				value_std_coef_override = 0.0 if eval_head_reduce == 'mean' else None
 				
+				# Determine if detailed logging is enabled for this step
+				enable_detailed_logging = (
+					self.cfg.log_detail_freq > 0 and
+					(self._step is not None) and
+					(self._step % self.cfg.log_detail_freq == 0)
+				)
+				
 				# Planner now returns batch dimension: action [B, A], mean [B, T, A], std [B, T, A]
 				# For acting (B=1), squeeze the batch dim
 				chosen_action, planner_info, mean, std = self.planner.plan(
-					z0, task=None, eval_mode=eval_mode, step=self._step,
+					z0, task=None, eval_mode=eval_mode,
+					enable_detailed_logging=enable_detailed_logging,
 					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
 					value_std_coef_override=value_std_coef_override,
 					use_warm_start=True,
@@ -374,7 +386,7 @@ class TDMPC2(torch.nn.Module):
 				z,
 				task=task_tensor,
 				eval_mode=False,
-				step=None,  # No logging during reanalyze
+				enable_detailed_logging=False,  # No detailed logging during reanalyze
 				train_noise_multiplier=0.0,  # No noise for expert targets
 				value_std_coef_override=None,
 				use_warm_start=False,
@@ -540,13 +552,8 @@ class TDMPC2(torch.nn.Module):
 			
 			# Get discount factor
 			if self.cfg.multitask:
-				task_flat = task.repeat(T * N) if task is not None else None
-				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B*N, 1]
-				gamma_scalar = self.discount.mean().item()  # for std discounting
-			else:
-				task_flat = None
-				gamma = self.discount  # scalar
-				gamma_scalar = float(self.discount)
+				raise NotImplementedError('Multitask not supported in compiled calc_pi_losses')
+			task_flat = None
 			
 			# Predict reward r(z, a) from ALL reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
@@ -581,10 +588,10 @@ class TDMPC2(torch.nn.Module):
 			
 			# Q_h = (r_mean + γ * v_mean_h) + std_coef * (r_std + γ * v_std_h)
 			# Total mean per dynamics head: μ_h = r_mean + γ * v_mean_h
-			q_mean_per_h = reward_mean + gamma * v_mean_per_h  # float32[H, T*B*N, 1]
+			q_mean_per_h = reward_mean + self.discount * v_mean_per_h  # float32[H, T*B*N, 1]
 			
 			# Total std per dynamics head: σ_h = r_std + γ * v_std_h
-			q_std_per_h = reward_std + gamma_scalar * v_std_per_h  # float32[H, T*B*N, 1]
+			q_std_per_h = reward_std + self.discount * v_std_per_h  # float32[H, T*B*N, 1]
 			
 			# Q_h = μ_h + std_coef * σ_h
 			q_per_h = q_mean_per_h + value_std_coef * q_std_per_h  # float32[H, T*B*N, 1]
@@ -724,9 +731,9 @@ class TDMPC2(torch.nn.Module):
 		kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # float32[T, B, A]
 		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
 		
-		# Scale with running scale (like BMPC does for unit consistency)
-		self.scale.update(kl_loss[0])
-		kl_scaled = self.scale(kl_loss)  # float32[T, B, 1]
+		# Scale with separate running scale for KL (different from Q-value scale)
+		self.kl_scale.update(kl_loss[0])
+		kl_scaled = self.kl_scale(kl_loss)  # float32[T, B, 1]
 		
 		# Entropy bonus (use optimistic or pessimistic entropy coeff)
 		if optimistic:
@@ -750,10 +757,13 @@ class TDMPC2(torch.nn.Module):
 			"pi_kl_loss": kl_loss.mean(),
 			"pi_kl_per_dim": kl_per_dim.mean(),
 			"pi_entropy": info["entropy"].mean(),
+			"pi_presquash_entropy": info["presquash_entropy"].mean(),
 			"pi_scaled_entropy": info["scaled_entropy"].mean(),
-			"pi_scale": self.scale.value,
+			"pi_kl_scale": self.kl_scale.value,  # Separate scale for KL (not Q-value scale)
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
+			"pi_presquash_mean": info["presquash_mean"].mean(),
+			"pi_presquash_abs_mean": info["presquash_mean"].abs().mean(),
 			"pi_abs_mean": info["mean"].abs().mean(),
 			"entropy_coeff": torch.tensor(entropy_coeff, device=self.device),
 			"expert_mean_abs": expert_mean.abs().mean(),
@@ -891,8 +901,8 @@ class TDMPC2(torch.nn.Module):
 		# Reshape back to [Ve, T, H, B, 1]
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
-		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
+		if self.cfg.multitask:
+			raise NotImplementedError('Multitask not supported in compiled _td_target')
 		
 		std_coef = float(self.cfg.td_target_std_coef)
 		
@@ -911,7 +921,7 @@ class TDMPC2(torch.nn.Module):
 			r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
 			
 			# TD mean per (Ve, H): μ_{ve,h} = r_mean_h + γ * (1-term) * v_{ve,h}
-			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
+			td_mean_per_ve_h = r_mean_exp + self.discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
 			
 			# TD std per H: σ_h = r_std_h (no value std in local mode)
 			td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
@@ -952,10 +962,10 @@ class TDMPC2(torch.nn.Module):
 			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))  # float32[T, H, B, 1]
 			
 			# TD mean per H: μ_h = r_mean_h + γ * (1-term) * v_mean_h
-			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
+			td_mean_per_h = r_mean_per_h + self.discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
 			
 			# TD std per H: σ_h = r_std_h + γ * v_std_h
-			td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h  # float32[T, H, B, 1]
+			td_std_per_h = r_std_per_h + self.discount * v_std_per_h  # float32[T, H, B, 1]
 			
 			# TD_h = μ_h + std_coef * σ_h per dynamics head
 			td_per_h = td_mean_per_h + std_coef * td_std_per_h  # float32[T, H, B, 1]
@@ -1990,9 +2000,18 @@ class TDMPC2(torch.nn.Module):
 		# Lazy reanalyze: BEFORE _update so fresh targets are used in current update
 		# Re-runs the planner on first-timestep observations from the sampled batch
 		# and updates both the local tensor and the buffer in-place.
+		# Note: update() may be called multiple times per env step (due to value_update_freq),
+		# but reanalyze should only run once per env step. Track via _last_reanalyze_step.
 		reanalyze_log_pending = None
 		reanalyze_interval = int(getattr(self.cfg, 'reanalyze_interval', 0))
-		if reanalyze_interval > 0 and self._step % reanalyze_interval == 0 and self._step > 0:
+		should_reanalyze = (
+			reanalyze_interval > 0 and
+			self._step % reanalyze_interval == 0 and
+			self._step > 0 and
+			self._step != self._last_reanalyze_step  # Prevent duplicate reanalyze for same env step
+		)
+		if should_reanalyze:
+			self._last_reanalyze_step = self._step
 			with maybe_range('update/lazy_reanalyze', self.cfg):
 				# Get first-timestep observations and indices
 				# obs: [T+1, B, *obs_shape], indices: [T+1, B]

@@ -410,10 +410,12 @@ class Buffer():
 			expert_action_dist: Tensor[N, A, 2] - new expert distributions
 			expert_value: Tensor[N] or None - new expert values (None skips value update)
 		"""
-		# Synchronize: wait for any active prefetch to complete
+		# Synchronize: wait for any active prefetch to complete and reset prefetch state.
+		# Must set _primed=False so next sample() will restart the prefetch properly.
 		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
 			self._prefetch_thread.join()
-			self._prefetch_thread = None
+		self._prefetch_thread = None
+		self._primed = False
 		
 		# Convert indices to list if tensor
 		if torch.is_tensor(indices):

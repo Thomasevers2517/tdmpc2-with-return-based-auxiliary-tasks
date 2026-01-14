@@ -501,9 +501,11 @@ class WorldModel(nn.Module):
 				action_dim, dtype=log_prob.dtype, device=log_prob.device
 			).pow(self.cfg.entropy_action_dim_power)
 			scaled_entropy = entropy * entropy_multiplier
+			presquash_entropy = -log_prob_presquash  # Gaussian entropy before tanh squashing
 			
 			info = TensorDict({
 				"presquash_mean": presquash_mean,
+				"presquash_entropy": presquash_entropy,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,

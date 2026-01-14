@@ -11,7 +11,7 @@ def compute_values(
     value_std_coef: float = 0.0,
     reward_head_mode: str = "all",
     use_ema_value: bool = False,
-    discount: float = 0.99,
+    discount: torch.Tensor = None,  # float32[] scalar tensor on device; required
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
@@ -54,9 +54,9 @@ def compute_values(
     # discount_powers[t] = γ^t for t in [0, T-1]
     device = latents_all.device
     dtype = latents_all.dtype
-    discount_powers = torch.pow(torch.tensor(discount, device=device, dtype=dtype), 
-                                 torch.arange(T, device=device, dtype=dtype))  # float32[T]
-    discount_T = discount ** T  # γ^T for bootstrap value
+    # discount is already a tensor on device; use directly
+    discount_powers = torch.pow(discount, torch.arange(T, device=device, dtype=dtype))  # float32[T]
+    discount_T = discount.pow(T)  # γ^T for bootstrap value
 
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :, :-1, :]                      # float32[H, B, N, T, L]

@@ -63,7 +63,7 @@ class Planner(torch.nn.Module):
         z0: torch.Tensor,
         task: Optional[torch.Tensor] = None,
         eval_mode: bool = False,
-        step: Optional[int] = None,
+        enable_detailed_logging: bool = False,
         train_noise_multiplier: Optional[float] = None,
         value_std_coef_override: Optional[float] = None,
         use_warm_start: bool = True,
@@ -79,7 +79,7 @@ class Planner(torch.nn.Module):
             z0 (Tensor[B, L] or Tensor[L]): Initial latent states.
             task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection.
-            step: Global step for detailed logging frequency gating.
+            enable_detailed_logging: If True, record per-iteration history for advanced info.
             value_std_coef_override: Override default value_std_coef for this call.
             use_warm_start: If True, initialize mean from shifted prev_mean (only for B=1).
             update_warm_start: If True, update prev_mean after planning (only for B=1).
@@ -180,7 +180,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
+                discount=self.discount,
             )
             # vals_*: [B, S]
             latent_dis_p = None
@@ -233,7 +233,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
+                discount=self.discount,
             )
             # vals_*: [B, N]
             
@@ -414,9 +414,7 @@ class Planner(torch.nn.Module):
         # Detailed logging (only for B=1)
         log_detailed = (
             enable_detailed_logging and 
-            self.cfg.log_detail_freq > 0 and 
-            (step is not None) and 
-            (step % self.cfg.log_detail_freq == 0)
+            (B == 1)
         )
         
         if log_detailed:
@@ -447,7 +445,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 T=T,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
+                discount=self.discount,
             )
             with torch.no_grad():
                 info_adv.compute_post_noise_effects(self.world_model)
