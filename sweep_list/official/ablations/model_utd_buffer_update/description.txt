@@ -1,0 +1,29 @@
+Model UTD and Buffer Update Ablation
+=====================================
+
+Purpose:
+Show that increasing model UTD (updates-to-data ratio) helps, especially when
+combined with fast replay buffer updates.
+
+Key insight:
+- Higher UTD = more gradient updates per environment step = faster learning
+- But this only works well if the replay buffer is updated frequently
+- Fast buffer updates + high UTD = significant performance boost
+
+Configuration:
+- Task: quadruped-walk
+- Sweep:
+  - utd_ratio: 1, 2, 4, 8
+  - buffer_update_ratio / reanalyze settings
+- Compare: High UTD alone vs High UTD + fast buffer updates
+
+Expected outcome:
+- UTD=1: Baseline performance
+- UTD=4 alone: Some improvement
+- UTD=4 + fast buffer: Significant improvement
+- The combination is key
+
+Metrics to log:
+- Episode return
+- Sample efficiency (performance vs env steps)
+- Training throughput (updates per second)

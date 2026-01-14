@@ -111,9 +111,18 @@ class OnlineTrainer(Trainer):
 
 		)
 
-	def to_td(self, obs, action=None, reward=None, terminated=None):
-		"""Creates a TensorDict for a new episode."""
-     
+	def to_td(self, obs, action=None, reward=None, terminated=None, expert_action_dist=None, expert_value=None):
+		"""Creates a TensorDict for a new episode.
+		
+		Args:
+			obs: Observation tensor or dict.
+			action: Action tensor [A]. None for first step (fills with NaN).
+			reward: Reward scalar. None for first step (fills with NaN).
+			terminated: Termination flag. None for first step (fills with NaN).
+			expert_action_dist: Expert action distribution [A, 2] where [...,0]=mean, [...,1]=std.
+				None for seed steps (fills with NaN, buffer replaces with N(0,1)).
+			expert_value: Expert value scalar. None for seed steps (fills with NaN).
+		"""
 		if isinstance(obs, dict):
 			obs = TensorDict(obs, batch_size=())
 		else:
@@ -124,11 +133,20 @@ class OnlineTrainer(Trainer):
 			reward = torch.tensor(float('nan'))
 		if terminated is None:
 			terminated = torch.tensor(float('nan'))
+		# Expert data: [A, 2] for action dist, scalar for value
+		# Fill with NaN if not provided (seed steps); buffer handles NaN -> N(0,1)
+		A = action.shape[-1]
+		if expert_action_dist is None:
+			expert_action_dist = torch.full((A, 2), float('nan'))
+		if expert_value is None:
+			expert_value = torch.tensor(float('nan'))
 		td = TensorDict(
 			obs=obs,
 			action=action.unsqueeze(0),
 			reward=reward.unsqueeze(0),
 			terminated=terminated.unsqueeze(0),
+			expert_action_dist=expert_action_dist.unsqueeze(0),  # [1, A, 2]
+			expert_value=expert_value.unsqueeze(0),  # [1]
 		batch_size=(1,))
 		return td
 
@@ -207,15 +225,22 @@ class OnlineTrainer(Trainer):
 
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
-				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, planner_info = self.agent.act(obs, mpc=self.cfg.train_mpc)
+				obs_device = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
+				action, planner_info = self.agent.act(obs_device, mpc=self.cfg.train_mpc)
 				action = action.cpu()
 				if basic_log_flag:
 					self.logger.log_planner_info(planner_info, self._step, category='train')
+				# Reanalyze current observation to get expert targets for distillation
+				# This is separate from act() - reanalyze uses different planner settings
+				expert_action_dist, expert_value, _ = self.agent.reanalyze(obs_device)
+				expert_action_dist = expert_action_dist.squeeze(0).cpu()  # [A, 2]
+				expert_value = expert_value.squeeze(0).cpu()  # scalar
 			else:
 				action = self.env.rand_act()
+				expert_action_dist = None  # NaN filled in to_td()
+				expert_value = None
 			obs, reward, done, info = self.env.step(action)
-			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
+			self._tds.append(self.to_td(obs, action, reward, info['terminated'], expert_action_dist, expert_value))
 
 			# Update agent
 			if self._step >= self.cfg.seed_steps:

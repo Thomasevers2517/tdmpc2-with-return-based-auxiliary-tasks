@@ -1,0 +1,13 @@
+Hard DMC Benchmark
+==================
+
+Purpose:
+Establish baseline performance on hard DeepMind Control tasks (high-dimensional).
+
+Configuration:
+- Steps: 1,000,000
+- Tasks: Hard DMC tasks (humanoid-stand, humanoid-walk, humanoid-run, dog-stand, dog-walk, dog-run, dog-trot)
+- Config: Core/latest baseline configuration
+
+Expected outcome:
+Demonstrate strong performance on challenging high-dimensional continuous control tasks.

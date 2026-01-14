@@ -289,13 +289,14 @@ class Logger:
 		# Console print sink (legacy behavior retained)
 		self._print(d, category)
 
-	def log_planner_info(self, info, step: int, category: str = "train"):
+	def log_planner_info(self, info, step: int, category: str = "train", prefix: str = "planner"):
 		"""Log planner information dataclass (basic or advanced).
 
 		Args:
 			info: PlannerBasicInfo or PlannerAdvancedInfo instance.
 			step: Global step for x-axis alignment.
 			category: Log category (train/eval/etc.).
+			prefix: Metric prefix (default "planner", use "reanalyze" for reanalyze logging).
 		"""
 		try:
 			from common.planner.info_types import PlannerBasicInfo, PlannerAdvancedInfo
@@ -317,16 +318,16 @@ class Logger:
 			if not isinstance(t, torch.Tensor):
 				return
 			if t.numel() == 1:
-				out[f"planner/{key}"] = t.detach().cpu().item()
+				out[f"{prefix}/{key}"] = t.detach().cpu().item()
 				return
 			# For non-scalars, log light summaries to avoid large payloads
 			cpu = t.detach().float().cpu()
-			out[f"planner/{key}_n"] = int(cpu.numel())
+			out[f"{prefix}/{key}_n"] = int(cpu.numel())
 			try:
-				out[f"planner/{key}_mean"] = float(cpu.mean().item())
-				out[f"planner/{key}_std"] = float(cpu.std(unbiased=False).item())
-				out[f"planner/{key}_min"] = float(cpu.min().item())
-				out[f"planner/{key}_max"] = float(cpu.max().item())
+				out[f"{prefix}/{key}_mean"] = float(cpu.mean().item())
+				out[f"{prefix}/{key}_std"] = float(cpu.std(unbiased=False).item())
+				out[f"{prefix}/{key}_min"] = float(cpu.min().item())
+				out[f"{prefix}/{key}_max"] = float(cpu.max().item())
 			except Exception:
 				# In rare cases (empty), skip stats
 				pass
@@ -345,7 +346,7 @@ class Logger:
 			if isinstance(val, torch.Tensor):
 				_summarize_tensor(name, val, payload)
 			elif isinstance(val, (int, float)):
-				payload[f"planner/{name}"] = val
+				payload[f"{prefix}/{name}"] = val
 			else:
 				# Non-numeric (e.g., lists) are skipped by default
 				continue
@@ -364,9 +365,9 @@ class Logger:
 				]:
 					v = k[1]
 					if isinstance(v, torch.Tensor) and v.numel() == 1:
-						payload[f"planner/{k[0]}"] = v.detach().cpu().item()
+						payload[f"{prefix}/{k[0]}"] = v.detach().cpu().item()
 					elif isinstance(v, (int, float)):
-						payload[f"planner/{k[0]}"] = v
+						payload[f"{prefix}/{k[0]}"] = v
 		except Exception:
 			pass
 

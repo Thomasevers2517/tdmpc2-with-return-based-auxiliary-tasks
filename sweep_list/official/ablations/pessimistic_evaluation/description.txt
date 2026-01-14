@@ -1,0 +1,25 @@
+Pessimistic Evaluation Ablation
+===============================
+
+Purpose:
+Show that evaluating pessimistically (avoiding uncertainty) leads to more stable
+and consistent evaluation performance.
+
+Key insight:
+During evaluation, we don't want to take risks. We want to do what we know works.
+Being pessimistic means avoiding uncertain states/actions, leading to:
+1. More stable evaluation scores (lower variance across episodes)
+2. Generally better average performance (fewer catastrophic failures)
+
+Configuration:
+- Task: Something where evaluation stability matters
+- Training: Keep optimistic exploration ON
+- Evaluation sweep: planner_value_std_coef_eval from positive (optimistic) to negative (pessimistic)
+
+Expected outcome:
+- Pessimistic evaluation: Lower variance in eval scores, more consistent behavior
+- Optimistic/neutral evaluation: Higher variance, occasional failures from trying risky actions
+
+Metrics to log:
+- Episode return (mean and std across eval episodes)
+- Value uncertainty during evaluation

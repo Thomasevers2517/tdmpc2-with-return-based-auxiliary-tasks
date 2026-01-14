@@ -316,20 +316,91 @@ class TDMPC2(torch.nn.Module):
 				# 'default' -> None (use config), 'mean' -> 0.0 (mean-only)
 				value_std_coef_override = 0.0 if eval_head_reduce == 'mean' else None
 				
+				# Planner now returns batch dimension: action [B, A], mean [B, T, A], std [B, T, A]
+				# For acting (B=1), squeeze the batch dim
 				chosen_action, planner_info, mean, std = self.planner.plan(
-					z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step,
+					z0, task=None, eval_mode=eval_mode, step=self._step,
 					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
-					value_std_coef_override=value_std_coef_override
+					value_std_coef_override=value_std_coef_override,
+					use_warm_start=True,
+					update_warm_start=True,
+					reanalyze=False,
 				)
 
 				# Planner already applies any training noise and clamps
-				return chosen_action, planner_info
+				# Squeeze batch dim for single-sample acting
+				return chosen_action.squeeze(0), planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
 			action_pi, info_pi = self.model.pi(z, task_tensor)
 			if eval_mode:
 				action_pi = info_pi['mean']
 			return action_pi[0], None
+
+	@torch.no_grad()
+	def reanalyze(self, obs, task=None):
+		"""Run planner on observations to get expert targets for policy distillation.
+		
+		This is separate from act() - reanalyze uses different planner settings
+		(no warm start, specific hyperparameters for generating consistent targets).
+		Used both for immediate reanalyze (single obs from online trainer) and
+		lazy reanalyze (batch of obs from replay buffer).
+		
+		Args:
+			obs: Observations, float32[B, *obs_shape] where B can be 1 or larger.
+			task: Optional task indices for multitask.
+		
+		Returns:
+			expert_action_dist: float32[B, A, 2] where [...,0]=mean, [...,1]=std.
+			expert_value: float32[B] scalar value estimates (None if B>1).
+			planner_info: PlannerBasicInfo or None (for logging).
+		"""
+		self.model.eval()
+		with maybe_range('Agent/reanalyze', self.cfg):
+			if task is not None:
+				task_tensor = torch.tensor([task], device=self.device) if not torch.is_tensor(task) else task
+			else:
+				task_tensor = None
+			
+			# Encode observations -> latent states [B, L]
+			z = self.model.encode(obs, task_tensor)  # float32[B, L]
+			B = z.shape[0]
+			
+			# Run planner with reanalyze=True:
+			# - use_warm_start=False (independent per sample)
+			# - update_warm_start=False (don't pollute warm start for acting)
+			# - Uses reanalyze-specific hyperparameters (iterations, num_samples, num_pi_trajs)
+			chosen_action, planner_info, mean, std = self.planner.plan(
+				z,
+				task=task_tensor,
+				eval_mode=False,
+				step=None,  # No logging during reanalyze
+				train_noise_multiplier=0.0,  # No noise for expert targets
+				value_std_coef_override=None,
+				use_warm_start=False,
+				update_warm_start=False,
+				reanalyze=True,
+			)
+			# mean, std: [B, T, A] -> take first timestep [:, 0, :] -> [B, A]
+			expert_mean = mean[:, 0, :]  # float32[B, A]
+			expert_std = std[:, 0, :]    # float32[B, A]
+			
+			# Ensure std is within valid range (defensive; planner should already clamp)
+			expert_std = expert_std.clamp(self.cfg.min_std, self.cfg.max_std)
+			
+			# Pack into [B, A, 2] format
+			expert_action_dist = torch.stack([expert_mean, expert_std], dim=-1)  # float32[B, A, 2]
+			
+			# Get expert value: only available for B=1 when planner_info is returned
+			if planner_info is not None:
+				expert_value = planner_info.value_chosen  # scalar or [1]
+				if expert_value.dim() == 0:
+					expert_value = expert_value.unsqueeze(0)  # Ensure [B] shape
+			else:
+				# B>1: planner_info is None, expert_value not available
+				expert_value = None
+			
+			return expert_action_dist, expert_value, planner_info
 
 	# Legacy helper methods `_estimate_value`, `_plan`, `update_planner_mean` removed.
 
@@ -594,28 +665,178 @@ class TDMPC2(torch.nn.Module):
 
 			return pi_loss, info
 
-	def update_pi(self, zs, task):
+	def calc_pi_distillation_losses(self, z, expert_action_dist, task, optimistic=False):
+		"""Compute policy loss via KL divergence distillation from expert planner targets.
+		
+		Distills the planner's action distribution into the policy via KL divergence.
+		This is an alternative to SVG-style policy optimization (calc_pi_losses).
+		
+		Args:
+			z (Tensor[T+1, B, L]): Latent states. Uses z[:-1] for policy (matches actions).
+			expert_action_dist (Tensor[T, B, A, 2]): Expert distributions where [...,0]=mean, [...,1]=std.
+			task: Task identifier for multitask setup.
+			optimistic (bool): If True, use optimistic policy and entropy coeff.
+		
+		Returns:
+			Tuple[Tensor, TensorDict]: Policy loss and info dict.
+		"""
+		# Validate input shapes
+		assert z.dim() == 3, f"z must be [T+1, B, L], got {z.shape}"
+		assert expert_action_dist.dim() == 4, f"expert_action_dist must be [T, B, A, 2], got {expert_action_dist.shape}"
+		assert expert_action_dist.shape[-1] == 2, f"expert_action_dist last dim must be 2, got {expert_action_dist.shape[-1]}"
+		
+		T_plus_1, B, L = z.shape
+		T = T_plus_1 - 1
+		T_expert, B_expert, A, _ = expert_action_dist.shape
+		
+		# Validate alignment: z has T+1 timesteps, expert has T
+		assert T == T_expert, f"z time dim ({T_plus_1}-1={T}) must match expert time dim ({T_expert})"
+		assert B == B_expert, f"z batch dim ({B}) must match expert batch dim ({B_expert})"
+		
+		# Use z[:-1] for policy (aligns with expert_action_dist timesteps)
+		z_for_pi = z[:-1]  # float32[T, B, L]
+		
+		# Get policy distribution (optimistic or pessimistic based on flag)
+		with maybe_range('Agent/pi_distillation', self.cfg):
+			_, info = self.model.pi(z_for_pi, task, optimistic=optimistic)
+		
+		# Extract policy mean/std
+		# Note: policy mean is already squashed (tanh applied), in [-1, 1]
+		policy_mean = info["mean"]           # float32[T, B, A]
+		policy_std = info["log_std"].exp()   # float32[T, B, A]
+		
+		# Validate policy output shapes
+		assert policy_mean.shape == (T, B, A), f"policy_mean shape {policy_mean.shape} != expected ({T}, {B}, {A})"
+		assert policy_std.shape == (T, B, A), f"policy_std shape {policy_std.shape} != expected ({T}, {B}, {A})"
+		
+		# Extract expert mean/std
+		# Expert targets are from planner's final distribution, also in [-1, 1]
+		expert_mean = expert_action_dist[..., 0]  # float32[T, B, A]
+		expert_std = expert_action_dist[..., 1]   # float32[T, B, A]
+		
+		# Validate expert values are reasonable
+		assert not torch.isnan(expert_mean).any(), "expert_mean contains NaN"
+		assert not torch.isnan(expert_std).any(), "expert_std contains NaN"
+		assert (expert_std > 0).all(), f"expert_std has non-positive values: min={expert_std.min()}"
+		
+		# Compute KL divergence: KL(policy || expert) per dimension
+		# Mean over action dimensions for total KL per (t, b) - consistent with BMPC
+		kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # float32[T, B, A]
+		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
+		
+		# Scale with running scale (like BMPC does for unit consistency)
+		self.scale.update(kl_loss[0])
+		kl_scaled = self.scale(kl_loss)  # float32[T, B, 1]
+		
+		# Entropy bonus (use optimistic or pessimistic entropy coeff)
+		if optimistic:
+			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+		else:
+			entropy_coeff = self.dynamic_entropy_coeff
+		entropy_term = info["scaled_entropy"]  # float32[T, B, 1]
+		
+		# Temporal weighting with rho (exponential decay)
+		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+		
+		# Final loss: minimize (KL - entropy_coeff * entropy), weighted by rho
+		# Note: KL is already a "loss" (minimize), entropy is a bonus (maximize -> subtract)
+		objective = kl_scaled - entropy_coeff * entropy_term  # float32[T, B, 1]
+		pi_loss = (objective.mean(dim=(1, 2)) * rho_pows).mean()
+		
+		# Build info dict
+		info_out = TensorDict({
+			"pi_loss": pi_loss,
+			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
+			"pi_kl_loss": kl_loss.mean(),
+			"pi_kl_per_dim": kl_per_dim.mean(),
+			"pi_entropy": info["entropy"].mean(),
+			"pi_scaled_entropy": info["scaled_entropy"].mean(),
+			"pi_scale": self.scale.value,
+			"pi_std": info["log_std"].mean(),
+			"pi_mean": info["mean"].mean(),
+			"pi_abs_mean": info["mean"].abs().mean(),
+			"entropy_coeff": torch.tensor(entropy_coeff, device=self.device),
+			"expert_mean_abs": expert_mean.abs().mean(),
+			"expert_std_mean": expert_std.mean(),
+		}, device=self.device)
+		
+		return pi_loss, info_out
+
+	def update_pi(self, zs, task, expert_action_dist=None):
 		"""
 		Update policy using a sequence of latent states.
 		
-		If dual_policy_enabled, computes losses for both pessimistic and optimistic
-		policies and sums them with equal weight.
+		Supports policy optimization methods:
+		- 'svg': Backprop through world model (calc_pi_losses)
+		- 'distillation': KL divergence to expert planner targets (calc_pi_distillation_losses)
+		- 'both': Sum of SVG and distillation losses (pessimistic only)
+		
+		Pessimistic policy uses cfg.policy_optimization_method.
+		Optimistic policy uses cfg.optimistic_policy_optimization_method (svg or distillation).
 
 		Args:
-			zs (torch.Tensor): Sequence of latent states.
+			zs (torch.Tensor): Sequence of latent states [T+1, B, L].
 			task (torch.Tensor): Task index (only used for multi-task experiments).
+			expert_action_dist (torch.Tensor): Expert action distributions [T, B, A, 2].
+				Required when policy_optimization_method is 'distillation' or 'both',
+				or when optimistic_policy_optimization_method is 'distillation'.
 
 		Returns:
 			Tuple[float, TensorDict]: Total policy loss and info dict.
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
+		method = str(self.cfg.policy_optimization_method).lower()
 		
-		# Pessimistic policy loss
-		pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+		# Optimistic method: 'same' means use same as pessimistic
+		opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
+		opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
+		
+		# Validate expert_action_dist is provided when needed
+		needs_expert = method in ('distillation', 'both') or (
+			self.cfg.dual_policy_enabled and opti_method == 'distillation'
+		)
+		if needs_expert:
+			assert expert_action_dist is not None, \
+				f"expert_action_dist required for policy_optimization_method='{method}' or optimistic_policy_optimization_method='{opti_method}'"
+		
+		# Compute losses based on method (pessimistic policy)
+		if method == 'svg':
+			# Pure SVG: backprop through world model
+			pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+			
+		elif method == 'distillation':
+			# Pure distillation: KL to expert targets (pessimistic policy only)
+			pi_loss, info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
+			
+		elif method == 'both':
+			# Combined: SVG + distillation
+			svg_loss, svg_info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
+			distill_loss, distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
+			
+			pi_loss = svg_loss + distill_loss
+			info = svg_info
+			# Merge distillation info with prefix
+			for k, v in distill_info.items():
+				info[f'distill_{k}'] = v
+		else:
+			raise ValueError(f"Unknown policy_optimization_method: '{method}'. Use 'svg', 'distillation', or 'both'.")
 		
 		# Optimistic policy loss (if dual policy enabled)
 		if self.cfg.dual_policy_enabled:
-			opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
+			if opti_method == 'svg':
+				opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
+			elif opti_method == 'distillation':
+				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
+			elif opti_method == 'both':
+				# Combined: SVG + distillation for optimistic
+				opti_svg_loss, opti_svg_info = self.calc_pi_losses(zs, task, optimistic=True)
+				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
+				opti_pi_loss = opti_svg_loss + opti_distill_loss
+				opti_info = opti_svg_info
+				for k, v in opti_distill_info.items():
+					opti_info[f'distill_{k}'] = v
+			else:
+				raise ValueError(f"Unknown optimistic_policy_optimization_method: '{opti_method}'. Use 'svg', 'distillation', or 'both'.")
 			
 			# Prefix optimistic info keys with 'opti_'
 			for k, v in opti_info.items():
@@ -1634,10 +1855,12 @@ class TDMPC2(torch.nn.Module):
 			'z_rollout': z_rollout,
 		}
 
-	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, update_world_model=True, task=None):
+	def _update(self, obs, action, reward, terminated, expert_action_dist=None, update_value=True, update_pi=True, update_world_model=True, task=None):
 		"""Single gradient update step over world model, critic, and policy.
 		
 		Args:
+			expert_action_dist: Expert action distributions [T, B, A, 2] for distillation.
+				Required when policy_optimization_method is 'distillation' or 'both'.
 			update_value: If True, compute and apply value/aux losses. If False, skip value losses.
 			update_pi: If True, update policy. If False, skip policy update.
 			update_world_model: If True, compute WM losses. If False, skip WM losses and use replay_true for imagination.
@@ -1684,7 +1907,7 @@ class TDMPC2(torch.nn.Module):
 				# Fallback to z_true if z_rollout unavailable (update_world_model=False).
 				z_for_pi = z_rollout.detach() if z_rollout is not None else z_true.detach()  # float32[T+1, B, L]
     
-				pi_loss, pi_info = self.update_pi(z_for_pi, task)
+				pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
 				pi_total = pi_loss * self.cfg.policy_coef
 				pi_total.backward()
 				if log_grads:
@@ -1741,7 +1964,7 @@ class TDMPC2(torch.nn.Module):
 			dict: Dictionary of training statistics.
 		"""
 		with maybe_range('update/sample_buffer', self.cfg):
-			obs, action, reward, terminated, task = buffer.sample()
+			obs, action, reward, terminated, task, expert_action_dist, indices = buffer.sample()
 
 		self._step = step
 		# Log detailed info when updating value and at log_detail_freq intervals
@@ -1763,9 +1986,68 @@ class TDMPC2(torch.nn.Module):
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
+
+		# Lazy reanalyze: BEFORE _update so fresh targets are used in current update
+		# Re-runs the planner on first-timestep observations from the sampled batch
+		# and updates both the local tensor and the buffer in-place.
+		reanalyze_log_pending = None
+		reanalyze_interval = int(getattr(self.cfg, 'reanalyze_interval', 0))
+		if reanalyze_interval > 0 and self._step % reanalyze_interval == 0 and self._step > 0:
+			with maybe_range('update/lazy_reanalyze', self.cfg):
+				# Get first-timestep observations and indices
+				# obs: [T+1, B, *obs_shape], indices: [T+1, B]
+				# Buffer stores (obs_{t+1}, action_t, expert_dist_t) together, so:
+				# - obs[0] is o₀ (first observation)
+				# - indices[1] is where expert_dist for o₀ is stored (not indices[0], which has NaN)
+				reanalyze_batch_size = int(getattr(self.cfg, 'reanalyze_batch_size', obs.shape[1]))
+				reanalyze_batch_size = min(reanalyze_batch_size, obs.shape[1])
+				
+				# Take first timestep obs, but indices[1] (where expert_dist for obs[0] is stored)
+				obs_reanalyze = obs[0, :reanalyze_batch_size]  # float32[B_re, *obs_shape]
+				indices_reanalyze = indices[1, :reanalyze_batch_size]  # [B_re] - use index 1, not 0!
+				
+				# Get old expert distributions before reanalyze (for KL logging)
+				# expert_action_dist: [T+1, B, A, 2] -> [B_re, A, 2]
+				old_expert_dist = expert_action_dist[1, :reanalyze_batch_size].clone()  # float32[B_re, A, 2]
+				
+				# Run reanalyze to get new expert targets
+				expert_action_dist_new, expert_value_new, reanalyze_info = self.reanalyze(obs_reanalyze, task=task)
+				
+				# Update expert_action_dist tensor in-place for this update
+				# expert_action_dist: [T+1, B, A, 2], update index 1 (where obs[0] targets live)
+				expert_action_dist[1, :reanalyze_batch_size] = expert_action_dist_new
+				
+				# Update buffer for future samples
+				buffer.update_expert_data(indices_reanalyze, expert_action_dist_new, expert_value_new)
+				
+				# Store logging info for after _update (when we have the info dict)
+				reanalyze_log_pending = {
+					'reanalyze_info': reanalyze_info,
+					'old_expert_dist': old_expert_dist,
+					'new_expert_dist': expert_action_dist_new,
+				}
+
 		torch.compiler.cudagraph_mark_step_begin()
   
-		info = self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
+		info = self._update(obs, action, reward, terminated, expert_action_dist=expert_action_dist, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
+
+		# Log reanalyze stats (deferred from before _update)
+		if reanalyze_log_pending is not None:
+			if reanalyze_log_pending['reanalyze_info'] is not None and self._step % self.cfg.log_freq == 0:
+				self.logger.log_planner_info(reanalyze_log_pending['reanalyze_info'], step=self._step, prefix="reanalyze")
+			
+			if self._step % self.cfg.log_freq == 0:
+				old_mean, old_std = reanalyze_log_pending['old_expert_dist'][..., 0], reanalyze_log_pending['old_expert_dist'][..., 1]  # [B_re, A]
+				new_mean, new_std = reanalyze_log_pending['new_expert_dist'][..., 0], reanalyze_log_pending['new_expert_dist'][..., 1]  # [B_re, A]
+				# Clamp stds to avoid numerical issues
+				old_std = old_std.clamp(min=1e-6)
+				new_std = new_std.clamp(min=1e-6)
+				# KL(old || new) for Gaussians: mean over actions, mean over batch
+				kl_div = (torch.log(new_std / old_std) + (old_std**2 + (old_mean - new_mean)**2) / (2 * new_std**2) - 0.5).mean(dim=-1).mean()
+				info['reanalyze/kl_old_to_new'] = kl_div.item()
+				# Also log mean/std differences
+				info['reanalyze/mean_diff'] = (new_mean - old_mean).abs().mean().item()
+				info['reanalyze/std_diff'] = (new_std - old_std).abs().mean().item()
 
 		# Log current encoder LR for W&B tracking
 		info['encoder_lr'] = self.optim.param_groups[0]['lr']
@@ -1886,19 +2168,31 @@ class TDMPC2(torch.nn.Module):
 		with torch.no_grad():
 			infos = []
 			for _ in range(num_batches):
-				obs, action, reward, terminated, task = buffer.sample()
+				obs, action, reward, terminated, task, expert_action_dist, indices = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
 					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False)
 					val_info = components['info']
 
+					# Check if we can compute policy loss (skip if distillation and no expert data)
+					method = str(self.cfg.policy_optimization_method).lower()
+					opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
+					opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
+					needs_expert = method in ('distillation', 'both') or (
+						self.cfg.dual_policy_enabled and opti_method in ('distillation', 'both')
+					)
 					
-					# Policy evaluates on dynamics rollout states (replay_rollout hardcoded)
-					# Fallback to z_true if z_rollout unavailable
-					z_for_pi = components['z_rollout'].detach() if components['z_rollout'] is not None else components['z_true'].detach()  # float32[T+1, B, L]
-      
-					pi_loss, pi_info = self.update_pi(z_for_pi, task)
-					val_info.update(pi_info, non_blocking=True)
+					# Skip policy loss if distillation is needed but expert data not available
+					if needs_expert and (expert_action_dist is None or torch.isnan(expert_action_dist).any()):
+						# Cannot compute policy loss without expert data - skip
+						pass
+					else:
+						# Policy evaluates on dynamics rollout states (replay_rollout hardcoded)
+						# Fallback to z_true if z_rollout unavailable
+						z_for_pi = components['z_rollout'].detach() if components['z_rollout'] is not None else components['z_true'].detach()  # float32[T+1, B, L]
+	      
+						pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
+						val_info.update(pi_info, non_blocking=True)
 					self.log_detailed = False
 				infos.append(val_info)
 
