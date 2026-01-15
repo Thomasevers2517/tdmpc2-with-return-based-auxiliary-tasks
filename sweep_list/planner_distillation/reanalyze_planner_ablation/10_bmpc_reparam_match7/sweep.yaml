@@ -8,36 +8,78 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep: Planner Distillation Test 2
+  # Sweep 10: BMPC Reparam - Match Sweep 7
   # 
-  # Goal: Test reanalyze_value_std_coef impact on policy distillation.
-  #       This controls how optimistic/pessimistic the expert targets
-  #       are for the policy being learned via distillation.
+  # Goal: Match sweep 7 performance with corrected reanalyze ratio
+  #       (reanalyze was running 8x too often before the fix)
   # 
-  # Key sweeps:
-  #   - reanalyze_value_std_coef: [0, -1, 1] (neutral, pessimistic, optimistic)
+  # Key changes from sweep 7:
+  #   - reanalyze_interval: 2 (was 10) 
+  #   - reanalyze_batch_size: 128 (was 64)
+  #   => Same effective reanalyze ratio as buggy sweep 7
+  # 
+  # Sweeps:
+  #   - start_entropy_coeff: [3e-3, 3e-4]
   # 
   # Fixed:
-  #   - policy_optimization_method: distillation
-  #   - optimistic_entropy_mult: 2
+  #   - optimistic_entropy_mult: 10
+  #   - reanalyze_value_std_coef: 0
+  #   - BMPC-style reparameterization (new code)
   # 
-  # Tasks: quadruped-walk
-  # Seeds: 1
-  # Total: 1 task × 3 reanalyze_value_std_coef × 4 entropy_coeff = 12 runs
+  # Tasks: quadruped-walk, dog-stand, dog-walk
+  # Seeds: 2
+  # Total: 2 entropy × 3 tasks × 2 seeds = 12 runs
   #############################################
 
   task:
-    value: quadruped-walk
+    values: [quadruped-walk, dog-stand, dog-walk]
 
   seed:
-    value: 1
+    values: [1, 2]
 
   #############################################
-  # REANALYZE SETTINGS - SWEEP
+  # SWEEP PARAMETERS
+  #############################################
+
+  start_entropy_coeff:
+    values: [0.003, 0.0001]
+
+  #############################################
+  # ENTROPY SETTINGS
+  #############################################
+
+  optimistic_entropy_mult:
+    value: 10
+  start_dynamic_entropy_ratio:
+    value: 1
+  end_dynamic_entropy_ratio:
+    value: 1
+  entropy_action_dim_power:
+    value: 1.0
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+
+  #############################################
+  # PLANNER - HIGH POLICY SEEDING
+  #############################################
+
+  num_samples:
+    value: 1024
+  num_pi_trajs:
+    value: 512
+  iterations:
+    value: 6
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # REANALYZE SETTINGS (compensate for bugfix)
   #############################################
 
   reanalyze_interval:
-    value: 10
+    value: 2
   reanalyze_batch_size:
     value: 128
   reanalyze_horizon:
@@ -52,8 +94,6 @@ parameters:
     value: 64
   reanalyze_temperature:
     value: 0.5
-  reanalyze_value_std_coef:
-    values: [0, -1, 1]
 
   #############################################
   # POLICY OPTIMIZATION METHOD
@@ -65,13 +105,6 @@ parameters:
     value: distillation
 
   #############################################
-  # OPTIMISTIC ENTROPY
-  #############################################
-
-  optimistic_entropy_mult:
-    value: 2
-
-  #############################################
   # TD TARGET SETTINGS
   #############################################
 
@@ -79,11 +112,6 @@ parameters:
     value: mean
   td_target_std_coef:
     value: -1
-
-  #############################################
-  # TD BOOTSTRAP
-  #############################################
-
   local_td_bootstrap:
     value: true
 
@@ -95,6 +123,10 @@ parameters:
     value: 0.3
   planner_value_std_coef_eval:
     value: -1
+  reanalyze_value_std_coef:
+    value: 0
+  ema_value_planning:
+    value: true
 
   #############################################
   # POLICY STD COEF SETTINGS
@@ -115,25 +147,6 @@ parameters:
     value: 1
   prior_hidden_div:
     value: 16
-
-  #############################################
-  # ENTROPY SETTINGS - SWEEP
-  #############################################
-
-  start_entropy_coeff:
-    values: [0.001, 0.0001, 0.00003, 0.00001]
-  start_dynamic_entropy_ratio:
-    value: 1
-  end_dynamic_entropy_ratio:
-    value: 1
-  entropy_action_dim_power:
-    value: 1.0
-  jacobian_correction_scale:
-    value: 1
-  hinge_coef:
-    value: 0
-  ema_value_planning:
-    value: true
 
   #############################################
   # ARCHITECTURE
@@ -159,26 +172,15 @@ parameters:
   steps:
     value: 100000
   eval_freq:
-    value: 5000
+    value: 10000
   multi_gamma_loss_weight:
     value: 0
   utd_ratio:
     value: 4
   value_update_freq:
-    value: 2
+    value: 8
   pi_update_freq:
     value: 1
-
-  #############################################
-  # PLANNER
-  #############################################
-
-  iterations:
-    value: 6
-  num_samples:
-    value: 1024
-  planner_use_all_heads_eval:
-    value: true
 
   #############################################
   # LOGGING

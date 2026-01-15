@@ -8,20 +8,21 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 8.3: Reanalyze Batch Size + Value Update Freq
+  # Sweep 9: Reanalyze Batch Size + Value Update Freq
   # 
-  # Goal: Test larger reanalyze batch with higher value update freq
-  #       - reanalyze_batch_size: [64, 256]
-  #       - value_update_freq: 8
+  # Goal: Test reanalyze batch size with value update freq
+  #       - reanalyze_batch_size: [32, 128]
+  #       - value_update_freq: [2, 8]
+  #       - reanalyze_interval: 5
   # 
-  # Tasks: dog-stand, quadruped-walk
+  # Tasks: dog-stand, dog-walk, quadruped-walk
   # Seeds: 1
   # Steps: 200k
-  # Total: 2 tasks × 2 batch_size × 1 seed = 4 runs
+  # Total: 3 tasks × 2 batch_size × 2 value_freq × 1 seed = 12 runs
   #############################################
 
   task:
-    values: [dog-stand, quadruped-walk]
+    values: [dog-stand, dog-walk, quadruped-walk]
 
   seed:
     value: 1
@@ -31,7 +32,10 @@ parameters:
   #############################################
 
   reanalyze_batch_size:
-    values: [64, 256]
+    values: [32, 128]
+
+  value_update_freq:
+    values: [2, 8]
 
   #############################################
   # ENTROPY SETTINGS (minimal/off)
@@ -70,7 +74,7 @@ parameters:
   #############################################
 
   reanalyze_interval:
-    value: 10
+    value: 5
   reanalyze_horizon:
     value: 3
   reanalyze_iterations:
@@ -142,8 +146,6 @@ parameters:
     value: 10000
   utd_ratio:
     value: 4
-  value_update_freq:
-    value: 8
   pi_update_freq:
     value: 1
 

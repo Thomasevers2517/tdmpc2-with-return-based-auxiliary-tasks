@@ -167,7 +167,7 @@ parameters:
   utd_ratio:
     value: 4
   value_update_freq:
-    value: 1
+    value: 8
   pi_update_freq:
     value: 1
 

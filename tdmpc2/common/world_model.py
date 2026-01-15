@@ -484,14 +484,34 @@ class WorldModel(nn.Module):
 			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action and apply squash (tanh) with configurable Jacobian correction
-			# jacobian_correction_scale controls how much we penalize action saturation:
-			#   1.0 = correct entropy (full Jacobian penalty near ±1)
-			#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
-			action = mean + eps * log_std.exp()
-			presquash_mean = mean
-			jacobian_scale = float(self.cfg.jacobian_correction_scale)
-			mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
+			# Sample action and apply squash/clamp
+			# For distillation: use BMPC-style (tanh mean first, then add noise, clamp)
+			#   This makes distribution matching easier since both policy and planner use clamped actions
+			# For SVG: use standard reparameterization with Jacobian correction
+			method = str(self.cfg.policy_optimization_method).lower()
+			opti_method = str(self.cfg.optimistic_policy_optimization_method).lower()
+			assert opti_method == 'same' or opti_method == method, (
+				f"optimistic_policy_optimization_method must be 'same' or match policy_optimization_method "
+				f"(got '{opti_method}' vs '{method}')"
+			)
+			use_bmpc_reparam = method in ('distillation', 'both')
+			
+			if use_bmpc_reparam:
+				# BMPC-style: tanh(mean) + noise, then clamp to [-1, 1]
+				# No Jacobian correction since we clamp (not a differentiable squash)
+				mean = torch.tanh(mean)
+				presquash_mean = mean  # Already squashed
+				action = (mean + eps * log_std.exp()).clamp(-1, 1)
+				log_prob = log_prob_presquash  # Use pre-squash log_prob (no good way to correct for clamp)
+			else:
+				# Standard reparameterization with configurable Jacobian correction
+				# jacobian_correction_scale controls how much we penalize action saturation:
+				#   1.0 = correct entropy (full Jacobian penalty near ±1)
+				#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
+				action = mean + eps * log_std.exp()
+				presquash_mean = mean
+				jacobian_scale = float(self.cfg.jacobian_correction_scale)
+				mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
 			
 			# Entropy and scaled_entropy for policy loss
 			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)
