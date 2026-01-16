@@ -459,10 +459,6 @@ class Planner(torch.nn.Module):
             with torch.no_grad():
                 info_adv.compute_post_noise_effects(self.world_model)
             
-            if update_warm_start:
-                self.prev_mean.copy_(mean[0])
-            
-            return chosen_action.detach(), info_adv, mean.detach(), std.detach()
 
         # Update warm-start mean (only for B=1)
         if update_warm_start and B == 1:
