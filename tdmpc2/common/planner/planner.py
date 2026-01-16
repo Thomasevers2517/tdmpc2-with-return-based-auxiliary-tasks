@@ -49,14 +49,14 @@ class Planner(torch.nn.Module):
         return shifted
 
     @torch.no_grad()
-    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, step: Optional[int] = None, train_noise_multiplier: Optional[float] = None, value_std_coef_override: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
+    def plan(self, z0: torch.Tensor, task: Optional[torch.Tensor] = None, eval_mode: bool = False, log_detailed: bool = False, train_noise_multiplier: Optional[float] = None, value_std_coef_override: Optional[float] = None) -> Tuple[torch.Tensor, PlannerBasicInfo, torch.Tensor, torch.Tensor]:
         """Plan an action sequence and return the first action.
 
         Args:
             z0 (Tensor[L] or Tensor[1, L]): Initial latent.
             task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection, eval temperature.
-            step: Global step for detailed logging frequency gating.
+            log_detailed: If True, return detailed planner info for logging.
             value_std_coef_override: If provided, overrides the default value_std_coef for this call.
                 Use 0.0 for mean-only reduction (e.g., eval_mean_head_reduce mode).
 
@@ -336,8 +336,7 @@ class Planner(torch.nn.Module):
         )
 
 
-        # Use existing global log_detail_freq instead of new key if available.
-        log_detailed = self.cfg.log_detail_freq > 0 and (step is not None) and (step % self.cfg.log_detail_freq == 0)
+        # Use the log_detailed flag passed by the caller
         if log_detailed:
             # Stack iteration histories
             actions_all = torch.stack(actions_hist, dim=0)               # [I,E,T,A]

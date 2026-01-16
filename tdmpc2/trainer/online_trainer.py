@@ -208,7 +208,7 @@ class OnlineTrainer(Trainer):
 			# Collect experience
 			if self._step > self.cfg.seed_steps:
 				obs = obs.to(self.agent.device, non_blocking=True).unsqueeze(0)
-				action, planner_info = self.agent.act(obs, mpc=self.cfg.train_mpc)
+				action, planner_info = self.agent.act(obs, mpc=self.cfg.train_mpc, log_detailed=detailed_log_flag)
 				action = action.cpu()
 				if basic_log_flag:
 					self.logger.log_planner_info(planner_info, self._step, category='train')
