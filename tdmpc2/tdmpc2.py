@@ -914,7 +914,6 @@ class TDMPC2(torch.nn.Module):
 			# We need to broadcast: terminated [T, H, B, 1]
 			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 			r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			raise NotImplementedError("Check to maybe fix the discount changing from the previous commit. I did this in the main branch and it maybe caused things to break.")
 			# TD mean per (Ve, H): μ_{ve,h} = r_mean_h + γ * (1-term) * v_{ve,h}
 			td_mean_per_ve_h = r_mean_exp + self.discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
 			

@@ -8,31 +8,27 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 10: BMPC Reparam - Match Sweep 7
+  # Sweep 8A: Sanity Check - Basic Distillation
   # 
-  # Goal: Match sweep 7 performance with corrected reanalyze ratio
-  #       (reanalyze was running 8x too often before the fix)
-  # 
-  # Key changes from sweep 7:
-  #   - reanalyze_interval: 2 (was 10) 
-  #   - reanalyze_batch_size: 128 (was 64)
-  #   => Same effective reanalyze ratio as buggy sweep 7
+  # Goal: Test basic distillation setup with varied entropy
   # 
   # Sweeps:
-  #   - start_entropy_coeff: [3e-3, 3e-4]
+  #   - start_entropy_coeff: [1e-4, 1e-3]
+  #   - optimistic_entropy_mult: [10, 100]
   # 
   # Fixed:
-  #   - optimistic_entropy_mult: 10
-  #   - reanalyze_value_std_coef: 0
-  #   - BMPC-style reparameterization (new code)
+  #   - value_update_freq: 2
+  #   - reanalyze_batch_size: 128
+  #   - num_q: 4
   # 
-  # Tasks: quadruped-walk, dog-stand, dog-walk
+  # Tasks: dog-stand, quadruped-walk
   # Seeds: 2
-  # Total: 2 entropy × 3 tasks × 2 seeds = 12 runs
+  # Steps: 100k
+  # Total: 2 entropy × 2 mult × 2 tasks × 2 seeds = 16 runs
   #############################################
 
   task:
-    values: [quadruped-walk, dog-stand, dog-walk]
+    values: [dog-stand, quadruped-walk]
 
   seed:
     values: [1, 2]
@@ -42,14 +38,15 @@ parameters:
   #############################################
 
   start_entropy_coeff:
-    values: [0.003, 0.0001]
+    values: [0.0001, 0.001]
+
+  optimistic_entropy_mult:
+    values: [10, 100]
 
   #############################################
   # ENTROPY SETTINGS
   #############################################
 
-  optimistic_entropy_mult:
-    value: 10
   start_dynamic_entropy_ratio:
     value: 1
   end_dynamic_entropy_ratio:
@@ -62,11 +59,11 @@ parameters:
     value: 0
 
   #############################################
-  # PLANNER - HIGH POLICY SEEDING
+  # PLANNER
   #############################################
 
   num_samples:
-    value: 1024
+    value: 512
   num_pi_trajs:
     value: 512
   iterations:
@@ -75,11 +72,11 @@ parameters:
     value: true
 
   #############################################
-  # REANALYZE SETTINGS (compensate for bugfix)
+  # REANALYZE SETTINGS
   #############################################
 
   reanalyze_interval:
-    value: 2
+    value: 10
   reanalyze_batch_size:
     value: 128
   reanalyze_horizon:
@@ -91,7 +88,7 @@ parameters:
   reanalyze_num_elites:
     value: 64
   reanalyze_num_pi_trajs:
-    value: 64
+    value: 24
   reanalyze_temperature:
     value: 0.5
 
@@ -129,26 +126,6 @@ parameters:
     value: true
 
   #############################################
-  # POLICY STD COEF SETTINGS
-  #############################################
-
-  policy_value_std_coef:
-    value: 0
-  optimistic_policy_value_std_coef:
-    value: 1
-
-  #############################################
-  # PRIOR SETTINGS
-  #############################################
-
-  prior_scale:
-    value: 0.1
-  prior_logit_scale:
-    value: 1
-  prior_hidden_div:
-    value: 16
-
-  #############################################
   # ARCHITECTURE
   #############################################
 
@@ -157,11 +134,9 @@ parameters:
   num_value_layers:
     value: 2
   num_q:
-    value: 2
+    value: 4
   num_reward_heads:
     value: 2
-  enc_lr_step_ratio:
-    value: 0.5
   planner_num_dynamics_heads:
     value: 2
 
@@ -173,12 +148,10 @@ parameters:
     value: 100000
   eval_freq:
     value: 10000
-  multi_gamma_loss_weight:
-    value: 0
   utd_ratio:
     value: 4
   value_update_freq:
-    value: 8
+    value: 2
   pi_update_freq:
     value: 1
 
@@ -186,12 +159,8 @@ parameters:
   # LOGGING
   #############################################
 
-  eval_mean_head_reduce:
-    value: false
   compile:
     value: true
-  dropout:
-    value: 0
   enable_wandb:
     value: true
   wandb_project:
