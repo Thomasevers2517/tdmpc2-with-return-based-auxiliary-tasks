@@ -63,7 +63,7 @@ class Planner(torch.nn.Module):
         z0: torch.Tensor,
         task: Optional[torch.Tensor] = None,
         eval_mode: bool = False,
-        step: Optional[int] = None,
+        log_detailed: bool = False,
         train_noise_multiplier: Optional[float] = None,
         value_std_coef_override: Optional[float] = None,
         use_warm_start: bool = True,
@@ -79,7 +79,7 @@ class Planner(torch.nn.Module):
             z0 (Tensor[B, L] or Tensor[L]): Initial latent states.
             task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection.
-            step: Global step for detailed logging frequency gating.
+            log_detailed: If True, return PlannerAdvancedInfo with full iteration history.
             value_std_coef_override: Override default value_std_coef for this call.
             use_warm_start: If True, initialize mean from shifted prev_mean (only for B=1).
             update_warm_start: If True, update prev_mean after planning (only for B=1).
@@ -88,7 +88,7 @@ class Planner(torch.nn.Module):
         Returns:
             Tuple of:
                 - Tensor[B, A]: First action for each batch element.
-                - PlannerBasicInfo | None: Planning info (None if B>1).
+                - PlannerBasicInfo | PlannerAdvancedInfo | None: Planning info (None if B>1).
                 - Tensor[B, T, A]: Final mean action sequences.
                 - Tensor[B, T, A]: Final std action sequences.
         """
@@ -411,15 +411,9 @@ class Planner(torch.nn.Module):
                 weighted_latent_disagreements_all=weighted_latent_dis_b0,
             )
 
-        # Detailed logging (only for B=1)
-        log_detailed = (
-            enable_detailed_logging and 
-            self.cfg.log_detail_freq > 0 and 
-            (step is not None) and 
-            (step % self.cfg.log_detail_freq == 0)
-        )
-        
-        if log_detailed:
+        # Detailed logging: upgrade info_basic to info_adv if requested (only for B=1)
+        info_out = info_basic
+        if log_detailed and enable_detailed_logging and info_basic is not None:
             actions_all = torch.stack(actions_hist, dim=0).squeeze(1)               # [I, E, T, A]
             latents_all = torch.stack(latents_hist, dim=0).squeeze(2)               # [I, H, E, T+1, L]
             values_all_unscaled = torch.stack(values_unscaled_hist, dim=0).squeeze(1)  # [I, E]
@@ -428,7 +422,7 @@ class Planner(torch.nn.Module):
             latent_disagreements_all = torch.stack(latent_disagreement_hist, dim=0).squeeze(1) if len(latent_disagreement_hist) > 0 else None
             value_disagreements_all = torch.stack(value_disagreement_hist, dim=0).squeeze(1) if len(value_disagreement_hist) > 0 else None
 
-            info_adv = PlannerAdvancedInfo(
+            info_out = PlannerAdvancedInfo(
                 **vars(info_basic),
                 actions_all=actions_all,
                 latents_all=latents_all,
@@ -450,16 +444,12 @@ class Planner(torch.nn.Module):
                 discount=float(self.discount),
             )
             with torch.no_grad():
-                info_adv.compute_post_noise_effects(self.world_model)
-            
-            if update_warm_start:
-                self.prev_mean.copy_(mean[0])
-            
-            return chosen_action.detach(), info_adv, mean.detach(), std.detach()
+                info_out.compute_post_noise_effects(self.world_model)
 
         # Update warm-start mean (only for B=1)
         if update_warm_start and B == 1:
             self.prev_mean.copy_(mean[0])
         
+        # Final clamp and return (always executed)
         chosen_action = chosen_action.clamp(-1.0, 1.0)
-        return chosen_action.detach(), info_basic, mean.detach(), std.detach()
+        return chosen_action.detach(), info_out, mean.detach(), std.detach()

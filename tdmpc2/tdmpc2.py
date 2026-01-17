@@ -285,7 +285,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default'):
+	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default', log_detailed: bool = False):
 		"""Select an action.
 
 		If `mpc=True`, uses modular `Planner` over latent space; else falls back to single policy prior.
@@ -298,6 +298,7 @@ class TDMPC2(torch.nn.Module):
 			eval_head_reduce (str): Head reduction mode for eval ('default', 'mean').
 				'default' uses planner_value_std_coef_eval (typically pessimistic).
 				'mean' uses value_std_coef=0 for mean-only reduction.
+			log_detailed (bool): If True, planner returns PlannerAdvancedInfo with full iteration history.
 
 		Returns:
 			Tensor: Action.
@@ -321,7 +322,7 @@ class TDMPC2(torch.nn.Module):
 				# Planner now returns batch dimension: action [B, A], mean [B, T, A], std [B, T, A]
 				# For acting (B=1), squeeze the batch dim
 				chosen_action, planner_info, mean, std = self.planner.plan(
-					z0, task=None, eval_mode=eval_mode, step=self._step,
+					z0, task=None, eval_mode=eval_mode, log_detailed=log_detailed,
 					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
 					value_std_coef_override=value_std_coef_override,
 					use_warm_start=True,
@@ -376,7 +377,7 @@ class TDMPC2(torch.nn.Module):
 				z,
 				task=task_tensor,
 				eval_mode=False,
-				step=None,  # No logging during reanalyze
+				log_detailed=False,  # No detailed logging during reanalyze
 				train_noise_multiplier=0.0,  # No noise for expert targets
 				value_std_coef_override=None,
 				use_warm_start=False,
