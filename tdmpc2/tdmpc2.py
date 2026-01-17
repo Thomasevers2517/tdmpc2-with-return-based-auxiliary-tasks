@@ -167,6 +167,7 @@ class TDMPC2(torch.nn.Module):
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
+		self._last_reanalyze_step = -1  # Track last step where reanalyze was run (prevent duplicates with utd_ratio > 1)
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
 		
 		# Frozen random encoder for KNN entropy estimation (observation diversity metric)
@@ -1992,7 +1993,16 @@ class TDMPC2(torch.nn.Module):
 		# and updates both the local tensor and the buffer in-place.
 		reanalyze_log_pending = None
 		reanalyze_interval = int(getattr(self.cfg, 'reanalyze_interval', 0))
-		if reanalyze_interval > 0 and self._step % reanalyze_interval == 0 and self._step > 0:
+		# Check both interval AND that we haven't already reanalyzed at this step
+		# (prevents multiple reanalyze calls per env step when utd_ratio > 1)
+		should_reanalyze = (
+			reanalyze_interval > 0
+			and self._step % reanalyze_interval == 0
+			and self._step > 0
+			and self._step != self._last_reanalyze_step
+		)
+		if should_reanalyze:
+			self._last_reanalyze_step = self._step
 			with maybe_range('update/lazy_reanalyze', self.cfg):
 				# Get first-timestep observations and indices
 				# obs: [T+1, B, *obs_shape], indices: [T+1, B]
