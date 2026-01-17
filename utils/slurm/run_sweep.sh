@@ -224,7 +224,11 @@ if [[ -n "${WANDB_PROJECT:-}" ]]; then export WANDB_PROJECT; fi
 wandb login --relogin "${WANDB_API_KEY}" >/dev/null
 
 echo "Starting wandb agent: ${SWEEP_ID} (count=${RUNS_PER_JOB})"
-srun wandb agent --count "${RUNS_PER_JOB}" "${SWEEP_ID}"
+# Use srun with per-task output files (task %t within the step)
+SRUN_OUT_DIR="${OUT_DIR:-/tmp}"
+srun --output="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.out" \
+     --error="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.err" \
+     wandb agent --count "${RUNS_PER_JOB}" "${SWEEP_ID}"
 
 echo "Agent finished."
 BATCH
@@ -243,7 +247,7 @@ CMD=( sbatch
   -o "$OUT_DIR/%x_%A_%a.out"
   -e "$OUT_DIR/%x_%A_%a.err"
   --array "$ARRAY_RANGE"
-  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT,CONDA_ENV=$CONDA_ENV"
+  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT,CONDA_ENV=$CONDA_ENV,OUT_DIR=$OUT_DIR"
   "${MAIL_ARGS[@]:-}"
   "$BATCH_SCRIPT"
 )
