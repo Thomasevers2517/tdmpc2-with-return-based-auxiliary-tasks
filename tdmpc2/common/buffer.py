@@ -413,7 +413,9 @@ class Buffer():
 		# Synchronize: wait for any active prefetch to complete
 		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
 			self._prefetch_thread.join()
-			self._prefetch_thread = None
+		self._prefetch_thread = None
+		self._primed = False
+		self._prefetched_td_gpu = None
 		
 		# Convert indices to list if tensor
 		if torch.is_tensor(indices):
