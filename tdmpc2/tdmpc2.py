@@ -229,6 +229,7 @@ class TDMPC2(torch.nn.Module):
 
 			# Use dynamic=False to avoid symbolic shapes which conflict with vmap in reward/V heads
 			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=False)
+			self.planner.plan = torch.compile(self.planner.plan, mode=self.cfg.compile_type, fullgraph=False, dynamic=False)
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
