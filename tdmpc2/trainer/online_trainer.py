@@ -140,7 +140,8 @@ class OnlineTrainer(Trainer):
 		while self._step <= self.cfg.steps:
 			# Logging cadence flags
 			detail_freq = self.cfg.log_detail_freq
-			detailed_log_flag = (self._step % detail_freq == 0) or (self._step == self.cfg.steps)
+			# Only trigger detailed logging at non-zero steps that are multiples of detail_freq
+			detailed_log_flag = (self._step != 0 and self._step % detail_freq == 0) or (self._step == self.cfg.steps)
 			basic_log_flag = (self._step % self.cfg.log_freq == 0) or detailed_log_flag
 			# Evaluate agent periodically, but never at step 0
 			if self._step != 0 and (self._step % self.cfg.eval_freq == 0):

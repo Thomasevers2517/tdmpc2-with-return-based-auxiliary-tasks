@@ -373,10 +373,6 @@ class Planner(torch.nn.Module):
             # Compute post-noise effects once (no-grad), available for logger + wandb
             with torch.no_grad():
                 info_adv.compute_post_noise_effects(self.world_model)
-            # Update warm-start mean for next call
-            self.prev_mean.copy_(mean)
-            # Ensure bounds
-            return chosen_action.detach(), info_adv, mean.detach(), std.detach()
 
         # Update warm-start mean for next call
         self.prev_mean.copy_(mean)
