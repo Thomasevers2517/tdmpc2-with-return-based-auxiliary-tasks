@@ -894,6 +894,8 @@ class TDMPC2(torch.nn.Module):
 		# Reshape back to [Ve, T, H, B, 1]
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
+
+		#TODO WARNING, fixing this and replacing this .item() call somehow breaks the performance of the algo, I do no know why. Someone should fix it for faster compile.
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
 		

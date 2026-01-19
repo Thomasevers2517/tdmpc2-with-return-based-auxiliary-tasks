@@ -27,7 +27,7 @@ from common.logger import get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
-torch._dynamo.config.capture_scalar_outputs = True
+# torch._dynamo.config.capture_scalar_outputs = True
 # torch.autograd.set_detect_anomaly(True)
 
 @hydra.main(config_name='config', config_path='.')

@@ -197,6 +197,14 @@ which python
 export PYTHONNOUSERSITE=1
 export MUJOCO_GL=egl
 
+# Store compilation caches on work filesystem (not scratch-local which can have issues)
+CACHE_BASE="${SLURM_SUBMIT_DIR}/.compile_cache"
+mkdir -p "${CACHE_BASE}/inductor" "${CACHE_BASE}/triton" "${CACHE_BASE}/cuda"
+export TORCHINDUCTOR_CACHE_DIR="${CACHE_BASE}/inductor"
+export TRITON_CACHE_DIR="${CACHE_BASE}/triton"
+export CUDA_CACHE_PATH="${CACHE_BASE}/cuda"
+echo "Compilation caches: ${CACHE_BASE}"
+
 
 # Helpful diagnostics: print TorchRL / TensorDict versions actually in use
 python - <<'PYVERS'
