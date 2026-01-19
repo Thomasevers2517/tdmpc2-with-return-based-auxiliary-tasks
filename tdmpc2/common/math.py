@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.distributions import Normal, kl_divergence
 from tensordict import TensorDict
 
 
@@ -170,42 +171,25 @@ def compute_knn_entropy(x: torch.Tensor, k: int = 5) -> torch.Tensor:
 
 
 def kl_div_gaussian(
-	policy_mean: torch.Tensor,   # float32[*, A]
-	policy_std: torch.Tensor,    # float32[*, A]
-	expert_mean: torch.Tensor,   # float32[*, A]
-	expert_std: torch.Tensor,    # float32[*, A]
+	p_mean: torch.Tensor,   # float32[*, A]
+	p_std: torch.Tensor,    # float32[*, A]
+	q_mean: torch.Tensor,   # float32[*, A]
+	q_std: torch.Tensor,    # float32[*, A]
 ) -> torch.Tensor:
-	"""KL divergence between two diagonal Gaussians: KL(policy || expert).
+	"""KL divergence between two diagonal Gaussians: KL(P || Q).
 	
-	KL(N(μ₁,σ₁) || N(μ₂,σ₂)) = log(σ₂/σ₁) + (σ₁² + (μ₁-μ₂)²)/(2σ₂²) - 0.5
+	Computes KL(N(p_mean, p_std) || N(q_mean, q_std)) using torch.distributions.
 	
 	Args:
-		policy_mean (Tensor[*, A]): Policy mean (squashed, in [-1,1]).
-		policy_std (Tensor[*, A]): Policy std (positive).
-		expert_mean (Tensor[*, A]): Expert mean (squashed, in [-1,1]).
-		expert_std (Tensor[*, A]): Expert std (positive).
+		p_mean (Tensor[*, A]): Mean of distribution P.
+		p_std (Tensor[*, A]): Std of distribution P (positive).
+		q_mean (Tensor[*, A]): Mean of distribution Q.
+		q_std (Tensor[*, A]): Std of distribution Q (positive).
 	
 	Returns:
 		Tensor[*, A]: Per-dimension KL divergence (sum over A for total KL).
 	"""
-	# Validate shapes match
-	assert policy_mean.shape == policy_std.shape, \
-		f"policy_mean {policy_mean.shape} != policy_std {policy_std.shape}"
-	assert policy_mean.shape == expert_mean.shape, \
-		f"policy_mean {policy_mean.shape} != expert_mean {expert_mean.shape}"
-	assert policy_std.shape == expert_std.shape, \
-		f"policy_std {policy_std.shape} != expert_std {expert_std.shape}"
+	p = Normal(p_mean, p_std)
+	q = Normal(q_mean, q_std)
 	
-	# Validate stds are positive
-	assert (policy_std > 0).all(), f"policy_std has non-positive values: min={policy_std.min()}"
-	assert (expert_std > 0).all(), f"expert_std has non-positive values: min={expert_std.min()}"
-	
-	# KL divergence formula for univariate Gaussians (applied per-dimension)
-	var_ratio = (policy_std / expert_std).pow(2)  # (σ₁/σ₂)²
-	mean_diff_sq = ((policy_mean - expert_mean) / expert_std).pow(2)  # ((μ₁-μ₂)/σ₂)²
-	kl = 0.5 * (var_ratio + mean_diff_sq - 1.0 - var_ratio.log())  # float32[*, A]
-	
-	# KL should be non-negative (up to numerical precision)
-	assert (kl >= -1e-6).all(), f"KL divergence has negative values: min={kl.min()}"
-	
-	return kl.clamp(min=0.0)  # Clamp for numerical stability
+	return kl_divergence(p, q)  # float32[*, A]

@@ -722,9 +722,13 @@ class TDMPC2(torch.nn.Module):
 		assert not torch.isnan(expert_std).any(), "expert_std contains NaN"
 		assert (expert_std > 0).all(), f"expert_std has non-positive values: min={expert_std.min()}"
 		
-		# Compute KL divergence: KL(policy || expert) per dimension
-		# Mean over action dimensions for total KL per (t, b) - consistent with BMPC
-		kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # float32[T, B, A]
+		# Compute KL divergence per dimension
+		# If fix_kl_order=True: KL(expert || policy) - minimizing makes policy match expert
+		# If fix_kl_order=False: KL(policy || expert) - legacy behavior
+		if self.cfg.fix_kl_order:
+			kl_per_dim = math.kl_div_gaussian(expert_mean, expert_std, policy_mean, policy_std)  # KL(expert || policy)
+		else:
+			kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # KL(policy || expert)
 		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
 		
 		# Scale with running scale (like BMPC does for unit consistency)
