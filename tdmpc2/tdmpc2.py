@@ -163,7 +163,11 @@ class TDMPC2(torch.nn.Module):
 		self._enc_lr_stepped = False  # Track if step-change has been applied
 
 		self.model.eval()
-		self.scale = RunningScale(cfg)
+		# Separate running scales for different policy loss types:
+		# - q_scale: for SVG (calc_pi_losses), min_scale=1.0 (legacy behavior)
+		# - kl_scale: for KL distillation (calc_pi_distillation_losses), min_scale from config
+		self.q_scale = RunningScale(cfg, min_scale=1.0)
+		self.kl_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
@@ -204,7 +208,8 @@ class TDMPC2(torch.nn.Module):
 		log.info('Discount factor: %s', str(self.discount))
 
 		# Modular planner (replaces legacy _plan / _prev_mean logic)
-		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=self.scale, discount=self.discount)
+		# Note: scale=None since planner's scale is reserved/unused; we use q_scale/kl_scale in update
+		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=None, discount=self.discount)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
 			# Keep eager references
@@ -612,8 +617,8 @@ class TDMPC2(torch.nn.Module):
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
 			# when computing both policies in a single backward pass.
 			if not optimistic:
-				self.scale.update(q_estimate[0])
-			q_scaled = self.scale(q_estimate)  # float32[T, B*N, 1]
+				self.q_scale.update(q_estimate[0])
+			q_scaled = self.q_scale(q_estimate)  # float32[T, B*N, 1]
 			
 			# Temporal weighting
 			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
@@ -647,7 +652,7 @@ class TDMPC2(torch.nn.Module):
 				"pi_entropy": info_entropy,
 				"pi_scaled_entropy": info_scaled_entropy,
 				"pi_entropy_multiplier": info["entropy_multiplier"],
-				"pi_scale": self.scale.value,
+				"pi_q_scale": self.q_scale.value,
 				"pi_std": info_log_std.mean(),
 				"pi_mean": info_mean.mean(),
 				"pi_abs_mean": info_mean.abs().mean(),
@@ -731,9 +736,9 @@ class TDMPC2(torch.nn.Module):
 			kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # KL(policy || expert)
 		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
 		
-		# Scale with running scale (like BMPC does for unit consistency)
-		self.scale.update(kl_loss[0])
-		kl_scaled = self.scale(kl_loss)  # float32[T, B, 1]
+		# Scale with running scale (uses kl_scale with configurable min_scale)
+		self.kl_scale.update(kl_loss[0])
+		kl_scaled = self.kl_scale(kl_loss)  # float32[T, B, 1]
 		
 		# Entropy bonus (use optimistic or pessimistic entropy coeff)
 		if optimistic:
@@ -758,7 +763,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_kl_per_dim": kl_per_dim.mean(),
 			"pi_entropy": info["entropy"].mean(),
 			"pi_scaled_entropy": info["scaled_entropy"].mean(),
-			"pi_scale": self.scale.value,
+			"pi_kl_scale": self.kl_scale.value,
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
 			"pi_abs_mean": info["mean"].abs().mean(),

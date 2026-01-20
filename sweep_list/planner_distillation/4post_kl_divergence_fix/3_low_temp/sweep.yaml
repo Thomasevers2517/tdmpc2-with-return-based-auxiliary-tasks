@@ -8,11 +8,12 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep: Post KL Divergence Fix - Test
+  # Sweep: Post KL Divergence Fix - Low Temperature
   # 
-  # Simple test sweep on quadruped-walk to verify
-  # the fix_kl_order=true change works correctly.
-  # Uses KL(expert || policy) instead of KL(policy || expert).
+  # Test with lower reanalyze_temperature (0.1) to get
+  # sharper/spikier target distributions from the planner.
+  # This should reduce policy entropy and lead to faster
+  # value improvement (less exploration, more exploitation).
   #############################################
 
   task:
@@ -22,18 +23,31 @@ parameters:
     values: [1]
 
   #############################################
-  # KL DIVERGENCE FIX
+  # KEY CHANGES FOR THIS SWEEP
   #############################################
 
+  # Use correct KL order: KL(expert || policy)
   fix_kl_order:
     value: true
+
+  # Lower temperature -> sharper/spikier target distributions
+  reanalyze_temperature:
+    value: 0.1
+
+  # Allow KL scale to go below 1.0 for amplifying small KL losses
+  kl_scale_min:
+    value: 0.1
+
+  # Update value more frequently
+  value_update_freq:
+    value: 2
 
   #############################################
   # ENTROPY SETTINGS
   #############################################
 
   start_entropy_coeff:
-    value: 0.0001
+    value: 0.0
   optimistic_entropy_mult:
     value: 100
   start_dynamic_entropy_ratio:
@@ -65,7 +79,7 @@ parameters:
   #############################################
 
   reanalyze_interval:
-    value: 10
+    value: 5
   reanalyze_batch_size:
     value: 32
   reanalyze_horizon:
@@ -73,13 +87,11 @@ parameters:
   reanalyze_iterations:
     value: 4
   reanalyze_num_samples:
-    value: 256
+    value: 512
   reanalyze_num_elites:
     value: 64
   reanalyze_num_pi_trajs:
     value: 24
-  reanalyze_temperature:
-    value: 0.5
   reanalyze_value_std_coef:
     value: 0
 
@@ -163,8 +175,6 @@ parameters:
     value: 0
   utd_ratio:
     value: 4
-  value_update_freq:
-    value: 1
   pi_update_freq:
     value: 1
 

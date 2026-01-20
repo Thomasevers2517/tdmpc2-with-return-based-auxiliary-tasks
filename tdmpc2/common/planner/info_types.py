@@ -100,6 +100,8 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         latent_disagreements_all: Optional[torch.Tensor]  # float32[I, E]
         value_disagreements_all: Optional[torch.Tensor]  # float32[I, E]
         raw_scores: float32[I, E]
+        mean_hist: float32[I, T, A] - mean action distribution per iteration
+        std_hist: float32[I, T, A] - std action distribution per iteration
     """
     actions_all: torch.Tensor
     latents_all: torch.Tensor
@@ -108,6 +110,8 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     latent_disagreements_all: Optional[torch.Tensor]
     value_disagreements_all: Optional[torch.Tensor]
     raw_scores: torch.Tensor
+    mean_hist: torch.Tensor  # float32[I, T, A]
+    std_hist: torch.Tensor   # float32[I, T, A]
 
     # Analysis context (advanced-only)
     action_seq_chosen: torch.Tensor  # (T,A)
@@ -173,6 +177,8 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         by `raw_scores`. For each selected candidate, print value, disagreement (if any),
         weighted disagreement, total score, and a slice of its action sequence limited to
         the first `num_action` action dimensions.
+        
+        Also displays the sampling distribution (mean/std) at each iteration.
         """
         lines = []
         I = self.actions_all.shape[0]
@@ -187,6 +193,22 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
 
         for i in range(I):
             lines.append(f"Iteration {i} | candidates={E}")
+            
+            # Distribution info: mean/std at this iteration
+            mean_i = self.mean_hist[i]  # [T, A]
+            std_i = self.std_hist[i]    # [T, A]
+            
+            # Show t=0 distribution (first action step) for first few action dims
+            mean_t0 = mean_i[0, :min(num_action, A)]  # [num_action]
+            std_t0 = std_i[0, :min(num_action, A)]    # [num_action]
+            lines.append(f"  dist t=0: mean=[{_fmt_vec(mean_t0)}] std=[{_fmt_vec(std_t0)}]")
+            
+            # Show average std across all timesteps and action dims
+            avg_std = float(std_i.mean().item())
+            max_std = float(std_i.max().item())
+            min_std = float(std_i.min().item())
+            lines.append(f"  dist all: avg_std={avg_std:.4f} max_std={max_std:.4f} min_std={min_std:.4f}")
+            
             scores_i = self.raw_scores[i]            # (E,)
             vals_i = self.values_all_scaled[i]       # (E,)
             latent_dis_i = self.latent_disagreements_all[i] if has_latent_dis else None  # (E,)

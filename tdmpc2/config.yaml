@@ -241,6 +241,7 @@ reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral,
 policy_optimization_method: distillation    # 'svg' (backprop through model) | 'distillation' (KL to expert) | 'both'
 optimistic_policy_optimization_method: same  # 'same' = same as policy_optimization_method | 'svg' | 'distillation' | 'both'
 fix_kl_order: true                          # If true, use KL(expert || policy); if false, use KL(policy || expert)
+kl_scale_min: 1.0                           # Minimum value for KL loss RunningScale (1.0 = no amplification, <1.0 allows amplifying small losses)
 
 # actor
 log_std_min: -10

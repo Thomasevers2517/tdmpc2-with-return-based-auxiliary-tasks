@@ -8,11 +8,12 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep: Post KL Divergence Fix - Test
+  # Sweep: Post KL Divergence Fix - Test 2
   # 
   # Simple test sweep on quadruped-walk to verify
   # the fix_kl_order=true change works correctly.
   # Uses KL(expert || policy) instead of KL(policy || expert).
+  # With reanalyze_num_samples=512 and reanalyze_interval=5
   #############################################
 
   task:
@@ -33,7 +34,7 @@ parameters:
   #############################################
 
   start_entropy_coeff:
-    value: 0.0001
+    value: 0.00000
   optimistic_entropy_mult:
     value: 100
   start_dynamic_entropy_ratio:
@@ -65,7 +66,7 @@ parameters:
   #############################################
 
   reanalyze_interval:
-    value: 10
+    value: 5
   reanalyze_batch_size:
     value: 32
   reanalyze_horizon:
@@ -73,7 +74,7 @@ parameters:
   reanalyze_iterations:
     value: 4
   reanalyze_num_samples:
-    value: 256
+    value: 512
   reanalyze_num_elites:
     value: 64
   reanalyze_num_pi_trajs:
