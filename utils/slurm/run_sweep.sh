@@ -198,12 +198,13 @@ export PYTHONNOUSERSITE=1
 export MUJOCO_GL=egl
 
 # Store compilation caches on work filesystem (not scratch-local which can have issues)
-CACHE_BASE="${SLURM_SUBMIT_DIR}/.compile_cache"
-mkdir -p "${CACHE_BASE}/inductor" "${CACHE_BASE}/triton" "${CACHE_BASE}/cuda"
-export TORCHINDUCTOR_CACHE_DIR="${CACHE_BASE}/inductor"
-export TRITON_CACHE_DIR="${CACHE_BASE}/triton"
-export CUDA_CACHE_PATH="${CACHE_BASE}/cuda"
-echo "Compilation caches: ${CACHE_BASE}"
+# NOTE: Commented out due to concurrent write corruption issues - revisit later
+# CACHE_BASE="${SLURM_SUBMIT_DIR}/.compile_cache"
+# mkdir -p "${CACHE_BASE}/inductor" "${CACHE_BASE}/triton" "${CACHE_BASE}/cuda"
+# export TORCHINDUCTOR_CACHE_DIR="${CACHE_BASE}/inductor"
+# export TRITON_CACHE_DIR="${CACHE_BASE}/triton"
+# export CUDA_CACHE_PATH="${CACHE_BASE}/cuda"
+# echo "Compilation caches: ${CACHE_BASE}"
 
 
 # Helpful diagnostics: print TorchRL / TensorDict versions actually in use
@@ -233,10 +234,20 @@ wandb login --relogin "${WANDB_API_KEY}" >/dev/null
 
 echo "Starting wandb agent: ${SWEEP_ID} (count=${RUNS_PER_JOB})"
 # Use srun with per-task output files (task %t within the step)
+# Each task gets its own cache directory via SLURM_PROCID to avoid concurrent write corruption
 SRUN_OUT_DIR="${OUT_DIR:-/tmp}"
 srun --output="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.out" \
      --error="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.err" \
-     wandb agent --count "${RUNS_PER_JOB}" "${SWEEP_ID}"
+     bash -c '
+       # Per-task cache directories to avoid corruption from concurrent writes
+       TASK_CACHE="${SLURM_SUBMIT_DIR}/.compile_cache/job_${SLURM_JOB_ID}_task_${SLURM_PROCID}"
+       mkdir -p "${TASK_CACHE}/inductor" "${TASK_CACHE}/triton" "${TASK_CACHE}/cuda"
+       export TORCHINDUCTOR_CACHE_DIR="${TASK_CACHE}/inductor"
+       export TRITON_CACHE_DIR="${TASK_CACHE}/triton"
+       export CUDA_CACHE_PATH="${TASK_CACHE}/cuda"
+       echo "Task ${SLURM_PROCID}: cache at ${TASK_CACHE}"
+       wandb agent --count "${RUNS_PER_JOB}" "${SWEEP_ID}"
+     '
 
 echo "Agent finished."
 BATCH

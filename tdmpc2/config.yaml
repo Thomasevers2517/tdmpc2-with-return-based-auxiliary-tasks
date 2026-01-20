@@ -240,6 +240,8 @@ reanalyze_temperature: 0.5          # Temperature for elite selection during rea
 reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral, >0 = optimistic, <0 = pessimistic)
 policy_optimization_method: distillation    # 'svg' (backprop through model) | 'distillation' (KL to expert) | 'both'
 optimistic_policy_optimization_method: same  # 'same' = same as policy_optimization_method | 'svg' | 'distillation' | 'both'
+policy_svg_distill_ratio: 0.5               # When method='both': ratio of distillation loss. 0=pure SVG, 1=pure distillation
+                                            # Combined loss = (1 - ratio) * svg_loss + ratio * distill_loss
 fix_kl_order: true                          # If true, use KL(expert || policy); if false, use KL(policy || expert)
 kl_scale_min: 1.0                           # Minimum value for KL loss RunningScale (1.0 = no amplification, <1.0 allows amplifying small losses)
 

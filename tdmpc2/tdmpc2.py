@@ -821,12 +821,15 @@ class TDMPC2(torch.nn.Module):
 			pi_loss, info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
 			
 		elif method == 'both':
-			# Combined: SVG + distillation
+			# Combined: SVG + distillation with configurable ratio
+			# ratio=0 -> pure SVG, ratio=1 -> pure distillation
 			svg_loss, svg_info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
 			distill_loss, distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
 			
-			pi_loss = svg_loss + distill_loss
+			ratio = self.cfg.policy_svg_distill_ratio
+			pi_loss = (1.0 - ratio) * svg_loss + ratio * distill_loss
 			info = svg_info
+			info['svg_distill_ratio'] = ratio
 			# Merge distillation info with prefix
 			for k, v in distill_info.items():
 				info[f'distill_{k}'] = v
@@ -840,11 +843,14 @@ class TDMPC2(torch.nn.Module):
 			elif opti_method == 'distillation':
 				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
 			elif opti_method == 'both':
-				# Combined: SVG + distillation for optimistic
+				# Combined: SVG + distillation for optimistic with configurable ratio
 				opti_svg_loss, opti_svg_info = self.calc_pi_losses(zs, task, optimistic=True)
 				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
-				opti_pi_loss = opti_svg_loss + opti_distill_loss
+				
+				ratio = self.cfg.policy_svg_distill_ratio
+				opti_pi_loss = (1.0 - ratio) * opti_svg_loss + ratio * opti_distill_loss
 				opti_info = opti_svg_info
+				opti_info['svg_distill_ratio'] = ratio
 				for k, v in opti_distill_info.items():
 					opti_info[f'distill_{k}'] = v
 			else:
