@@ -484,14 +484,24 @@ class WorldModel(nn.Module):
 			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action and apply squash (tanh) with configurable Jacobian correction
-			# jacobian_correction_scale controls how much we penalize action saturation:
-			#   1.0 = correct entropy (full Jacobian penalty near ±1)
-			#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
-			action = mean + eps * log_std.exp()
-			presquash_mean = mean
-			jacobian_scale = float(self.cfg.jacobian_correction_scale)
-			mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
+			# Sample action using either BMPC-style or standard squash parameterization
+			if self.cfg.bmpc_policy_parameterization:
+				# BMPC-style: squash mean first, then add noise with clamp
+				# mean = tanh(mean_raw), action = (mean + eps * std).clamp(-1, 1)
+				# No Jacobian correction needed since we don't squash the full sample
+				mean = torch.tanh(mean)
+				presquash_mean = mean  # Already squashed
+				action = (mean + eps * log_std.exp()).clamp(-1, 1)
+				log_prob = log_prob_presquash  # No Jacobian correction
+			else:
+				# Standard squashed Gaussian: action = tanh(mean + eps * std)
+				# jacobian_correction_scale controls how much we penalize action saturation:
+				#   1.0 = correct entropy (full Jacobian penalty near ±1)
+				#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
+				action = mean + eps * log_std.exp()
+				presquash_mean = mean
+				jacobian_scale = float(self.cfg.jacobian_correction_scale)
+				mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
 			
 			# Entropy and scaled_entropy for policy loss
 			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)

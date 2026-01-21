@@ -264,6 +264,14 @@ entropy_action_dim_power: 1.0
 # Setting to 0.0 reproduces the old buggy behavior which may help tasks requiring
 # extreme/saturated actions (e.g., dog-run) by not penalizing confidence near boundaries.
 jacobian_correction_scale: 1.0
+
+# BMPC-style policy parameterization (alternative to squashing full action):
+# If true: mean = tanh(mean_raw), action = (mean + eps * std).clamp(-1, 1)
+#   - No Jacobian correction needed since we only squash the mean, not the sample
+#   - Policy learns in bounded mean space; noise adds exploration around tanh(mean)
+# If false (default): action = mean + eps * std, then action = tanh(action)
+#   - Standard squashed Gaussian; requires Jacobian correction for entropy
+bmpc_policy_parameterization: false
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 1 # if set to 0.8, at 80% of training steps the entropy coeff will start to decay linearly.
 dynamic_entropy_schedule : exponential  # linear | exponential
