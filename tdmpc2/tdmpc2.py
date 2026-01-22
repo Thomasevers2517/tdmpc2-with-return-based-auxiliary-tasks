@@ -118,7 +118,7 @@ class TDMPC2(torch.nn.Module):
 		param_groups = [
 			{'params': self.model._encoder.parameters(), 'lr': lr_encoder},
 			{'params': self.model._dynamics_heads.parameters(), 'lr': lr_dynamics},
-			{'params': self.model._Rs.parameters(), 'lr': lr_reward},
+			{'params': self.model._reward_heads.parameters(), 'lr': lr_reward},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else [], 'lr': self.cfg.lr},
 			{'params': self.model._Vs.parameters(), 'lr': lr_value},
 			{'params': self.model._task_emb.parameters() if self.cfg.multitask else [], 'lr': self.cfg.lr}
@@ -163,33 +163,11 @@ class TDMPC2(torch.nn.Module):
 		self._enc_lr_stepped = False  # Track if step-change has been applied
 
 		self.model.eval()
-		# Separate running scales for different policy loss types:
-		# - q_scale: for SVG (calc_pi_losses), min_scale=1.0 (legacy behavior)
-		# - kl_scale: for KL distillation (calc_pi_distillation_losses), min_scale from config
-		self.q_scale = RunningScale(cfg, min_scale=1.0)
-		self.kl_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
+		self.scale = RunningScale(cfg)
 		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
-		self._last_reanalyze_step = -1  # Track last step where reanalyze was run (prevent duplicates with utd_ratio > 1)
 		self.log_detailed = None  # whether to log detailed gradients (set via external signal)
-		
-		# Frozen random encoder for KNN entropy estimation (observation diversity metric)
-		# Only for state observations (not pixels)
-		if self.cfg.obs == 'state':
-			obs_dim = list(self.cfg.obs_shape.values())[0][0]  # Get first obs modality dim
-			knn_entropy_dim = int(getattr(self.cfg, 'knn_entropy_dim', 128))
-			self._knn_encoder = torch.nn.Sequential(
-				torch.nn.Linear(obs_dim, 64),
-				torch.nn.ReLU(),
-				torch.nn.Linear(64, knn_entropy_dim),
-			).to(self.device)
-			# Freeze encoder
-			for p in self._knn_encoder.parameters():
-				p.requires_grad_(False)
-			self._knn_encoder.eval()
-		else:
-			self._knn_encoder = None
 		self.register_buffer(
 			"dynamic_entropy_coeff",
 			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
@@ -208,8 +186,7 @@ class TDMPC2(torch.nn.Module):
 		log.info('Discount factor: %s', str(self.discount))
 
 		# Modular planner (replaces legacy _plan / _prev_mean logic)
-		# Note: scale=None since planner's scale is reserved/unused; we use q_scale/kl_scale in update
-		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=None, discount=self.discount)
+		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=self.scale)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
 			# Keep eager references
@@ -232,9 +209,8 @@ class TDMPC2(torch.nn.Module):
 			self.optim_step = optim_step
 			self.pi_optim_step = pi_optim_step
 
-			# Use dynamic=False to avoid symbolic shapes which conflict with vmap in reward/V heads
-			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=False)
-			self.planner.plan = torch.compile(self.planner.plan, mode=self.cfg.compile_type, fullgraph=False, dynamic=False)
+
+			self.act = torch.compile(self.act, mode=self.cfg.compile_type, dynamic=True)
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
@@ -290,7 +266,7 @@ class TDMPC2(torch.nn.Module):
 		return
 
 	@torch.no_grad()
-	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True, eval_head_reduce: str = 'default', log_detailed: bool = False):
+	def act(self, obs, eval_mode: bool = False, task=None, mpc: bool = True):
 		"""Select an action.
 
 		If `mpc=True`, uses modular `Planner` over latent space; else falls back to single policy prior.
@@ -300,10 +276,6 @@ class TDMPC2(torch.nn.Module):
 			eval_mode (bool): Evaluation flag (planner switches to value-only scoring / argmax selection).
 			task: Optional task index (unsupported for planner; passed to policy when mpc=False).
 			mpc (bool): Whether to use planning.
-			eval_head_reduce (str): Head reduction mode for eval ('default', 'mean').
-				'default' uses planner_value_std_coef_eval (typically pessimistic).
-				'mean' uses value_std_coef=0 for mean-only reduction.
-			log_detailed (bool): If True, planner returns PlannerAdvancedInfo with full iteration history.
 
 		Returns:
 			Tensor: Action.
@@ -319,96 +291,19 @@ class TDMPC2(torch.nn.Module):
 			if mpc:
 				# Encode observation -> latent start (shape [1,L])
 				z0 = self.model.encode(obs, task_tensor)
-				
-				# Convert eval_head_reduce to value_std_coef_override
-				# 'default' -> None (use config), 'mean' -> 0.0 (mean-only)
-				value_std_coef_override = 0.0 if eval_head_reduce == 'mean' else None
-				
-				# Planner now returns batch dimension: action [B, A], mean [B, T, A], std [B, T, A]
-				# For acting (B=1), squeeze the batch dim
 				chosen_action, planner_info, mean, std = self.planner.plan(
-					z0, task=None, eval_mode=eval_mode, log_detailed=log_detailed,
-					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff)),
-					value_std_coef_override=value_std_coef_override,
-					use_warm_start=True,
-					update_warm_start=True,
-					reanalyze=False,
+					z0.squeeze(0), task=None, eval_mode=eval_mode, step=self._step,
+					train_noise_multiplier=(0.0 if eval_mode else float(self.cfg.train_act_std_coeff))
 				)
 
 				# Planner already applies any training noise and clamps
-				# Squeeze batch dim for single-sample acting
-				return chosen_action.squeeze(0), planner_info
+				return chosen_action, planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
 			action_pi, info_pi = self.model.pi(z, task_tensor)
 			if eval_mode:
 				action_pi = info_pi['mean']
 			return action_pi[0], None
-
-	@torch.no_grad()
-	def reanalyze(self, obs, task=None):
-		"""Run planner on observations to get expert targets for policy distillation.
-		
-		This is separate from act() - reanalyze uses different planner settings
-		(no warm start, specific hyperparameters for generating consistent targets).
-		Used both for immediate reanalyze (single obs from online trainer) and
-		lazy reanalyze (batch of obs from replay buffer).
-		
-		Args:
-			obs: Observations, float32[B, *obs_shape] where B can be 1 or larger.
-			task: Optional task indices for multitask.
-		
-		Returns:
-			expert_action_dist: float32[B, A, 2] where [...,0]=mean, [...,1]=std.
-			expert_value: float32[B] scalar value estimates (None if B>1).
-			planner_info: PlannerBasicInfo or None (for logging).
-		"""
-		self.model.eval()
-		with maybe_range('Agent/reanalyze', self.cfg):
-			if task is not None:
-				task_tensor = torch.tensor([task], device=self.device) if not torch.is_tensor(task) else task
-			else:
-				task_tensor = None
-			
-			# Encode observations -> latent states [B, L]
-			z = self.model.encode(obs, task_tensor)  # float32[B, L]
-			B = z.shape[0]
-			
-			# Run planner with reanalyze=True:
-			# - use_warm_start=False (independent per sample)
-			# - update_warm_start=False (don't pollute warm start for acting)
-			# - Uses reanalyze-specific hyperparameters (iterations, num_samples, num_pi_trajs)
-			chosen_action, planner_info, mean, std = self.planner.plan(
-				z,
-				task=task_tensor,
-				eval_mode=False,
-				log_detailed=False,  # No detailed logging during reanalyze
-				train_noise_multiplier=0.0,  # No noise for expert targets
-				value_std_coef_override=None,
-				use_warm_start=False,
-				update_warm_start=False,
-				reanalyze=True,
-			)
-			# mean, std: [B, T, A] -> take first timestep [:, 0, :] -> [B, A]
-			expert_mean = mean[:, 0, :]  # float32[B, A]
-			expert_std = std[:, 0, :]    # float32[B, A]
-			
-			# Ensure std is within valid range (defensive; planner should already clamp)
-			expert_std = expert_std.clamp(self.cfg.min_std, self.cfg.max_std)
-			
-			# Pack into [B, A, 2] format
-			expert_action_dist = torch.stack([expert_mean, expert_std], dim=-1)  # float32[B, A, 2]
-			
-			# Get expert value: only available for B=1 when planner_info is returned
-			if planner_info is not None:
-				expert_value = planner_info.value_chosen  # scalar or [1]
-				if expert_value.dim() == 0:
-					expert_value = expert_value.unsqueeze(0)  # Ensure [B] shape
-			else:
-				# B>1: planner_info is None, expert_value not available
-				expert_value = None
-			
-			return expert_action_dist, expert_value, planner_info
 
 	# Legacy helper methods `_estimate_value`, `_plan`, `update_planner_mean` removed.
 
@@ -429,7 +324,7 @@ class TDMPC2(torch.nn.Module):
 		# dynamics (all heads)
 		groups["dynamics"] = list(self.model._dynamics_heads.parameters())
 		# reward
-		groups["reward"] = list(self.model._Rs.parameters())
+		groups["reward"] = list(self.model._reward_heads.parameters())
 		# termination (optional)
 		if self.cfg.episodic:
 			groups["termination"] = list(self.model._termination.parameters())
@@ -498,13 +393,8 @@ class TDMPC2(torch.nn.Module):
 		through dynamics. The dynamics, reward, and value function are frozen
 		during policy optimization (SAC-style backprop through frozen model).
 		
-		CORRECT OPTIMISM: For each dynamics head h, compute:
-		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std)
-		  Q_h = μ_h + value_std_coef × σ_h
-		Then reduce over dynamics heads:
-		  value_std_coef > 0: max over H (optimistic)
-		  value_std_coef < 0: min over H (pessimistic)
-		  value_std_coef = 0: mean over H (neutral)
+		Uses policy_head_reduce to aggregate over both reward heads (R) and
+		dynamics heads (H) when computing the Q-estimate.
 		
 		When num_rollouts > 1, samples multiple actions per state to reduce
 		variance in policy gradients.
@@ -512,8 +402,9 @@ class TDMPC2(torch.nn.Module):
 		Args:
 			z (Tensor[T, B, L]): Current latent states.
 			task: Task identifier for multitask setup.
-			optimistic: If True, use optimistic policy with +1.0 std_coef and
-				scaled entropy. If False, use pessimistic policy with -1.0 std_coef.
+			optimistic: If True, use optimistic policy with max reduction and
+				scaled entropy. If False, use pessimistic policy with configured
+				reduction (default min).
 			
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
@@ -525,13 +416,15 @@ class TDMPC2(torch.nn.Module):
 		# Ensure contiguity for torch.compile compatibility
 		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
 		
-		# Select std_coef based on optimistic flag
+		# Select reduction mode and entropy coefficient based on optimistic flag
 		if optimistic:
-			value_std_coef = self.cfg.optimistic_policy_value_std_coef  # +1.0 for optimistic
+			policy_reduce = self.cfg.optimistic_head_reduce  # 'max' or 'mean' for optimistic
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+			lambda_value_disagreement = self.cfg.optimistic_policy_lambda_value_disagreement
 		else:
-			value_std_coef = self.cfg.policy_value_std_coef  # -1.0 for pessimistic
+			policy_reduce = self.cfg.policy_head_reduce  # 'mean', 'min', or 'max'
 			entropy_coeff = self.dynamic_entropy_coeff
+			lambda_value_disagreement = self.cfg.policy_lambda_value_disagreement
 			
 		with maybe_range('Agent/update_pi', self.cfg):
 			# Expand z to have N rollouts: [T, B, L] -> [T, B, N, L] -> [T, B*N, L]
@@ -550,75 +443,68 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.multitask:
 				task_flat = task.repeat(T * N) if task is not None else None
 				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B*N, 1]
-				gamma_scalar = self.discount.mean().item()  # for std discounting
 			else:
 				task_flat = None
 				gamma = self.discount  # scalar
-				gamma_scalar = float(self.discount)
 			
-			# Predict reward r(z, a) from ALL reward heads
+			# Predict reward r(z, a) from all reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
+			# NOTE: Gradients flow through reward/dynamics/V to the action, but only
+			# policy params are updated (pi_optim only contains policy parameters).
 			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B*N, K]
 			R = reward_logits_all.shape[0]  # number of reward heads
 			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B*N, 1]
 			
-			# Roll through ALL dynamics heads to get next states z'
+			# Reduce over reward heads using policy_head_reduce
+			if policy_reduce == 'mean':
+				reward_flat = reward_all.mean(dim=0)  # float32[T*B*N, 1]
+			elif policy_reduce == 'min':
+				reward_flat = torch.amin(reward_all, dim=0)  # float32[T*B*N, 1]
+			elif policy_reduce == 'max':
+				reward_flat = torch.amax(reward_all, dim=0)  # float32[T*B*N, 1]
+			else:
+				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
+			
+			# Roll through ALL dynamics heads to get next states z', then reduce V
+			# This adds pessimism/optimism based on policy_head_reduce to prevent policy from exploiting errors
 			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B*N, L]
 			H = next_z_all.shape[0]  # number of dynamics heads
 			
-			# Evaluate V(z') for each dynamics head using ALL Ve value heads
+			# Evaluate V(z') for each dynamics head using detached network
+			# Use return_type='min' to also take minimum over V ensemble heads
 			# Reshape to evaluate all heads at once: [H*T*B*N, L]
 			next_z_all_flat = next_z_all.view(H * T * B * N, L)  # float32[H*T*B*N, L]
 			task_flat_expanded = task_flat.repeat(H) if task_flat is not None else None
-			# return_type='all_values' returns [Ve, H*T*B*N, 1] for all Ve heads
-			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-			Ve = v_next_all_flat.shape[0]  # number of value heads
-			v_next_all = v_next_all_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
+			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='min', detach=True)  # float32[H*T*B*N, 1]
+			v_next_all = v_next_all_flat.view(H, T * B * N, 1)  # float32[H, T*B*N, 1]
 			
-			# CORRECT OPTIMISM: Compute per dynamics head
-			# reward_all: [R, T*B*N, 1] - same reward for all dynamics heads
-			# v_next_all: [Ve, H, T*B*N, 1] - different values per dynamics head
-			
-			# Reward mean and std across R reward heads (same for all dynamics heads)
-			reward_mean = reward_all.mean(dim=0)  # float32[T*B*N, 1]
-			reward_std = reward_all.std(dim=0, unbiased=(R > 1))  # float32[T*B*N, 1]
-			
-			# Value mean and std across Ve value heads, per dynamics head h
-			v_mean_per_h = v_next_all.mean(dim=0)  # float32[H, T*B*N, 1]
-			v_std_per_h = v_next_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
-			
-			# Q_h = (r_mean + γ * v_mean_h) + std_coef * (r_std + γ * v_std_h)
-			# Total mean per dynamics head: μ_h = r_mean + γ * v_mean_h
-			q_mean_per_h = reward_mean + gamma * v_mean_per_h  # float32[H, T*B*N, 1]
-			
-			# Total std per dynamics head: σ_h = r_std + γ * v_std_h
-			q_std_per_h = reward_std + gamma_scalar * v_std_per_h  # float32[H, T*B*N, 1]
-			
-			# Q_h = μ_h + std_coef * σ_h
-			q_per_h = q_mean_per_h + value_std_coef * q_std_per_h  # float32[H, T*B*N, 1]
-			
-			# Reduce over dynamics heads based on sign of value_std_coef
-			if value_std_coef > 0:
-				# Optimistic: max over dynamics heads
-				q_estimate_flat, _ = q_per_h.max(dim=0)  # float32[T*B*N, 1]
-			elif value_std_coef < 0:
-				# Pessimistic: min over dynamics heads
-				q_estimate_flat, _ = q_per_h.min(dim=0)  # float32[T*B*N, 1]
+			# Reduce over dynamics heads using policy_head_reduce
+			if policy_reduce == 'mean':
+				v_next_flat = v_next_all.mean(dim=0)  # float32[T*B*N, 1]
+			elif policy_reduce == 'min':
+				v_next_flat = torch.amin(v_next_all, dim=0)  # float32[T*B*N, 1]
+			elif policy_reduce == 'max':
+				v_next_flat = torch.amax(v_next_all, dim=0)  # float32[T*B*N, 1]
 			else:
-				# Neutral: mean over dynamics heads
-				q_estimate_flat = q_per_h.mean(dim=0)  # float32[T*B*N, 1]
+				raise ValueError(f"Invalid policy_head_reduce '{policy_reduce}'. Expected 'mean', 'min', or 'max'.")
 			
-			q_estimate = q_estimate_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
+			# Compute value disagreement across dynamics heads (std of V estimates)
+			# Scale by self.scale.value for unit consistency with q_scaled
+			v_disagreement_flat = v_next_all.std(dim=0)  # float32[T*B*N, 1]
+			v_disagreement_scaled_flat = v_disagreement_flat / self.scale.value.clamp(min=1e-6)  # float32[T*B*N, 1]
+			v_disagreement_scaled = v_disagreement_scaled_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
 			
-			# For logging: std across dynamics heads (disagreement)
-			q_std = q_per_h.std(dim=0, unbiased=(H > 1))  # float32[T*B*N, 1]
+			# Compute Q-like estimate: r(z, a) + γ * V(z')
+			# This is what the action "earns" - immediate reward plus discounted future value
+			q_estimate_flat = reward_flat + gamma * v_next_flat  # float32[T*B*N, 1]
+			q_estimate = q_estimate_flat.view(T, B * N, 1)           # float32[T, B*N, 1]
 			
 			# Update scale with the Q-estimate (first timestep batch for stability)
 			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
 			# when computing both policies in a single backward pass.
 			if not optimistic:
-				self.q_scale.update(q_estimate[0])
-			q_scaled = self.q_scale(q_estimate)  # float32[T, B*N, 1]
+				self.scale.update(q_estimate[0])
+			q_scaled = self.scale(q_estimate)  # float32[T, B*N, 1]
 			
 			# Temporal weighting
 			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
@@ -626,11 +512,11 @@ class TDMPC2(torch.nn.Module):
 			# Entropy from policy (always use scaled_entropy with configurable action_dim power)
 			entropy_term = info["scaled_entropy"]  # float32[T, B*N, 1]
 			
-			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
-			# Uncertainty handling is now via value_std_coef in q_estimate computation
+			# Policy loss: maximize (q_scaled + entropy_coeff * entropy - λ * v_disagreement)
+			# Subtraction: positive λ penalizes uncertainty, negative λ rewards it
 			# Apply rho weighting across time
 			# Average over both B and N dimensions to reduce variance from multiple rollouts
-			objective = q_scaled + entropy_coeff * entropy_term  # float32[T, B*N, 1]
+			objective = q_scaled + entropy_coeff * entropy_term - lambda_value_disagreement * v_disagreement_scaled  # float32[T, B*N, 1]
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# Add hinge^p penalty on pre-squash mean μ
@@ -645,6 +531,7 @@ class TDMPC2(torch.nn.Module):
 			info_log_std = info["log_std"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			info_presquash_mean = info["presquash_mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			q_estimate_avg = q_estimate.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			v_disagreement_scaled_avg = v_disagreement_scaled.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
 
 			info = TensorDict({
 				"pi_loss": pi_loss,
@@ -652,7 +539,7 @@ class TDMPC2(torch.nn.Module):
 				"pi_entropy": info_entropy,
 				"pi_scaled_entropy": info_scaled_entropy,
 				"pi_entropy_multiplier": info["entropy_multiplier"],
-				"pi_q_scale": self.q_scale.value,
+				"pi_scale": self.scale.value,
 				"pi_std": info_log_std.mean(),
 				"pi_mean": info_mean.mean(),
 				"pi_abs_mean": info_mean.abs().mean(),
@@ -665,196 +552,37 @@ class TDMPC2(torch.nn.Module):
 				"entropy_coeff": self.dynamic_entropy_coeff,
 				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate_avg.mean(),
-				"pi_reward_mean": reward_all.mean(),
-				"pi_v_next_mean": v_next_all.mean(),
-				"pi_q_std": q_std.mean(),  # Std across (Ve × H × R) - now used in q_estimate via value_std_coef
+				"pi_reward_mean": reward_flat.mean(),
+				"pi_v_next_mean": v_next_flat.mean(),
+				"pi_value_disagreement": v_disagreement_flat.mean(),
+				"pi_value_disagreement_scaled": v_disagreement_scaled_avg.mean(),
 				"pi_num_rollouts": float(N),  # Log how many rollouts used (float for mean() compatibility)
 			}, device=self.device)
 
 			return pi_loss, info
 
-	def calc_pi_distillation_losses(self, z, expert_action_dist, task, optimistic=False):
-		"""Compute policy loss via KL divergence distillation from expert planner targets.
-		
-		Distills the planner's action distribution into the policy via KL divergence.
-		This is an alternative to SVG-style policy optimization (calc_pi_losses).
-		
-		Args:
-			z (Tensor[T+1, B, L]): Latent states. Uses z[:-1] for policy (matches actions).
-			expert_action_dist (Tensor[T, B, A, 2]): Expert distributions where [...,0]=mean, [...,1]=std.
-			task: Task identifier for multitask setup.
-			optimistic (bool): If True, use optimistic policy and entropy coeff.
-		
-		Returns:
-			Tuple[Tensor, TensorDict]: Policy loss and info dict.
-		"""
-		# Validate input shapes
-		assert z.dim() == 3, f"z must be [T+1, B, L], got {z.shape}"
-		assert expert_action_dist.dim() == 4, f"expert_action_dist must be [T, B, A, 2], got {expert_action_dist.shape}"
-		assert expert_action_dist.shape[-1] == 2, f"expert_action_dist last dim must be 2, got {expert_action_dist.shape[-1]}"
-		
-		T_plus_1, B, L = z.shape
-		T = T_plus_1 - 1
-		T_expert, B_expert, A, _ = expert_action_dist.shape
-		
-		# Validate alignment: z has T+1 timesteps, expert has T
-		assert T == T_expert, f"z time dim ({T_plus_1}-1={T}) must match expert time dim ({T_expert})"
-		assert B == B_expert, f"z batch dim ({B}) must match expert batch dim ({B_expert})"
-		
-		# Use z[:-1] for policy (aligns with expert_action_dist timesteps)
-		z_for_pi = z[:-1]  # float32[T, B, L]
-		
-		# Get policy distribution (optimistic or pessimistic based on flag)
-		with maybe_range('Agent/pi_distillation', self.cfg):
-			_, info = self.model.pi(z_for_pi, task, optimistic=optimistic)
-		
-		# Extract policy mean/std
-		# Note: policy mean is already squashed (tanh applied), in [-1, 1]
-		policy_mean = info["mean"]           # float32[T, B, A]
-		policy_std = info["log_std"].exp()   # float32[T, B, A]
-		
-		# Validate policy output shapes
-		assert policy_mean.shape == (T, B, A), f"policy_mean shape {policy_mean.shape} != expected ({T}, {B}, {A})"
-		assert policy_std.shape == (T, B, A), f"policy_std shape {policy_std.shape} != expected ({T}, {B}, {A})"
-		
-		# Extract expert mean/std
-		# Expert targets are from planner's final distribution, also in [-1, 1]
-		expert_mean = expert_action_dist[..., 0]  # float32[T, B, A]
-		expert_std = expert_action_dist[..., 1]   # float32[T, B, A]
-		
-		# Validate expert values are reasonable
-		assert not torch.isnan(expert_mean).any(), "expert_mean contains NaN"
-		assert not torch.isnan(expert_std).any(), "expert_std contains NaN"
-		assert (expert_std > 0).all(), f"expert_std has non-positive values: min={expert_std.min()}"
-		
-		# Compute KL divergence per dimension
-		# If fix_kl_order=True: KL(expert || policy) - minimizing makes policy match expert
-		# If fix_kl_order=False: KL(policy || expert) - legacy behavior
-		if self.cfg.fix_kl_order:
-			kl_per_dim = math.kl_div_gaussian(expert_mean, expert_std, policy_mean, policy_std)  # KL(expert || policy)
-		else:
-			kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # KL(policy || expert)
-		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
-		
-		# Scale with running scale (uses kl_scale with configurable min_scale)
-		self.kl_scale.update(kl_loss[0])
-		kl_scaled = self.kl_scale(kl_loss)  # float32[T, B, 1]
-		
-		# Entropy bonus (use optimistic or pessimistic entropy coeff)
-		if optimistic:
-			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
-		else:
-			entropy_coeff = self.dynamic_entropy_coeff
-		entropy_term = info["scaled_entropy"]  # float32[T, B, 1]
-		
-		# Temporal weighting with rho (exponential decay)
-		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
-		
-		# Final loss: minimize (KL - entropy_coeff * entropy), weighted by rho
-		# Note: KL is already a "loss" (minimize), entropy is a bonus (maximize -> subtract)
-		objective = kl_scaled - entropy_coeff * entropy_term  # float32[T, B, 1]
-		pi_loss = (objective.mean(dim=(1, 2)) * rho_pows).mean()
-		
-		# Build info dict
-		info_out = TensorDict({
-			"pi_loss": pi_loss,
-			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
-			"pi_kl_loss": kl_loss.mean(),
-			"pi_kl_per_dim": kl_per_dim.mean(),
-			"pi_entropy": info["entropy"].mean(),
-			"pi_scaled_entropy": info["scaled_entropy"].mean(),
-			"pi_kl_scale": self.kl_scale.value,
-			"pi_std": info["log_std"].mean(),
-			"pi_mean": info["mean"].mean(),
-			"pi_abs_mean": info["mean"].abs().mean(),
-			"entropy_coeff": torch.tensor(entropy_coeff, device=self.device),
-			"expert_mean_abs": expert_mean.abs().mean(),
-			"expert_std_mean": expert_std.mean(),
-		}, device=self.device)
-		
-		return pi_loss, info_out
-
-	def update_pi(self, zs, task, expert_action_dist=None):
+	def update_pi(self, zs, task):
 		"""
 		Update policy using a sequence of latent states.
 		
-		Supports policy optimization methods:
-		- 'svg': Backprop through world model (calc_pi_losses)
-		- 'distillation': KL divergence to expert planner targets (calc_pi_distillation_losses)
-		- 'both': Sum of SVG and distillation losses (pessimistic only)
-		
-		Pessimistic policy uses cfg.policy_optimization_method.
-		Optimistic policy uses cfg.optimistic_policy_optimization_method (svg or distillation).
+		If dual_policy_enabled, computes losses for both pessimistic and optimistic
+		policies and sums them with equal weight.
 
 		Args:
-			zs (torch.Tensor): Sequence of latent states [T+1, B, L].
+			zs (torch.Tensor): Sequence of latent states.
 			task (torch.Tensor): Task index (only used for multi-task experiments).
-			expert_action_dist (torch.Tensor): Expert action distributions [T, B, A, 2].
-				Required when policy_optimization_method is 'distillation' or 'both',
-				or when optimistic_policy_optimization_method is 'distillation'.
 
 		Returns:
 			Tuple[float, TensorDict]: Total policy loss and info dict.
 		"""
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
-		method = str(self.cfg.policy_optimization_method).lower()
 		
-		# Optimistic method: 'same' means use same as pessimistic
-		opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
-		opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
-		
-		# Validate expert_action_dist is provided when needed
-		needs_expert = method in ('distillation', 'both') or (
-			self.cfg.dual_policy_enabled and opti_method == 'distillation'
-		)
-		if needs_expert:
-			assert expert_action_dist is not None, \
-				f"expert_action_dist required for policy_optimization_method='{method}' or optimistic_policy_optimization_method='{opti_method}'"
-		
-		# Compute losses based on method (pessimistic policy)
-		if method == 'svg':
-			# Pure SVG: backprop through world model
-			pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
-			
-		elif method == 'distillation':
-			# Pure distillation: KL to expert targets (pessimistic policy only)
-			pi_loss, info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
-			
-		elif method == 'both':
-			# Combined: SVG + distillation with configurable ratio
-			# ratio=0 -> pure SVG, ratio=1 -> pure distillation
-			svg_loss, svg_info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
-			distill_loss, distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
-			
-			ratio = self.cfg.policy_svg_distill_ratio
-			pi_loss = (1.0 - ratio) * svg_loss + ratio * distill_loss
-			info = svg_info
-			info['svg_distill_ratio'] = ratio
-			# Merge distillation info with prefix
-			for k, v in distill_info.items():
-				info[f'distill_{k}'] = v
-		else:
-			raise ValueError(f"Unknown policy_optimization_method: '{method}'. Use 'svg', 'distillation', or 'both'.")
+		# Pessimistic policy loss
+		pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
 		
 		# Optimistic policy loss (if dual policy enabled)
 		if self.cfg.dual_policy_enabled:
-			if opti_method == 'svg':
-				opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
-			elif opti_method == 'distillation':
-				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
-			elif opti_method == 'both':
-				# Combined: SVG + distillation for optimistic with configurable ratio
-				opti_svg_loss, opti_svg_info = self.calc_pi_losses(zs, task, optimistic=True)
-				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
-				
-				ratio = self.cfg.policy_svg_distill_ratio
-				opti_pi_loss = (1.0 - ratio) * opti_svg_loss + ratio * opti_distill_loss
-				opti_info = opti_svg_info
-				opti_info['svg_distill_ratio'] = ratio
-				for k, v in opti_distill_info.items():
-					opti_info[f'distill_{k}'] = v
-			else:
-				raise ValueError(f"Unknown optimistic_policy_optimization_method: '{opti_method}'. Use 'svg', 'distillation', or 'both'.")
+			opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
 			
 			# Prefix optimistic info keys with 'opti_'
 			for k, v in opti_info.items():
@@ -872,16 +600,10 @@ class TDMPC2(torch.nn.Module):
 		
 		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
 		
-		CORRECT OPTIMISM: For each dynamics head h, compute:
-		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std, if global)
-		  TD_h = μ_h + td_target_std_coef × σ_h
-		Then reduce over dynamics heads:
-		  std_coef > 0: max over H (optimistic)
-		  std_coef < 0: min over H (pessimistic)
-		  std_coef = 0: mean over H (neutral)
-		
-		Local bootstrapping: each Ve head bootstraps itself, no value std (σ^v=0).
-		Global bootstrapping: all Ve heads get same target, value std computed across Ve.
+		Reduction behavior controlled by cfg.td_bootstrap_mode:
+		  - 'min': min over Ve (value heads) and H (dynamics heads), then expand to Ve
+		  - 'mean': mean over Ve and H, then expand to Ve
+		  - 'local': each Ve head bootstraps itself, H reduced by cfg.local_td_target_dynamics_reduction
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -891,7 +613,7 @@ class TDMPC2(torch.nn.Module):
 
 		Returns:
 			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1], Tensor[T, B, 1]]: 
-				(TD-targets per Ve head, td_mean_log, td_std_log).
+				(TD-targets per Ve head, std across dynamics heads avg over Ve, std across value heads avg over H).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
 		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
@@ -909,109 +631,61 @@ class TDMPC2(torch.nn.Module):
 		# Reshape back to [Ve, T, H, B, 1]
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
-
-		#TODO WARNING, fixing this and replacing this .item() call somehow breaks the performance of the algo, I do no know why. Someone should fix it for faster compile.
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
 		
-		std_coef = float(self.cfg.td_target_std_coef)
+		# Pessimistically reduce over reward heads: min over R (dim=1)
+		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
-		if self.cfg.local_td_bootstrap:
-			# LOCAL: Each Ve head bootstraps itself
-			# No value std (each head sees only itself), only reward std across R
-			
-			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
-			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
-			
-			# v_values: [Ve, T, H, B, 1] - use directly (each Ve head bootstraps itself)
-			# TD_h = r_mean_h + γ * (1-term) * v_ve_h  for each (Ve, H)
-			# We need to broadcast: terminated [T, H, B, 1]
-			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-			r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			
-			# TD mean per (Ve, H): μ_{ve,h} = r_mean_h + γ * (1-term) * v_{ve,h}
-			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
-			
-			# TD std per H: σ_h = r_std_h (no value std in local mode)
-			td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
-			
-			# TD_h = μ_h + std_coef * σ_h per dynamics head
-			# For local, we compute this per (Ve, H), then reduce over H
-			# td_std_per_h needs to broadcast to [Ve, T, H, B, 1]
-			td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp  # float32[Ve, T, H, B, 1]
-			
-			# Determine dynamics reduction method
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-			
-			# Reduce over dynamics heads H
-			if dyn_reduction == "max":
-				td_targets, _ = td_per_ve_h.max(dim=2)  # float32[Ve, T, B, 1]
-			elif dyn_reduction == "min":
-				td_targets, _ = td_per_ve_h.min(dim=2)  # float32[Ve, T, B, 1]
-			else:  # "mean"
-				td_targets = td_per_ve_h.mean(dim=2)  # float32[Ve, T, B, 1]
-			
-			# For logging
-			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
-			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
-			
-		else:
-			# GLOBAL: All Ve heads get same target
-			# Compute reward std across R, value std across Ve, per dynamics head H
-			
-			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
-			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
-			
-			# v_values: [Ve, T, H, B, 1] - mean and std across Ve per (H, T, B)
-			v_mean_per_h = v_values.mean(dim=0)  # float32[T, H, B, 1]
-			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))  # float32[T, H, B, 1]
-			
-			# TD mean per H: μ_h = r_mean_h + γ * (1-term) * v_mean_h
-			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
-			
-			# TD std per H: σ_h = r_std_h + γ * v_std_h
-			td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h  # float32[T, H, B, 1]
-			
-			# TD_h = μ_h + std_coef * σ_h per dynamics head
-			td_per_h = td_mean_per_h + std_coef * td_std_per_h  # float32[T, H, B, 1]
-			
-			# Determine dynamics reduction method
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-			
-			# Reduce over dynamics heads H
-			if dyn_reduction == "max":
-				td_reduced, _ = td_per_h.max(dim=1)  # float32[T, B, 1]
-			elif dyn_reduction == "min":
-				td_reduced, _ = td_per_h.min(dim=1)  # float32[T, B, 1]
-			else:  # "mean"
-				td_reduced = td_per_h.mean(dim=1)  # float32[T, B, 1]
-			
-			# All Ve heads get same target
+		# Expand reward/terminated for broadcasting with Ve: [T, H, B, 1] -> [1, T, H, B, 1]
+		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
+		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
+		
+		# Per-head TD targets: r + γ * (1 - done) * V(s')  ->  [Ve, T, H, B, 1]
+		td_per_head = reward_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
+		
+		# Compute std across dynamics heads H (averaged over Ve) for logging
+		# For each Ve: std over H, then average over Ve
+		td_std_over_h_per_ve = td_per_head.std(dim=2, unbiased=False)  # float32[Ve, T, B, 1]
+		td_std_across_dynamics_heads = td_std_over_h_per_ve.mean(dim=0)  # float32[T, B, 1]
+		
+		# Compute std across value heads Ve (averaged over H) for logging
+		# For each H: std over Ve, then average over H
+		td_std_over_ve_per_h = td_per_head.std(dim=0, unbiased=False)  # float32[T, H, B, 1]
+		td_std_across_value_heads = td_std_over_ve_per_h.mean(dim=1)  # float32[T, B, 1]
+		
+		# Apply reduction based on td_bootstrap_mode - always reduce H, output is [Ve, T, B, 1]
+		mode = self.cfg.td_bootstrap_mode
+		if mode == 'min':
+			# Min over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
+			td_reduced = torch.amin(td_per_head, dim=(0, 2), keepdim=False)  # float32[T, B, 1]
 			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-			
-			# For logging
-			td_mean_log = td_mean_per_h.mean(dim=1)  # float32[T, B, 1]
-			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
+		elif mode == 'mean':
+			# Mean over Ve (dim=0) and H (dim=2), then expand to [Ve, T, B, 1]
+			td_reduced = td_per_head.mean(dim=(0, 2), keepdim=False)  # float32[T, B, 1]
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+		elif mode == 'local':
+			# Each Ve head bootstraps itself; reduce H by local_td_target_dynamics_reduction
+			h_reduction = self.cfg.local_td_target_dynamics_reduction
+			if h_reduction == 'single':
+				# H=1 when using single random head, no reduction needed
+				td_targets = td_per_head.squeeze(2)  # float32[Ve, T, B, 1]
+			elif h_reduction == 'min':
+				td_targets = torch.amin(td_per_head, dim=2)  # float32[Ve, T, B, 1]
+			else:  # 'mean'
+				td_targets = td_per_head.mean(dim=2)  # float32[Ve, T, B, 1]
+		else:
+			raise ValueError(f"Unknown td_bootstrap_mode: {mode}. Expected 'min', 'mean', or 'local'.")
 		
-		return td_targets, td_mean_log, td_std_log
+		return td_targets, td_std_across_dynamics_heads, td_std_across_value_heads 
   
 
 	@torch.no_grad()
 	def _td_target_aux(self, next_z, reward, terminated, task):
 		"""
-		Compute auxiliary multi-gamma TD targets using correct optimism.
+		Compute auxiliary multi-gamma TD targets.
 		
-		CORRECT OPTIMISM: For each dynamics head h, compute:
-		  σ_h = σ^r_h  (reward std only, aux values have no Ve ensemble)
-		  TD_h = μ_h + td_target_std_coef × σ_h
-		Then reduce over dynamics heads H based on sign of std_coef.
+		Auxiliary values have no Ve ensemble, so td_bootstrap_mode 'min'/'mean'/'local'
+		are equivalent for Ve. Dynamics head (H) reduction uses local_td_target_dynamics_reduction.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
@@ -1020,7 +694,7 @@ class TDMPC2(torch.nn.Module):
 			task (torch.Tensor): Task index (only used for multi-task experiments).
 
 		Returns:
-			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma.
+			Tensor[G_aux, T, B, 1]: TD targets per auxiliary gamma (H dimension reduced).
 		"""
 		G_aux = len(self._all_gammas) - 1
 		if G_aux <= 0:
@@ -1033,52 +707,37 @@ class TDMPC2(torch.nn.Module):
 		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
 		
 		# Evaluate auxiliary V on next states using target network
-		# V_aux returns (G_aux, T, H*B, 1) for scalar values (mean over 2 outputs per gamma)
-		v_values_flat = self.model.V_aux(next_z_flat, task, return_type='mean', target=True)  # float32[G_aux, T, H*B, 1]
+		# V_aux returns (G_aux, T, H*B, 1) for scalar values
+		v_values_flat = self.model.V_aux(next_z_flat, task, return_type='min', target=True)  # float32[G_aux, T, H*B, 1]
 		
 		# Reshape back to [G_aux, T, H, B, 1]
 		v_values = v_values_flat.view(G_aux, T, H, B, 1)  # float32[G_aux, T, H, B, 1]
 		
-		# gammas_aux: auxiliary discount factors (e.g., 0.9, 0.99)
-		gammas_aux = torch.tensor(self._all_gammas[1:], device=next_z.device, dtype=next_z.dtype)  # float32[G_aux]
+		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		
-		std_coef = float(self.cfg.td_target_std_coef)
+		# Pessimistically reduce over reward heads: min over R (dim=1)
+		reward_pessimistic = torch.amin(reward, dim=1)  # float32[T, H, B, 1]
 		
-		# CORRECT OPTIMISM: Per dynamics head h
-		# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
-		r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-		r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
-		
-		# v_values: [G_aux, T, H, B, 1] - already mean over 2 outputs per gamma
-		# No value std for aux (single value per gamma)
-		
-		# TD mean per (G_aux, H): μ_{g,h} = r_mean_h + γ_g * (1-term) * v_{g,h}
-		# gammas_aux: [G_aux] -> [G_aux, 1, 1, 1] for broadcasting
-		gammas_exp = gammas_aux.view(G_aux, 1, 1, 1)  # float32[G_aux, 1, 1, 1]
-		r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+		# Expand reward/terminated for broadcasting: [T, H, B, 1] -> [1, T, H, B, 1]
+		reward_exp = reward_pessimistic.unsqueeze(0)  # float32[1, T, H, B, 1]
 		terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
 		
-		td_mean_per_g_h = r_mean_exp + gammas_exp.unsqueeze(-1) * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
+		# Compute per-head TD targets for all auxiliary gammas at once
+		# gamma_aux: scalar per g, broadcast over [G_aux, T, H, B, 1]
+		gammas_aux = torch.tensor(self._all_gammas[1:], device=next_z.device, dtype=next_z.dtype)  # float32[G_aux]
+		gammas_aux = gammas_aux.view(G_aux, 1, 1, 1, 1)  # float32[G_aux, 1, 1, 1, 1]
 		
-		# TD std per H: σ_h = r_std_h (no value std for aux)
-		td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
-		td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1] - broadcast to G_aux
+		td_per_head = reward_exp + gammas_aux * discount * (1 - terminated_exp) * v_values  # float32[G_aux, T, H, B, 1]
 		
-		# TD_{g,h} = μ_{g,h} + std_coef * σ_h
-		td_per_g_h = td_mean_per_g_h + std_coef * td_std_exp  # float32[G_aux, T, H, B, 1]
-		
-		# Determine dynamics reduction method
-		dyn_reduction = self.cfg.td_target_dynamics_reduction
-		if dyn_reduction == "from_std_coef":
-			dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-		
-		# Reduce over dynamics heads H
-		if dyn_reduction == "max":
-			td_targets_aux, _ = td_per_g_h.max(dim=2)  # float32[G_aux, T, B, 1]
-		elif dyn_reduction == "min":
-			td_targets_aux, _ = td_per_g_h.min(dim=2)  # float32[G_aux, T, B, 1]
-		else:  # "mean"
-			td_targets_aux = td_per_g_h.mean(dim=2)  # float32[G_aux, T, B, 1]
+		# Reduce H dimension using local_td_target_dynamics_reduction - output is [G_aux, T, B, 1]
+		h_reduction = self.cfg.local_td_target_dynamics_reduction
+		if h_reduction == 'single':
+			# H=1 when using single random head, no reduction needed
+			td_targets_aux = td_per_head.squeeze(2)  # float32[G_aux, T, B, 1]
+		elif h_reduction == 'min':
+			td_targets_aux = torch.amin(td_per_head, dim=2)  # float32[G_aux, T, B, 1]
+		else:  # 'mean'
+			td_targets_aux = td_per_head.mean(dim=2)  # float32[G_aux, T, B, 1]
 		
 		return td_targets_aux
 
@@ -1361,15 +1020,16 @@ class TDMPC2(torch.nn.Module):
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
 		
-		# Determine head_mode based on td_target_use_all_dynamics_heads
-		# When false, use a randomly-selected dynamics head (cheaper but no H-std)
-		# When true, use all heads for full (R × H × Ve) combinations
-		if self.cfg.td_target_use_all_dynamics_heads:
-			head_mode = 'all'
-			H = int(self.cfg.planner_num_dynamics_heads)
-		else:
+		# Determine head_mode based on local_td_target_dynamics_reduction
+		# When 'single', use a randomly-selected dynamics head (cheapest)
+		# Otherwise, use all heads and reduce later
+		h_reduction = self.cfg.local_td_target_dynamics_reduction
+		if self.cfg.td_bootstrap_mode == 'local' and h_reduction == 'single':
 			head_mode = 'random'  # Use single randomly-selected head
 			H = 1  # Only one head in output
+		else:
+			head_mode = 'all'
+			H = int(self.cfg.planner_num_dynamics_heads)
 		
 		# Multi-head imagination requires rollout_len=1 so all heads share the same action
 		# (policy samples at z[0] before dynamics step)
@@ -1516,15 +1176,15 @@ class TDMPC2(torch.nn.Module):
 				R = rewards_flat.shape[1]
 				terminated_flat = terminated.view(T_imag, H, S * BN, 1)  # [T_imag, H, S*BN, 1]
 				
-				td_targets_flat, td_mean_flat, td_std_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
-				# td_targets_flat: [Ve, T_imag, S*BN, 1] - reduced targets (mean + coef×std)
-				# td_mean_flat: [T_imag, S*BN, 1] - mean across all Ve×R×H combinations
-				# td_std_flat: [T_imag, S*BN, 1] - std across all Ve×R×H combinations
+				td_targets_flat, td_std_dynamics_flat, td_std_value_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
+				# td_targets_flat: [Ve, T_imag, S*BN, 1]
+				# td_std_dynamics_flat: [T_imag, S*BN, 1] - std across H (dynamics heads), avg over Ve
+				# td_std_value_flat: [T_imag, S*BN, 1] - std across Ve (value heads), avg over H
 				
 				# Split back: [Ve, T_imag, S*BN, 1] -> [Ve, T_imag, S, BN, 1]
 				td_targets = td_targets_flat.view(Ve, T_imag, S, BN, 1)
-				td_mean = td_mean_flat.view(T_imag, S, BN, 1)  # float32[T_imag, S, BN, 1]
-				td_std = td_std_flat.view(T_imag, S, BN, 1)    # float32[T_imag, S, BN, 1]
+				td_std_across_dynamics_heads = td_std_dynamics_flat.view(T_imag, S, BN, 1)
+				td_std_across_value_heads = td_std_value_flat.view(T_imag, S, BN, 1)
 
 		with maybe_range('Value/ce', self.cfg):
 			# TD targets: [Ve, T_imag, S, BN, 1], vs: [Ve, T_imag, S, BN, K]
@@ -1552,29 +1212,29 @@ class TDMPC2(torch.nn.Module):
 		
 		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN, 1]
 		
-		# Log td_target statistics (mean and std across all Ve×R×H combinations)
+		# Always log td_target std across dynamics and value heads (important diagnostics)
 		info.update({
-			'td_target_mean': td_mean.mean(),
-			'td_target_std': td_std.mean(),
+			'td_target_std_across_dynamics_heads': td_std_across_dynamics_heads.mean(),
+			'td_target_std_across_value_heads': td_std_across_value_heads.mean(),
 		}, non_blocking=True)
 		
 		if self.log_detailed:
 			info.update({
-				'td_target_reduced_mean': td_targets.mean(),
-				'td_target_reduced_std': td_targets.std(),
-				'td_target_reduced_min': td_targets.min(),
-				'td_target_reduced_max': td_targets.max(),
+				'td_target_mean': td_targets.mean(),
+				'td_target_std': td_targets.std(),
+				'td_target_min': td_targets.min(),
+				'td_target_max': td_targets.max(),
 				'value_pred_mean': value_pred.mean(),
 				'value_pred_std': value_pred.std(),
 				'value_pred_min': value_pred.min(),
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
 			
-			# Std across num_rollouts (N dimension) - diagnostic for rollout diversity
+			# Variance across num_rollouts (N dimension) - diagnostic for rollout diversity
 			# Need to reshape back to include N: [Ve, T_imag, S, B, N, 1]
 			td_targets_with_n = td_targets.view(Ve, T_imag, S, B, N, 1)
-			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()  # std across N (different actions)
-			info.update({'td_target_std_across_rollouts': td_std_across_rollouts}, non_blocking=True)
+			td_var_across_rollouts = td_targets_with_n.var(dim=4).mean()  # variance across N
+			info.update({'td_target_var_across_rollouts': td_var_across_rollouts}, non_blocking=True)
    
 		# Value error per replay step (S dimension)
 		value_error = value_pred - td_targets  # float32[Ve, T_imag, S, BN, 1]
@@ -1797,16 +1457,13 @@ class TDMPC2(torch.nn.Module):
 			S, B_orig, L = start_z.shape
 			A = self.cfg.action_dim
 			N = int(self.cfg.num_rollouts)
+			H = int(self.cfg.planner_num_dynamics_heads)
 			R = int(self.cfg.num_reward_heads)
 			T_imag = int(self.cfg.imagination_horizon)
 			
 			# imagined_rollout flattens S*B into batch, uses N rollouts per state
 			# Returns tensors with B_expanded = S * B_orig * N
-			# H depends on td_target_use_all_dynamics_heads: 1 if False, planner_num_dynamics_heads if True
 			imagined = self.imagined_rollout(start_z, task=task, rollout_len=T_imag)
-			
-			# Get actual H from returned tensor (may be 1 if td_target_use_all_dynamics_heads=False)
-			H = imagined['z_seq'].shape[1]
 			
 			# Reshape outputs from [*, B_expanded, *] to [*, S, B, N, *]
 			# z_seq: [T_imag+1, H, S*B*N, L] -> [T_imag+1, H, S, B, N, L]
@@ -1875,12 +1532,10 @@ class TDMPC2(torch.nn.Module):
 			'z_rollout': z_rollout,
 		}
 
-	def _update(self, obs, action, reward, terminated, expert_action_dist=None, update_value=True, update_pi=True, update_world_model=True, task=None):
+	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, update_world_model=True, task=None):
 		"""Single gradient update step over world model, critic, and policy.
 		
 		Args:
-			expert_action_dist: Expert action distributions [T, B, A, 2] for distillation.
-				Required when policy_optimization_method is 'distillation' or 'both'.
 			update_value: If True, compute and apply value/aux losses. If False, skip value losses.
 			update_pi: If True, update policy. If False, skip policy update.
 			update_world_model: If True, compute WM losses. If False, skip WM losses and use replay_true for imagination.
@@ -1927,7 +1582,7 @@ class TDMPC2(torch.nn.Module):
 				# Fallback to z_true if z_rollout unavailable (update_world_model=False).
 				z_for_pi = z_rollout.detach() if z_rollout is not None else z_true.detach()  # float32[T+1, B, L]
     
-				pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
+				pi_loss, pi_info = self.update_pi(z_for_pi, task)
 				pi_total = pi_loss * self.cfg.policy_coef
 				pi_total.backward()
 				if log_grads:
@@ -1984,7 +1639,7 @@ class TDMPC2(torch.nn.Module):
 			dict: Dictionary of training statistics.
 		"""
 		with maybe_range('update/sample_buffer', self.cfg):
-			obs, action, reward, terminated, task, expert_action_dist, indices = buffer.sample()
+			obs, action, reward, terminated, task = buffer.sample()
 
 		self._step = step
 		# Log detailed info when updating value and at log_detail_freq intervals
@@ -2006,92 +1661,12 @@ class TDMPC2(torch.nn.Module):
 		kwargs = {}
 		if task is not None:
 			kwargs["task"] = task
-
-		# Lazy reanalyze: BEFORE _update so fresh targets are used in current update
-		# Re-runs the planner on first-timestep observations from the sampled batch
-		# and updates both the local tensor and the buffer in-place.
-		reanalyze_log_pending = None
-		reanalyze_interval = int(getattr(self.cfg, 'reanalyze_interval', 0))
-		# Check both interval AND that we haven't already reanalyzed at this step
-		# (prevents multiple reanalyze calls per env step when utd_ratio > 1)
-		should_reanalyze = (
-			reanalyze_interval > 0
-			and self._step % reanalyze_interval == 0
-			and self._step > 0
-			and self._step != self._last_reanalyze_step
-		)
-		if should_reanalyze:
-			self._last_reanalyze_step = self._step
-			with maybe_range('update/lazy_reanalyze', self.cfg):
-				# Get first-timestep observations and indices
-				# obs: [T+1, B, *obs_shape], indices: [T+1, B]
-				# Buffer stores (obs_{t+1}, action_t, expert_dist_t) together, so:
-				# - obs[0] is o₀ (first observation)
-				# - indices[1] is where expert_dist for o₀ is stored (not indices[0], which has NaN)
-				reanalyze_batch_size = int(getattr(self.cfg, 'reanalyze_batch_size', obs.shape[1]))
-				reanalyze_batch_size = min(reanalyze_batch_size, obs.shape[1])
-				
-				# Take first timestep obs, but indices[1] (where expert_dist for obs[0] is stored)
-				obs_reanalyze = obs[0, :reanalyze_batch_size]  # float32[B_re, *obs_shape]
-				indices_reanalyze = indices[1, :reanalyze_batch_size]  # [B_re] - use index 1, not 0!
-				
-				# Get old expert distributions before reanalyze (for KL logging)
-				# expert_action_dist: [T+1, B, A, 2] -> [B_re, A, 2]
-				old_expert_dist = expert_action_dist[1, :reanalyze_batch_size].clone()  # float32[B_re, A, 2]
-				
-				# Run reanalyze to get new expert targets
-				expert_action_dist_new, expert_value_new, reanalyze_info = self.reanalyze(obs_reanalyze, task=task)
-				
-				# Update expert_action_dist tensor in-place for this update
-				# expert_action_dist: [T+1, B, A, 2], update index 1 (where obs[0] targets live)
-				expert_action_dist[1, :reanalyze_batch_size] = expert_action_dist_new
-				
-				# Update buffer for future samples
-				buffer.update_expert_data(indices_reanalyze, expert_action_dist_new, expert_value_new)
-				
-				# Store logging info for after _update (when we have the info dict)
-				reanalyze_log_pending = {
-					'reanalyze_info': reanalyze_info,
-					'old_expert_dist': old_expert_dist,
-					'new_expert_dist': expert_action_dist_new,
-				}
-
 		torch.compiler.cudagraph_mark_step_begin()
   
-		info = self._update(obs, action, reward, terminated, expert_action_dist=expert_action_dist, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
-
-		# Log reanalyze stats (deferred from before _update)
-		if reanalyze_log_pending is not None:
-			if reanalyze_log_pending['reanalyze_info'] is not None and self._step % self.cfg.log_freq == 0:
-				self.logger.log_planner_info(reanalyze_log_pending['reanalyze_info'], step=self._step, prefix="reanalyze")
-			
-			if self._step % self.cfg.log_freq == 0:
-				old_mean, old_std = reanalyze_log_pending['old_expert_dist'][..., 0], reanalyze_log_pending['old_expert_dist'][..., 1]  # [B_re, A]
-				new_mean, new_std = reanalyze_log_pending['new_expert_dist'][..., 0], reanalyze_log_pending['new_expert_dist'][..., 1]  # [B_re, A]
-				# Clamp stds to avoid numerical issues
-				old_std = old_std.clamp(min=1e-6)
-				new_std = new_std.clamp(min=1e-6)
-				# KL(old || new) for Gaussians: mean over actions, mean over batch
-				kl_div = (torch.log(new_std / old_std) + (old_std**2 + (old_mean - new_mean)**2) / (2 * new_std**2) - 0.5).mean(dim=-1).mean()
-				info['reanalyze/kl_old_to_new'] = kl_div.item()
-				# Also log mean/std differences
-				info['reanalyze/mean_diff'] = (new_mean - old_mean).abs().mean().item()
-				info['reanalyze/std_diff'] = (new_std - old_std).abs().mean().item()
+		info = self._update(obs, action, reward, terminated, update_value=update_value, update_pi=update_pi, update_world_model=update_world_model, **kwargs)
 
 		# Log current encoder LR for W&B tracking
 		info['encoder_lr'] = self.optim.param_groups[0]['lr']
-
-		# KNN entropy logging (sparse, only when log_detailed)
-		if self.log_detailed and self._knn_encoder is not None:
-			with torch.no_grad():
-				# obs: [T+1, B, obs_dim], take first timestep
-				obs_flat = obs[0]  # float32[B, obs_dim]
-				# Encode with frozen random encoder
-				encoded = self._knn_encoder(obs_flat)  # float32[B, knn_entropy_dim]
-				# Compute KNN entropy
-				knn_k = int(getattr(self.cfg, 'knn_entropy_k', 5))
-				batch_knn_entropy = math.compute_knn_entropy(encoded, k=knn_k)
-				info['batch_knn_entropy'] = batch_knn_entropy.item()
 
 		return info
 
@@ -2197,31 +1772,19 @@ class TDMPC2(torch.nn.Module):
 		with torch.no_grad():
 			infos = []
 			for _ in range(num_batches):
-				obs, action, reward, terminated, task, expert_action_dist, indices = buffer.sample()
+				obs, action, reward, terminated, task = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
 					components = self._compute_loss_components(obs, action, reward, terminated, task, update_value=True, log_grads=False)
 					val_info = components['info']
 
-					# Check if we can compute policy loss (skip if distillation and no expert data)
-					method = str(self.cfg.policy_optimization_method).lower()
-					opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
-					opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
-					needs_expert = method in ('distillation', 'both') or (
-						self.cfg.dual_policy_enabled and opti_method in ('distillation', 'both')
-					)
 					
-					# Skip policy loss if distillation is needed but expert data not available
-					if needs_expert and (expert_action_dist is None or torch.isnan(expert_action_dist).any()):
-						# Cannot compute policy loss without expert data - skip
-						pass
-					else:
-						# Policy evaluates on dynamics rollout states (replay_rollout hardcoded)
-						# Fallback to z_true if z_rollout unavailable
-						z_for_pi = components['z_rollout'].detach() if components['z_rollout'] is not None else components['z_true'].detach()  # float32[T+1, B, L]
-	      
-						pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
-						val_info.update(pi_info, non_blocking=True)
+					# Policy evaluates on dynamics rollout states (replay_rollout hardcoded)
+					# Fallback to z_true if z_rollout unavailable
+					z_for_pi = components['z_rollout'].detach() if components['z_rollout'] is not None else components['z_true'].detach()  # float32[T+1, B, L]
+      
+					pi_loss, pi_info = self.update_pi(z_for_pi, task)
+					val_info.update(pi_info, non_blocking=True)
 					self.log_detailed = False
 				infos.append(val_info)
 

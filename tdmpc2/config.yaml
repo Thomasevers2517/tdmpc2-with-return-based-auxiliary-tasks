@@ -101,7 +101,7 @@ optimistic_policy_value_std_coef: 1
 # Planner value std coefficients (separate for train vs eval)
 # Train: "opt" or positive (encourage exploration, max over dynamics)
 # Eval: "pess" or negative (robust action selection, min over dynamics)
-planner_value_std_coef_train: 0.3
+planner_value_std_coef_train: 1
 planner_value_std_coef_eval: -1
 
 # Evaluation-specific planner head configuration.
@@ -135,7 +135,7 @@ planner_policy_elites_first_iter_only: false
 # Number of dynamics heads for multi-head dynamics ensemble.
 # All heads are used during training for TD targets and imagination.
 # During eval, uses all heads or single head based on planner_use_all_heads_eval.
-planner_num_dynamics_heads: 4
+planner_num_dynamics_heads: 2
 
 # Frozen random prior networks for ensemble diversity (dynamics, value, reward).
 # Prior is L2-normalized and added to main network output.
@@ -172,7 +172,7 @@ detach_imagine_value: false # if true, detach imagined latents when using them f
 imagine_initial_source: replay_rollout  # replay_true | replay_rollout - whether imagination starts from true encoded latents or dynamics rollout latents (head 0)
 actor_source: replay_rollout # ac | replay_rollout | replay_true (controls actor source) ac copies ac source
 
-ema_value_planning: true # If true, use EMA target network for V in planner scoring; if false, use online network
+ema_value_planning: true # If true, use EMA target network for V in planner scoring; if false, use online network. Should maybe be false
 
 steps: 100_000
 batch_size: 256
@@ -199,7 +199,7 @@ enc_lr_scale: 0.3
 #   0.5 = step at halfway (default)
 #   1.0 = step at start (freeze immediately)
 enc_lr_step_ratio: 0.5          # Fraction of training after which to step-change LR (0.5 = halfway)
-enc_lr_step_scale: 0.0          # Multiplier for encoder LR after step (0.0 = freeze)
+enc_lr_step_scale: 1         # Multiplier for encoder LR after step (0.0 = freeze). Turn to 0 for tasks that require very high dynamics accuracy.
 pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize training.
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
@@ -236,8 +236,8 @@ temperature: 0.5
 # reanalyze (planner distillation)
 # Generate expert targets by re-running planner on observations.
 # Used for policy distillation: KL(expert || policy) loss.
-reanalyze_interval: 10              # 0 = disabled. >0 = steps between lazy reanalyze
-reanalyze_batch_size: 128           # How many samples to reanalyze per interval
+reanalyze_interval: 5              # 0 = disabled. >0 = steps between lazy reanalyze
+reanalyze_batch_size: 64           # How many samples to reanalyze per interval
 reanalyze_horizon: 3                # Planning horizon for reanalyze
 reanalyze_iterations: 6             # MPPI iterations for reanalyze
 reanalyze_num_samples: 512          # Samples per MPPI iteration during reanalyze
@@ -250,7 +250,7 @@ optimistic_policy_optimization_method: same  # 'same' = same as policy_optimizat
 policy_svg_distill_ratio: 0.5               # When method='both': ratio of distillation loss. 0=pure SVG, 1=pure distillation
                                             # Combined loss = (1 - ratio) * svg_loss + ratio * distill_loss
 fix_kl_order: true                          # If true, use KL(expert || policy); if false, use KL(policy || expert)
-kl_scale_min: 1.0                           # Minimum value for KL loss RunningScale (1.0 = no amplification, <1.0 allows amplifying small losses)
+kl_scale_min: 0.1                          # Minimum value for KL loss RunningScale (1.0 = no amplification, <1.0 allows amplifying small losses)
 
 # actor
 log_std_min: -10
@@ -330,7 +330,7 @@ log_detail_freq: 5000
 log_freq: 200
 
 # misc
-compile: false
+compile: true
 compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
 save_video: false
 save_agent: false
