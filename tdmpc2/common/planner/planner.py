@@ -326,7 +326,9 @@ class Planner(torch.nn.Module):
                     value_disagreement_hist.append(val_dis.detach())      # [1, E]
 
         # Final selection: per batch element
-        if eval_mode:
+        # Greedy (argmax) selection: used in eval mode OR when greedy_train_action_selection is enabled
+        use_greedy = eval_mode or bool(getattr(self.cfg, 'greedy_train_action_selection', False))
+        if use_greedy:
             chosen_idx = scores.argmax(dim=1, keepdim=True)  # [B, 1]
         else:
             probs = torch.softmax(elite_scores / max(temp, 1e-8), dim=1)  # [B, K]

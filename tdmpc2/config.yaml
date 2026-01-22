@@ -118,6 +118,13 @@ policy_seed_noise_std: 0.05
 # Set to 0.0 to disable. Used for ablation studies comparing optimistic planning vs noise-based exploration.
 planner_action_noise_std: 0.0
 
+# Greedy (argmax) vs softmax sampling for training action selection.
+# If true: use argmax over elite scores (deterministic, like eval mode).
+# If false: use softmax sampling from elites (stochastic exploration).
+# For BMPC-style policy parameterization, greedy selection may work better
+# since exploration comes from policy noise rather than planner sampling.
+greedy_train_action_selection: false
+
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0
 

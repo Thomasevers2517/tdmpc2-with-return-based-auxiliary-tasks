@@ -239,8 +239,8 @@ SRUN_OUT_DIR="${OUT_DIR:-/tmp}"
 srun --output="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.out" \
      --error="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.err" \
      bash -c '
-       # Per-task cache directories to avoid corruption from concurrent writes
-       TASK_CACHE="${SLURM_SUBMIT_DIR}/.compile_cache/job_${SLURM_JOB_ID}_task_${SLURM_PROCID}"
+       # Per-task cache directories on local scratch to avoid disk space issues and corruption
+       TASK_CACHE="${TMPDIR:-/tmp}/compile_cache_task_${SLURM_PROCID}"
        mkdir -p "${TASK_CACHE}/inductor" "${TASK_CACHE}/triton" "${TASK_CACHE}/cuda"
        export TORCHINDUCTOR_CACHE_DIR="${TASK_CACHE}/inductor"
        export TRITON_CACHE_DIR="${TASK_CACHE}/triton"
