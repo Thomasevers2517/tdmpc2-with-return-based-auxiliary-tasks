@@ -1162,6 +1162,7 @@ class TDMPC2(torch.nn.Module):
 		branch_term_losses = []
 		termination_logits_cache = []
 		branch_reward_error = []
+		branch_reward_pred_all = []  # Store all-heads predictions for logging
   
 		for branch in branches:
 			latents = branch['latents']
@@ -1206,6 +1207,8 @@ class TDMPC2(torch.nn.Module):
 					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, H*B, 1]
 					reward_pred_all = reward_pred_all.view(R, T, H_dyn, B, 1)  # [R, T, H, B, 1]
 					reward_pred = reward_pred_all.mean(dim=(0, 2))  # [T, B, 1]
+					# Store for logging: average over dynamics heads -> [R, T, B, 1]
+					reward_pred_all_for_log = reward_pred_all.mean(dim=2)  # [R, T, B, 1]
 					
 					# Termination loss over dynamics heads
 					head_term_losses = []
@@ -1245,6 +1248,7 @@ class TDMPC2(torch.nn.Module):
 					# Expected reward prediction for error logging: average over R
 					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, B, 1]
 					reward_pred = reward_pred_all.mean(dim=0)  # [T, B, 1]
+					reward_pred_all_for_log = reward_pred_all  # [R, T, B, 1] - already correct shape
 					
 				if self.cfg.episodic:
 					term_logits = self.model.termination(next_latents, task, unnormalized=True)
@@ -1258,6 +1262,7 @@ class TDMPC2(torch.nn.Module):
 			branch_term_losses.append(term_loss_branch)
 			termination_logits_cache.append(term_logits)
 			branch_reward_error.append(reward_pred.detach() - reward_target)
+			branch_reward_pred_all.append(reward_pred_all_for_log.detach())  # [R, T, B, 1]
 
 		reward_loss = torch.stack(branch_reward_losses).mean()
 		termination_loss = torch.stack(branch_term_losses).mean()
@@ -1311,11 +1316,18 @@ class TDMPC2(torch.nn.Module):
 					f'termination_loss_{weight_mode}_weighted': branch_term_losses[idx] * self.cfg.termination_coef,
 				}, non_blocking=True)
 				reward_error = branch_reward_error[idx]
+				reward_pred_all = branch_reward_pred_all[idx]  # [R, T, B, 1]
 				for i in range(T):
+					# Reward prediction stats: mean and std across reward heads
+					reward_pred_step = reward_pred_all[:, i, :, 0]  # [R, B]
+					reward_pred_mean = reward_pred_step.mean()  # scalar: mean over all heads and batch
+					reward_pred_head_std = reward_pred_step.std(dim=0).mean()  # scalar: std across heads, averaged over batch
 					info.update({
 						f"reward_error_abs_mean/step{i}": reward_error[i].abs().mean(),
 						f"reward_error_std/step{i}": reward_error[i].std(),
-						f"reward_error_max/step{i}": reward_error[i].abs().max()
+						f"reward_error_max/step{i}": reward_error[i].abs().max(),
+						f"reward_pred_mean/step{i}": reward_pred_mean,
+						f"reward_pred_head_std/step{i}": reward_pred_head_std,
 					}, non_blocking=True)
 
 		if self.cfg.episodic and self.log_detailed:

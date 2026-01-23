@@ -8,10 +8,12 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 4t: Hopper-Hop Policy Method
+  # Sweep 4u: Hopper-Hop Diagnostics
   # 
-  # Test distillation vs both policy methods
-  # with optimism=1 and greedy=false.
+  # Test with settings from previous successful runs:
+  # - num_samples=1024
+  # - entropy_coeff=3e-5
+  # - Sweep num_q [4, 8] and td_target_std_coef [-1, 0]
   #############################################
 
   task:
@@ -25,24 +27,31 @@ parameters:
   # SWEPT PARAMETERS
   #############################################
 
-  policy_optimization_method:
-    values: [distillation, both]
+  num_q:
+    values: [4, 8]
+
+  td_target_std_coef:
+    values: [-1, 0]
+
+  #############################################
+  # KEY SETTINGS
+  #############################################
+
+  start_entropy_coeff:
+    value: 0.00003
+  planner_value_std_coef_train:
+    value: 1
+  greedy_train_action_selection:
+    value: false
 
   #############################################
   # FIXED PARAMETERS
   #############################################
 
-  planner_value_std_coef_train:
-    value: 1
-  greedy_train_action_selection:
-    value: false
-  policy_svg_distill_ratio:
-    value: 0.5
-
   reanalyze_temperature:
     value: 0.5
   reanalyze_interval:
-    value: 5
+    value: 10
   value_update_freq:
     value: 2
   pi_update_freq:
@@ -59,12 +68,8 @@ parameters:
     value: true
   kl_scale_min:
     value: 0.1
-  start_entropy_coeff:
-    value: 0.0
   local_td_bootstrap:
     value: true
-  num_q:
-    value: 4
 
   #############################################
   # REANALYZE SETTINGS
@@ -107,7 +112,7 @@ parameters:
   #############################################
 
   num_samples:
-    value: 512
+    value: 1024
   num_pi_trajs:
     value: 24
   iterations:
@@ -123,6 +128,8 @@ parameters:
   # POLICY OPTIMIZATION METHOD
   #############################################
 
+  policy_optimization_method:
+    value: distillation
   optimistic_policy_optimization_method:
     value: distillation
 
@@ -132,8 +139,6 @@ parameters:
 
   td_target_dynamics_reduction:
     value: mean
-  td_target_std_coef:
-    value: 0
 
   #############################################
   # POLICY STD COEF SETTINGS
