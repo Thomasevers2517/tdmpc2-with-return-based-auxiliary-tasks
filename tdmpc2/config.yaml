@@ -123,7 +123,7 @@ planner_action_noise_std: 0.0
 # If false: use softmax sampling from elites (stochastic exploration).
 # For BMPC-style policy parameterization, greedy selection may work better
 # since exploration comes from policy noise rather than planner sampling.
-greedy_train_action_selection: true
+greedy_train_action_selection: false
 
 # Weight for latent disagreement term (training only). Set 0.0 to disable.
 planner_lambda_disagreement: 0
@@ -236,7 +236,7 @@ temperature: 0.5
 # reanalyze (planner distillation)
 # Generate expert targets by re-running planner on observations.
 # Used for policy distillation: KL(expert || policy) loss.
-reanalyze_interval: 5              # 0 = disabled. >0 = steps between lazy reanalyze
+reanalyze_interval: 10              # 0 = disabled. >0 = steps between lazy reanalyze
 reanalyze_batch_size: 64           # How many samples to reanalyze per interval
 reanalyze_horizon: 3                # Planning horizon for reanalyze
 reanalyze_iterations: 6             # MPPI iterations for reanalyze
@@ -278,7 +278,7 @@ jacobian_correction_scale: 1.0
 #   - Policy learns in bounded mean space; noise adds exploration around tanh(mean)
 # If false (default): action = mean + eps * std, then action = tanh(action)
 #   - Standard squashed Gaussian; requires Jacobian correction for entropy
-bmpc_policy_parameterization: false
+bmpc_policy_parameterization: true
 end_dynamic_entropy_ratio: 1
 start_dynamic_entropy_ratio: 1 # if set to 0.8, at 80% of training steps the entropy coeff will start to decay linearly.
 dynamic_entropy_schedule : exponential  # linear | exponential
@@ -309,7 +309,7 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 512
 task_dim: 96
-num_q: 8
+num_q: 4
 dropout: 0  # Disabled for compile + vmap + functional_call compatibility
 encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (train + eval mode for stable targets)
 reward_dropout_enabled: false  # Whether to apply dropout to reward heads (uses same dropout rate as value heads)
@@ -330,7 +330,7 @@ log_detail_freq: 5000
 log_freq: 200
 
 # misc
-compile: false
+compile: true
 compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
 save_video: false
 save_agent: false
