@@ -17,10 +17,14 @@ def compute_values(
     With V-function (state-only value), we bootstrap using V(z_last) directly
     without needing to sample or provide an action.
     
-    Value = sum(rewards over T steps) + V(z_last)  (undiscounted)
+    For episodic tasks, rewards and bootstrap are weighted by alive probability:
+      Value = sum_t(alive_probs[t] * r_t) + alive_probs[T] * V(z_last)
+    where alive_probs[t] = Π_{s=0}^{t-1}(1 - p_term(z_s))
+    
+    For non-episodic tasks: Value = sum(rewards) + V(z_last)
     
     CORRECT OPTIMISM: For each dynamics head h, compute:
-      σ_h = sqrt(sum_t(σ^r_{h,t}²) + σ^v_h²)  (variance-based aggregation)
+      σ_h = sqrt(sum_t(alive[t]² × σ^r_{h,t}²) + alive[T]² × σ^v_h²)
       Q_h = μ_h + value_std_coef × σ_h
     Then reduce over dynamics heads:
       value_std_coef > 0: max over H (optimistic)
@@ -60,6 +64,25 @@ def compute_values(
     z_flat = z_t.contiguous().view(H * B * N, T, L)         # float32[H*B*N, T, L]
     a_flat = a_t.contiguous().view(H * B * N, T, -1)        # float32[H*B*N, T, A]
 
+    # Compute cumulative alive probabilities for episodic tasks
+    # alive_probs[t] = probability of being alive at timestep t = Π_{s=0}^{t-1}(1 - p_term(z_s))
+    # alive_probs[0] = 1 (always alive at start), alive_probs[T] = prob alive for bootstrap
+    if cfg.episodic:
+        # Get termination probabilities at each step
+        z_for_term = z_flat.view(H * B * N * T, L)
+        term_probs_flat = world_model.termination(z_for_term, task)  # float32[H*B*N*T, 1]
+        term_probs = term_probs_flat.view(H, B, N, T)  # float32[H, B, N, T]
+        
+        # Cumulative product of survival: cumprod(1 - term_probs)
+        cumulative_survival = torch.cumprod(1 - term_probs, dim=3)  # float32[H, B, N, T]
+        
+        # Prepend 1 to get alive_probs at each timestep (including t=0 and t=T)
+        ones = torch.ones(H, B, N, 1, device=device, dtype=dtype)
+        alive_probs = torch.cat([ones, cumulative_survival], dim=3)  # float32[H, B, N, T+1]
+    else:
+        # Non-episodic: always alive
+        alive_probs = torch.ones(H, B, N, T + 1, device=device, dtype=dtype)
+
     # Get reward logits from reward heads: [R, H*B*N, T, K]
     # R=1 if reward_head_mode='single', R=num_reward_heads if 'all'
     rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode=reward_head_mode)
@@ -88,16 +111,16 @@ def compute_values(
     v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
     v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
     
-    # Compute undiscounted return mean per dynamics head
-    # μ_h = sum_t(r_mean_{h,t}) + v_mean_h
-    returns_mean_per_h = r_mean_per_h.sum(dim=3)  # float32[H, B, N]
-    total_mean_per_h = returns_mean_per_h + v_mean_per_h  # float32[H, B, N]
+    # Compute alive-weighted return mean per dynamics head
+    # μ_h = sum_t(alive_probs[t] * r_mean_{h,t}) + alive_probs[T] * v_mean_h
+    # alive_probs[:,:,:,:T] for rewards, alive_probs[:,:,:,T] for bootstrap
+    returns_mean_per_h = (r_mean_per_h * alive_probs[:, :, :, :T]).sum(dim=3)  # float32[H, B, N]
+    total_mean_per_h = returns_mean_per_h + alive_probs[:, :, :, T] * v_mean_per_h  # float32[H, B, N]
     
-    # Compute aggregated std per dynamics head using variance addition
-    # σ_h = sqrt(sum_t(σ^r_{h,t}²) + σ^v_h²)
-    # r_std_per_h: [H, B, N, T], v_std_per_h: [H, B, N]
-    reward_var_sum_per_h = (r_std_per_h ** 2).sum(dim=3)  # float32[H, B, N]
-    total_var_per_h = reward_var_sum_per_h + v_std_per_h ** 2  # float32[H, B, N]
+    # Compute aggregated std per dynamics head using alive-weighted variance addition
+    # σ_h = sqrt(sum_t(alive_probs[t]² * σ^r_{h,t}²) + alive_probs[T]² * σ^v_h²)
+    reward_var_sum_per_h = ((r_std_per_h * alive_probs[:, :, :, :T]) ** 2).sum(dim=3)  # float32[H, B, N]
+    total_var_per_h = reward_var_sum_per_h + (alive_probs[:, :, :, T] * v_std_per_h) ** 2  # float32[H, B, N]
     total_std_per_h = total_var_per_h.sqrt()  # float32[H, B, N]
     
     # Compute Q_h = μ_h + value_std_coef × σ_h per dynamics head

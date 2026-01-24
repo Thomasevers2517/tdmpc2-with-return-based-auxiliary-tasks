@@ -98,7 +98,12 @@ class WorldModel(nn.Module):
 			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Rs = layers.Ensemble(reward_mlps)
 		
-		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
+		# Termination head: same sizing as reward head (hidden dim, num layers)
+		self._termination = layers.mlp(
+			cfg.latent_dim + cfg.task_dim,
+			num_reward_layers * [reward_hidden_dim],
+			1
+		) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
 		# Optimistic policy for dual-policy architecture (same architecture as _pi)
 		self._pi_optimistic = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim) if cfg.dual_policy_enabled else None
