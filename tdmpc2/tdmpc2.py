@@ -209,7 +209,8 @@ class TDMPC2(torch.nn.Module):
 
 		# Modular planner (replaces legacy _plan / _prev_mean logic)
 		# Note: scale=None since planner's scale is reserved/unused; we use q_scale/kl_scale in update
-		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=None, discount=self.discount)
+		# Note: Planner uses undiscounted returns (γ=1) for trajectory scoring
+		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=None)
 		if cfg.compile:
 			log.info('Compiling update function with torch.compile...')
 			# Keep eager references

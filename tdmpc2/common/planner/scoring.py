@@ -11,17 +11,16 @@ def compute_values(
     value_std_coef: float = 0.0,
     reward_head_mode: str = "all",
     use_ema_value: bool = False,
-    discount: float = 0.99,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
     without needing to sample or provide an action.
     
-    Value = sum(rewards over T steps) + γ^T * V(z_last)
+    Value = sum(rewards over T steps) + V(z_last)  (undiscounted)
     
     CORRECT OPTIMISM: For each dynamics head h, compute:
-      σ_h = sum_t(γ^(t-1) * σ^r_{h,t}) + γ^T * σ^v_h
+      σ_h = sqrt(sum_t(σ^r_{h,t}²) + σ^v_h²)  (variance-based aggregation)
       Q_h = μ_h + value_std_coef × σ_h
     Then reduce over dynamics heads:
       value_std_coef > 0: max over H (optimistic)
@@ -49,14 +48,8 @@ def compute_values(
     T = Tp1 - 1
     cfg = world_model.cfg
     Ve = cfg.num_q  # number of V ensemble heads
-
-    # Precompute discount powers: γ^0, γ^1, ..., γ^(T-1) for rewards, γ^T for bootstrap
-    # discount_powers[t] = γ^t for t in [0, T-1]
     device = latents_all.device
     dtype = latents_all.dtype
-    discount_powers = torch.pow(torch.tensor(discount, device=device, dtype=dtype), 
-                                 torch.arange(T, device=device, dtype=dtype))  # float32[T]
-    discount_T = discount ** T  # γ^T for bootstrap value
 
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :, :-1, :]                      # float32[H, B, N, T, L]
@@ -95,17 +88,17 @@ def compute_values(
     v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
     v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
     
-    # Compute discounted return mean per dynamics head
-    # μ_h = sum_t(γ^(t-1) * r_mean_{h,t}) + γ^T * v_mean_h
-    # discount_powers: [T], r_mean_per_h: [H, B, N, T]
-    returns_mean_per_h = (r_mean_per_h * discount_powers).sum(dim=3)  # float32[H, B, N]
-    total_mean_per_h = returns_mean_per_h + discount_T * v_mean_per_h  # float32[H, B, N]
+    # Compute undiscounted return mean per dynamics head
+    # μ_h = sum_t(r_mean_{h,t}) + v_mean_h
+    returns_mean_per_h = r_mean_per_h.sum(dim=3)  # float32[H, B, N]
+    total_mean_per_h = returns_mean_per_h + v_mean_per_h  # float32[H, B, N]
     
-    # Compute aggregated std per dynamics head (sum of discounted stds)
-    # σ_h = sum_t(γ^(t-1) * σ^r_{h,t}) + γ^T * σ^v_h
-    # discount_powers: [T], r_std_per_h: [H, B, N, T]
-    reward_std_sum_per_h = (r_std_per_h * discount_powers).sum(dim=3)  # float32[H, B, N]
-    total_std_per_h = reward_std_sum_per_h + discount_T * v_std_per_h  # float32[H, B, N]
+    # Compute aggregated std per dynamics head using variance addition
+    # σ_h = sqrt(sum_t(σ^r_{h,t}²) + σ^v_h²)
+    # r_std_per_h: [H, B, N, T], v_std_per_h: [H, B, N]
+    reward_var_sum_per_h = (r_std_per_h ** 2).sum(dim=3)  # float32[H, B, N]
+    total_var_per_h = reward_var_sum_per_h + v_std_per_h ** 2  # float32[H, B, N]
+    total_std_per_h = total_var_per_h.sqrt()  # float32[H, B, N]
     
     # Compute Q_h = μ_h + value_std_coef × σ_h per dynamics head
     q_per_h = total_mean_per_h + value_std_coef * total_std_per_h  # float32[H, B, N]

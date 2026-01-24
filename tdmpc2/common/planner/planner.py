@@ -19,7 +19,7 @@ class Planner(torch.nn.Module):
     All operations support batch dimension B. Shapes are always [B, ...] throughout.
     """
 
-    def __init__(self, cfg, world_model, scale=None, discount=None):
+    def __init__(self, cfg, world_model, scale=None):
         super().__init__()
         self.cfg = cfg
         self.world_model = world_model
@@ -27,14 +27,6 @@ class Planner(torch.nn.Module):
         T, A = cfg.horizon, cfg.action_dim
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.register_buffer('prev_mean', torch.zeros(T, A, device=device))  # float32[T,A]
-        # Store discount for compute_values (can be scalar or tensor for multitask)
-        if discount is not None:
-            if isinstance(discount, torch.Tensor):
-                self.register_buffer('discount', discount.clone())
-            else:
-                self.register_buffer('discount', torch.tensor(discount, device=device))
-        else:
-            self.register_buffer('discount', torch.tensor(0.99, device=device))
 
     def reset_warm_start(self) -> None:
         self.prev_mean.zero_()
@@ -180,7 +172,6 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
             )
             # vals_*: [B, S]
             latent_dis_p = None
@@ -235,7 +226,6 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
             )
             # vals_*: [B, N]
             
@@ -451,7 +441,6 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 T=T,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
             )
             with torch.no_grad():
                 info_out.compute_post_noise_effects(self.world_model)
