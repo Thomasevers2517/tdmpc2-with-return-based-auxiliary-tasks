@@ -1,0 +1,153 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 155i: Model size scaling
+  # 
+  # Goal: Test how model size affects performance with minimal ensembles.
+  # Using single reward head, single dynamics head, 5 value heads.
+  # 
+  # Key sweep:
+  #   - model_size: 5, 19, 48 (parameters: 5M, 19M, 48M)
+  # 
+  # model_size overrides: enc_dim, mlp_dim, latent_dim, num_enc_layers
+  # We explicitly set: num_reward_heads=1, planner_num_dynamics_heads=1, num_q=5
+  # 
+  # Tasks: hopper-hop, quadruped-walk
+  # Seeds: 3
+  # Total: 2 model_sizes × 2 tasks × 3 seeds = 12 runs
+  #############################################
+
+  task:
+    values:
+      - hopper-hop
+      - quadruped-walk
+
+  seed:
+    values: [1, 2, 3]
+
+  #############################################
+  # MODEL SIZE - KEY SWEEP
+  #############################################
+
+  model_size:
+    values: [5, 19]
+
+  #############################################
+  # ENSEMBLE SETTINGS - MINIMAL
+  #############################################
+
+  num_reward_heads:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 1
+  num_q:
+    value: 5
+
+  #############################################
+  # TD TARGET SETTINGS (neutral, no ensemble reduction needed)
+  #############################################
+
+  td_target_dynamics_reduction:
+    value: mean
+  td_target_std_coef:
+    value: 0
+
+  #############################################
+  # PLANNER STD COEF (no ensemble, so neutral)
+  #############################################
+
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+
+  #############################################
+  # POLICY STD COEF SETTINGS (neutral, no ensemble)
+  #############################################
+
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 0
+
+  #############################################
+  # PRIOR SETTINGS (default)
+  #############################################
+
+  prior_scale:
+    value: 0.1
+  prior_logit_scale:
+    value: 1
+  prior_hidden_div:
+    value: 16
+
+  #############################################
+  # ENTROPY SETTINGS (default)
+  #############################################
+
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+  ema_value_planning:
+    value: true
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+  dropout:
+    value: 0
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

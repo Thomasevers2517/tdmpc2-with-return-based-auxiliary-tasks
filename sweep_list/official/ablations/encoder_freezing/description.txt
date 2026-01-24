@@ -1,0 +1,31 @@
+Encoder Freezing Ablation
+=========================
+
+Purpose:
+Show that on tasks requiring high dynamics accuracy, freezing the encoder
+(stopping encoder gradients during dynamics training) significantly improves
+dynamics prediction and overall performance.
+
+Key insight:
+- Some tasks require very accurate dynamics predictions
+- If the encoder keeps changing, the dynamics model struggles to track it
+- Freezing the encoder after initial learning allows dynamics to converge better
+- Result: Lower dynamics loss, better performance
+
+Configuration:
+- Tasks: 
+  - acrobot-swingup (requires precise dynamics)
+  - humanoid-bench balance task (requires dynamics accuracy)
+- Sweep:
+  - enc_lr_step_ratio: 0 (frozen) vs 0.5 vs 1 (full learning rate)
+  - Or explicit encoder freezing flag
+
+Expected outcome:
+- Frozen encoder: Lower dynamics loss, higher task performance
+- Non-frozen encoder: Higher dynamics loss, worse performance on these tasks
+
+Metrics to log:
+- Episode return
+- Dynamics loss (total and per-step)
+- Encoder gradient norm (if not frozen)
+- Latent space statistics

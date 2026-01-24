@@ -1,0 +1,140 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 152: Prior Scale Stress Test (Quadruped)
+  # 
+  # Goal: Test how far we can push prior_scale before
+  #       numerical instability occurs with compile=true
+  # 
+  # Sweep:
+  #   - prior_scale: [0.1, 1, 10] (extreme range)
+  #   - prior_logit_scale: 2
+  #   - prior_hidden_div: [1, 16]
+  #   - task: quadruped-walk only
+  #   - 6 seeds
+  #
+  # 3 prior_scale × 2 prior_hidden_div × 6 seeds = 36 runs
+  #############################################
+
+  task:
+    values:
+      - quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
+
+  #############################################
+  # PRIOR SCALE SWEEP (main focus)
+  #############################################
+
+  prior_scale:
+    values: [0.1, 1, 10]
+
+  prior_logit_scale:
+    value: 1
+
+  prior_hidden_div:
+    value: 16
+
+  #############################################
+  # CORRECT OPTIMISM SETTINGS (baseline)
+  #############################################
+
+  value_std_coef_default:
+    value: 1
+  td_target_std_coef:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 1
+  planner_value_std_coef_train:
+    value: opt
+  planner_value_std_coef_eval:
+    value: pess
+
+  # Jacobian correction
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+
+  # Use EMA target network for planner scoring
+  ema_value_planning:
+    value: true
+
+  #############################################
+  # ARCHITECTURE
+  #############################################
+
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 4
+  planner_num_dynamics_heads:
+    value: 4
+
+  #############################################
+  # ENTROPY SETTINGS
+  #############################################
+
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0.01
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  dropout:
+    value: 0  # Disabled for compile + vmap + functional_call compatibility
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

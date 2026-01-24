@@ -1,0 +1,13 @@
+Easy DMC Benchmark
+==================
+
+Purpose:
+Establish baseline performance on easy DeepMind Control tasks.
+
+Configuration:
+- Steps: 100,000
+- Tasks: Standard easy DMC tasks (e.g., cartpole-swingup, cheetah-run, walker-walk, etc.)
+- Config: Core/latest baseline configuration
+
+Expected outcome:
+Strong performance on these easier tasks, demonstrating the method works well on standard benchmarks.

@@ -10,9 +10,10 @@ log = get_logger(__name__)
 class RunningScale(torch.nn.Module):
 	"""Running trimmed scale estimator."""
 
-	def __init__(self, cfg):
+	def __init__(self, cfg, min_scale: float = 1.0):
 		super().__init__()
 		self.cfg = cfg
+		self.min_scale = min_scale  # Minimum scale value (1.0 = no amplification)
 		self.value = Buffer(torch.ones(1, dtype=torch.float32, device=torch.device('cuda:0')))
 		self._percentiles = Buffer(torch.tensor([5, 95], dtype=torch.float32, device=torch.device('cuda:0')))
 
@@ -43,7 +44,7 @@ class RunningScale(torch.nn.Module):
 
 	def update(self, x):
 		percentiles = self._percentile(x.detach())
-		value = torch.clamp(percentiles[1] - percentiles[0], min=1.)
+		value = torch.clamp(percentiles[1] - percentiles[0], min=self.min_scale)
 		self.value.data.lerp_(value, self.cfg.tau)
 
 	def forward(self, x, update=False):

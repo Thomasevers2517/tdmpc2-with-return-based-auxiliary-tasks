@@ -1,0 +1,127 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 147: Sparse Reward Entropy Ablation
+  # 
+  # Goal: Test if reducing entropy coefficient helps sparse reward tasks
+  # Context: cartpole-swingup-sparse only gets reward after ~60k steps
+  # Hypothesis: Lower entropy might help policy commit to extreme actions sooner
+  # 
+  # Sweep: start_entropy_coeff in {1e-5, 3e-6} (baseline is 3e-5)
+  # Tasks: cartpole-swingup-sparse, quadruped-walk
+  # 
+  # 2 tasks × 2 entropy × 4 seeds = 16 runs
+  #############################################
+
+  task:
+    values:
+      - cartpole-swingup-sparse
+      - quadruped-walk
+
+  # SWEEP: start_entropy_coeff
+  start_entropy_coeff:
+    values: [0.00001, 0.000003]
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  #############################################
+  # CORRECT OPTIMISM SETTINGS (fixed)
+  #############################################
+
+  td_target_std_coef:
+    value: 0
+  value_std_coef_default:
+    value: 1
+  policy_value_std_coef:
+    value: pess
+  optimistic_policy_value_std_coef:
+    value: opt
+  planner_value_std_coef_train:
+    value: opt
+  planner_value_std_coef_eval:
+    value: pess
+
+  # Jacobian correction
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+
+  # Use EMA target network for planner scoring
+  ema_value_planning:
+    value: true
+
+  #############################################
+  # ARCHITECTURE
+  #############################################
+
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+
+  #############################################
+  # ENTROPY SETTINGS
+  #############################################
+
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  #############################################
+  # EXPLORATION
+  #############################################
+
+  planner_lambda_disagreement:
+    value: 0
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0.01
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

@@ -1,0 +1,25 @@
+Optimistic Deep Exploration Ablation
+=====================================
+
+Purpose:
+Show that optimistic exploration (seeking uncertainty during training) significantly
+helps on tasks that require exploration.
+
+Key insight:
+By being optimistic about uncertain states during training, the agent actively
+explores the environment and discovers rewarding behaviors faster.
+
+Configuration:
+- Task: hopper-hop (requires exploration to discover hopping behavior)
+- Baseline: No optimism (planner_value_std_coef = 0)
+- Treatment: Optimistic planner (planner_value_std_coef > 0)
+- Keep pessimistic evaluation OFF to isolate this effect
+
+Expected outcome:
+- With optimistic exploration: Agent discovers hopping behavior faster
+- Without optimism: Agent may get stuck in local optima (just standing)
+
+Metrics to log:
+- Episode return
+- Value uncertainty during planning
+- Exploration coverage (if available)

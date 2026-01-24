@@ -1,0 +1,157 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 159a: Dog-run with prior disabled
+  # 
+  # Goal: Test if prior network is hurting dog-run performance.
+  # Disable both prior_scale and prior_logit_scale.
+  # 
+  # Key settings:
+  #   - prior_scale: 0 (disabled)
+  #   - prior_logit_scale: 0 (disabled)
+  # 
+  # Task: dog-run
+  # Seeds: 2
+  # Total: 1 task × 2 seeds = 2 runs
+  #############################################
+
+  task:
+    value: dog-run
+
+  seed:
+    values: [1, 2]
+
+  #############################################
+  # PRIOR SETTINGS - DISABLED
+  #############################################
+
+  prior_scale:
+    value: 0
+  prior_logit_scale:
+    value: 0
+  prior_hidden_div:
+    value: 16
+
+  #############################################
+  # TD TARGET SETTINGS (defaults)
+  #############################################
+
+  td_target_dynamics_reduction:
+    value: mean
+  td_target_std_coef:
+    value: 0
+
+  #############################################
+  # PLANNER STD COEF SETTINGS
+  #############################################
+
+  planner_value_std_coef_train:
+    value: 0.3
+  planner_value_std_coef_eval:
+    value: -1
+
+  #############################################
+  # POLICY STD COEF SETTINGS
+  #############################################
+
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 1
+
+  #############################################
+  # ENTROPY SETTINGS (no decay)
+  #############################################
+
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 1
+  end_dynamic_entropy_ratio:
+    value: 1
+  entropy_action_dim_power:
+    value: 1.0
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+  ema_value_planning:
+    value: true
+
+  #############################################
+  # ARCHITECTURE
+  #############################################
+
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 2
+  planner_num_dynamics_heads:
+    value: 4
+  enc_lr_step_ratio:
+    value: 0.5
+
+  #############################################
+  # TD BOOTSTRAP
+  #############################################
+
+  local_td_bootstrap:
+    value: true
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 1000000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  iterations:
+    value: 6
+  num_samples:
+    value: 1024
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+  dropout:
+    value: 0
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

@@ -1,0 +1,28 @@
+TD Targets Ablation
+===================
+
+Purpose:
+Show how different TD target formulations affect learning, particularly:
+1. Local vs global value bootstrapping
+2. Mean vs pessimistic reduction over dynamics/reward ensemble
+
+Key insight:
+- High-dimensional tasks (dog, humanoid) benefit from pessimistic TD targets
+  (being conservative about uncertain predictions in value estimation)
+- Lower-dimensional easier tasks don't need this pessimism as much
+
+Configuration:
+- Tasks: dog-walk (high-dim, benefits from pessimism) vs quadruped-walk (lower-dim)
+- Sweep:
+  - local_td_bootstrap: true/false (local vs global value bootstrapping)
+  - td_target_dynamics_reduction: mean vs pessimistic (std_coef)
+  - td_target_std_coef: 0, -0.5, -1 (degree of pessimism)
+
+Expected outcome:
+- High-dim tasks (dog): Pessimistic TD targets help, mean may overestimate
+- Low-dim tasks: Pessimism less necessary, mean works fine
+
+Metrics to log:
+- Episode return
+- TD error / value loss
+- Value predictions vs actual returns

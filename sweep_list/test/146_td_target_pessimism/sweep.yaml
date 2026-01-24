@@ -1,0 +1,120 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 146: TD Target Pessimism Ablation
+  # 
+  # Goal: Test reduced TD target pessimism since correct
+  #       optimism produces larger std estimates
+  # 
+  # Sweep: td_target_std_coef in {0, -0.2, -0.5}
+  # Tasks: hopper-hop, quadruped-walk, cartpole-swingup_sparse
+  # 
+  # 3 tasks × 3 td_target × 4 seeds = 36 runs
+  #############################################
+
+  task:
+    values:
+      - hopper-hop
+      - quadruped-walk
+      - cartpole-swingup_sparse
+
+  # SWEEP: td_target_std_coef
+  td_target_std_coef:
+    values: [0, -0.2, -0.5]
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  #############################################
+  # CORRECT OPTIMISM SETTINGS (fixed)
+  #############################################
+
+  value_std_coef_default:
+    value: 1
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 1
+  planner_value_std_coef_train:
+    value: opt
+  planner_value_std_coef_eval:
+    value: pess
+
+  # Jacobian correction
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+
+  # Use EMA target network for planner scoring
+  ema_value_planning:
+    value: true
+
+  #############################################
+  # ARCHITECTURE
+  #############################################
+
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_q:
+    value: 8
+  num_reward_heads:
+    value: 4
+  planner_num_dynamics_heads:
+    value: 4
+
+  #############################################
+  # ENTROPY SETTINGS
+  #############################################
+
+  start_entropy_coeff:
+    value: 0.00003
+  start_dynamic_entropy_ratio:
+    value: 0.5
+  entropy_action_dim_power:
+    value: 1.0
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0.01
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  planner_use_all_heads_eval:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: true
+  compile:
+    value: true
+
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

@@ -1,0 +1,36 @@
+Policy Entropy Fix Ablation
+===========================
+
+Purpose:
+Show that the Jacobian compensation for policy entropy is essential for proper
+entropy regularization. Without it, the policy becomes effectively deterministic
+even with high entropy coefficients.
+
+Key insight:
+The tanh squashing in the policy changes the entropy calculation. Without the
+Jacobian correction:
+- The "entropy" being maximized is NOT the true entropy
+- The policy cheats by setting std to maximum while driving mean to extremes
+- The TRUE entropy is actually very low (deterministic policy)
+
+With Jacobian correction:
+- We maximize the TRUE entropy
+- The policy remains genuinely stochastic
+- Entropy regularization works as intended
+
+Configuration:
+- Task: Something where exploration matters
+- Sweep:
+  - jacobian_correction_scale: 0 (off) vs 1 (on)
+  - start_entropy_coeff: various values
+- Log BOTH the "fake" entropy and the TRUE entropy for comparison
+
+Expected outcome:
+- Without Jacobian fix: High "fake" entropy, very low TRUE entropy, deterministic behavior
+- With Jacobian fix: Entropy values match, genuinely stochastic policy
+
+Metrics to log:
+- Episode return
+- True policy entropy (with Jacobian correction)
+- "Fake" policy entropy (without Jacobian correction)  
+- Policy mean and std statistics

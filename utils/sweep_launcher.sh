@@ -62,6 +62,12 @@ echo "Found: $SWEEP_LINE" | tee -a "$LOG_DIR/sweep_create.log"
 SWEEP_ID=$(echo "$SWEEP_LINE" | awk -F'/' '{print $3}')
 echo "$SWEEP_ID" > "$LOG_DIR/sweep_id.txt"
 
+# Also save id.txt and project.txt in the same directory as the sweep yaml
+SWEEP_YAML_DIR=$(dirname "$SWEEP_YAML")
+echo "$SWEEP_ID" > "$SWEEP_YAML_DIR/id.txt"
+echo "$WANDB_PROJECT" > "$SWEEP_YAML_DIR/project.txt"
+echo "Saved id.txt and project.txt to $SWEEP_YAML_DIR"
+
 # Launch agents for each GPU (nohup, ensure env sourced in subshell)
 IFS=',' read -ra GPUS <<< "$GPU_LIST"
 for GPU in "${GPUS[@]}"; do

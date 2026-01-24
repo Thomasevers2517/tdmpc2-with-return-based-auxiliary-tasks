@@ -2,6 +2,9 @@ import os
 os.environ['MUJOCO_GL'] = os.getenv("MUJOCO_GL", 'egl')
 os.environ['LAZY_LEGACY_OP'] = '0'
 os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
+# Debug: get proper CUDA error locations (disable for production)
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# os.environ['TORCH_USE_CUDA_DSA'] = '1'
 # os.environ['TORCH_LOGS'] = "+recompiles"
 import warnings
 warnings.filterwarnings('ignore')
@@ -24,6 +27,7 @@ from common.logger import get_logger
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
+# torch._dynamo.config.capture_scalar_outputs = True
 # torch.autograd.set_detect_anomaly(True)
 
 @hydra.main(config_name='config', config_path='.')

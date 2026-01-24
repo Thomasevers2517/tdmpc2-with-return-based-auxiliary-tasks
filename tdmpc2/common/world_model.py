@@ -50,10 +50,9 @@ class WorldModel(nn.Module):
 		self._encoder = layers.enc(cfg)
 		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
 		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
-		# Prior network config for ensemble diversity
-		prior_enabled = cfg.dynamics_prior_enabled
-		prior_hidden_dim = cfg.dynamics_prior_hidden_dim
-		prior_scale = cfg.dynamics_prior_scale
+		# Unified prior config for ensemble diversity
+		prior_hidden_div = int(cfg.prior_hidden_div)
+		prior_scale = float(cfg.prior_scale)
 		# Dynamics head config: layer count and dropout
 		dynamics_num_layers = int(getattr(cfg, 'dynamics_num_layers', 2))
 		dynamics_dropout = float(getattr(cfg, 'dynamics_dropout', 0.0))
@@ -63,8 +62,7 @@ class WorldModel(nn.Module):
 				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
 				out_dim=cfg.latent_dim,
 				cfg=cfg,
-				prior_enabled=prior_enabled,
-				prior_hidden_dim=prior_hidden_dim,
+				prior_hidden_div=prior_hidden_div,
 				prior_scale=prior_scale,
 				dropout=dynamics_dropout,
 			)
@@ -74,23 +72,31 @@ class WorldModel(nn.Module):
 		self._dynamics = self._dynamics_heads[0]
 		
 		# Multi-head reward ensemble for pessimistic reward estimation
+		# Uses Ensemble (vmap) for efficient vectorized forward pass.
 		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
 		# Ensemble stores params in TensorDictParams which apply() does not traverse.
 		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
 		reward_dropout = cfg.dropout if getattr(cfg, 'reward_dropout_enabled', False) else 0.0
-		self._reward_heads = nn.ModuleList([
-			layers.mlp(
-				cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				num_reward_layers * [reward_hidden_dim],  # [dim] or [dim, dim]
-				max(cfg.num_bins, 1),
+		prior_logit_scale = getattr(cfg, 'prior_logit_scale', 5.0)  # Default 5.0 for backward compat
+		reward_mlps = [
+			layers.MLPWithPrior(
+				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
+				hidden_dims=num_reward_layers * [reward_hidden_dim],
+				out_dim=max(cfg.num_bins, 1),
+				prior_hidden_div=prior_hidden_div,
+				prior_scale=prior_scale,
+				prior_logit_scale=prior_logit_scale,
 				dropout=reward_dropout,
+				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
+				cfg=cfg,
 			)
 			for _ in range(num_reward_heads)
-		])
-		for mlp in self._reward_heads:
-			mlp.apply(init.weight_init)
+		]
+		for mlp_with_prior in reward_mlps:
+			mlp_with_prior.main_mlp.apply(init.weight_init)
+		self._Rs = layers.Ensemble(reward_mlps)
 		
 		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
 		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
@@ -102,9 +108,22 @@ class WorldModel(nn.Module):
 		v_input_dim = cfg.latent_dim + cfg.task_dim
 		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div  # Allow smaller V networks via value_dim_div
 		num_value_layers = cfg.num_value_layers  # Number of hidden layers (default 2)
-		v_mlps = [layers.mlp(v_input_dim, num_value_layers*[v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout) for _ in range(cfg.num_q)]
-		for mlp in v_mlps:
-			mlp.apply(init.weight_init)
+		v_mlps = [
+			layers.MLPWithPrior(
+				in_dim=v_input_dim,
+				hidden_dims=num_value_layers * [v_mlp_dim],
+				out_dim=max(cfg.num_bins, 1),
+				prior_hidden_div=prior_hidden_div,
+				prior_scale=prior_scale,
+				prior_logit_scale=prior_logit_scale,
+				dropout=cfg.dropout,
+				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
+				cfg=cfg,
+			)
+			for _ in range(cfg.num_q)
+		]
+		for mlp_with_prior in v_mlps:
+			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
 
 		# ------------------------------------------------------------------
@@ -143,10 +162,17 @@ class WorldModel(nn.Module):
 				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
 
 		self.apply(init.weight_init)
-		reward_weights = [head[-1].weight for head in self._reward_heads]
-		# Last layer index = num_value_layers (e.g., 1 hidden → layers 0,1 → output is "1")
+		# Zero-init main network output layers for reward and value heads.
+		# When prior_scale=0: output = main(x) = 0 initially → V≈0, R≈0
+		# When prior_scale>0: output = main(x) + prior(x) = 0 + prior(x) → diversity from prior
+		# The main network can still learn to compensate since its output layer is trainable.
+		# NOTE: MLPWithPrior nests the main MLP under "main_mlp" in TensorDictParams
+		reward_output_layer_key = str(num_reward_layers)
 		v_output_layer_key = str(num_value_layers)
-		init.zero_(reward_weights + [self._Vs.params[v_output_layer_key, "weight"]])
+		init.zero_([
+			self._Rs.params["main_mlp", reward_output_layer_key, "weight"],
+			self._Vs.params["main_mlp", v_output_layer_key, "weight"],
+		])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
@@ -225,7 +251,7 @@ class WorldModel(nn.Module):
 		if self._num_aux_gamma > 0:
 			modules.append('Aux V-functions')
 			aux_modules = [self._aux_joint_Vs if self._aux_joint_Vs is not None else self._aux_separate_Vs]
-		for i, m in enumerate([self._encoder, self._dynamics, self._reward_heads, self._termination, self._pi, self._Vs] + aux_modules):
+		for i, m in enumerate([self._encoder, self._dynamics, self._Rs, self._termination, self._pi, self._Vs] + aux_modules):
 			if m == self._termination and not self.cfg.episodic:
 				continue
 			repr += f"{modules[i]}: {m}\n"
@@ -396,13 +422,15 @@ class WorldModel(nn.Module):
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			with self._autocast_context():
-				if head_mode == 'single':
-					out = self._reward_heads[0](za).unsqueeze(0)
-				elif head_mode == 'all':
-					out = torch.stack([head(za) for head in self._reward_heads], dim=0)
-				else:
-					raise ValueError(f"Unsupported head_mode for reward: {head_mode}. Use 'single' or 'all'.")
-			return out.float()
+				# Ensemble forward returns [num_heads, ..., K] via vmap
+				out = self._Rs(za)
+			out = out.float()
+			if head_mode == 'single':
+				return out[:1]  # Keep leading dim, take first head only
+			elif head_mode == 'all':
+				return out
+			else:
+				raise ValueError(f"Unsupported head_mode for reward: {head_mode}. Use 'single' or 'all'.")
 	
 	def termination(self, z, task, unnormalized=False):
 		"""
@@ -456,14 +484,24 @@ class WorldModel(nn.Module):
 			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action and apply squash (tanh) with configurable Jacobian correction
-			# jacobian_correction_scale controls how much we penalize action saturation:
-			#   1.0 = correct entropy (full Jacobian penalty near ±1)
-			#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
-			action = mean + eps * log_std.exp()
-			presquash_mean = mean
-			jacobian_scale = float(self.cfg.jacobian_correction_scale)
-			mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
+			# Sample action using either BMPC-style or standard squash parameterization
+			if self.cfg.bmpc_policy_parameterization:
+				# BMPC-style: squash mean first, then add noise with clamp
+				# mean = tanh(mean_raw), action = (mean + eps * std).clamp(-1, 1)
+				# No Jacobian correction needed since we don't squash the full sample
+				mean = torch.tanh(mean)
+				presquash_mean = mean  # Already squashed
+				action = (mean + eps * log_std.exp()).clamp(-1, 1)
+				log_prob = log_prob_presquash  # No Jacobian correction
+			else:
+				# Standard squashed Gaussian: action = tanh(mean + eps * std)
+				# jacobian_correction_scale controls how much we penalize action saturation:
+				#   1.0 = correct entropy (full Jacobian penalty near ±1)
+				#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
+				action = mean + eps * log_std.exp()
+				presquash_mean = mean
+				jacobian_scale = float(self.cfg.jacobian_correction_scale)
+				mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
 			
 			# Entropy and scaled_entropy for policy loss
 			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)

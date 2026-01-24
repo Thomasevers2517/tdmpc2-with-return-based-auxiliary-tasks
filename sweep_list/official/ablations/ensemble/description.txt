@@ -1,0 +1,28 @@
+Ensemble Ablation
+=================
+
+Purpose:
+Show that simply adding an ensemble of dynamics and reward heads improves performance,
+even WITHOUT any optimism or pessimism anywhere.
+
+Key insight:
+The ensemble provides:
+1. Better predictions through averaging
+2. Extra learning signal from multiple heads
+
+Configuration:
+- Task: quadruped-walk
+- Optimism: OFF everywhere (planner, policy, TD targets)
+- Pessimism: OFF everywhere
+- Sweep: num_dynamics_heads, num_reward_heads (1 vs 2 vs more)
+- Also ablate: Learning rate scaling with ensemble size
+
+Expected outcome:
+- Performance improves just from having multiple heads
+- Learning rate scaling is important for proper ensemble training
+  (without scaling, larger ensembles don't train as well)
+
+Metrics to log:
+- Episode return
+- Dynamics loss per head
+- Reward loss per head

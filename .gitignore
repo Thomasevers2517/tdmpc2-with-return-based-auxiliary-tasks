@@ -6,6 +6,7 @@ tdmpc2/logs/
 tdmpc2/outputs/
 tdmpc2/wandb/
 
+.compile_cache/
 
 # HPC
 nautilus/*.yaml

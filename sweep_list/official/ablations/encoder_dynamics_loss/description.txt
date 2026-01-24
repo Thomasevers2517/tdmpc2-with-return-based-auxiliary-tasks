@@ -1,0 +1,37 @@
+Encoder Dynamics Loss (Consistency Loss) Ablation
+=================================================
+
+Purpose:
+Show that the encoder consistency loss improves performance by reducing
+irrelevant information in the latent space, preventing overfitting.
+
+Key insight:
+The encoder consistency loss says: "Make the latent easier to predict."
+This has the effect of:
+1. Removing irrelevant/noisy information from the latent
+2. Keeping only task-relevant information
+3. Reducing overfitting to spurious correlations
+4. Decreasing latent variance
+
+Configuration:
+- Task: quadruped-walk (and potentially others)
+- Sweep:
+  - encoder_consistency_coef: 0, 0.1, 0.5, 1.0
+  - Possibly with different UTD ratios
+- Log latent variance to show compression effect
+
+Expected outcome:
+- coef=0: Higher latent variance, potential overfitting
+- coef=0.5-1: Lower latent variance, better generalization, improved performance
+- Too high coef: May lose important information
+
+Key relationship to show:
+- Encoder consistency loss decreases → Good
+- Latent variance decreases → Less irrelevant info
+- Performance increases → Better generalization
+
+Metrics to log:
+- Episode return
+- Encoder consistency loss
+- Latent variance (mean/std of latent dimensions)
+- Dynamics loss (should also improve)
