@@ -8,19 +8,20 @@ command:
   - ${args_no_hyphens}
 parameters:
   #############################################
-  # Sweep 9: Hopper-Hop Default Settings
+  # Sweep 9: Hopper-Hop & Quadruped-Walk Baseline
   # 
-  # Baseline planner distillation on hopper-hop
+  # Baseline planner distillation on DMC tasks
   #
-  # Task: hopper-hop
+  # Tasks: hopper-hop, quadruped-walk
   # Steps: 100k
   # Seeds: 4
-  # Total runs: 4
+  # Total runs: 8
   #############################################
 
   task:
     values:
       - hopper-hop
+      - quadruped-walk
 
   seed:
     values: [1, 2, 3, 4]
