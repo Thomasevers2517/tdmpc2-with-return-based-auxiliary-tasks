@@ -288,8 +288,10 @@ class Planner(torch.nn.Module):
             # Elite selection per batch element: [B, E] -> [B, K]
             elite_scores, elite_indices = torch.topk(scores, K, dim=1, largest=True, sorted=True)  # [B, K]
             
-            # Softmax weights over elite scores per batch
-            w = torch.softmax(elite_scores / max(temp, 1e-8), dim=1)  # [B, K]
+            # Compute weights over elite scores per batch (BMPC-style: subtract max, multiply by temp)
+            max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
+            w = torch.exp(temp * (elite_scores - max_elite))  # [B, K]
+            w = w / (w.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             
             # Gather elite actions: [B, E, T, A] -> [B, K, T, A]
             elite_indices_expanded = elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, T, A)  # [B, K, T, A]
@@ -321,7 +323,10 @@ class Planner(torch.nn.Module):
         if use_greedy:
             chosen_idx = scores.argmax(dim=1, keepdim=True)  # [B, 1]
         else:
-            probs = torch.softmax(elite_scores / max(temp, 1e-8), dim=1)  # [B, K]
+            # BMPC-style: subtract max, multiply by temp
+            max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
+            probs = torch.exp(temp * (elite_scores - max_elite))  # [B, K]
+            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             elite_pick = torch.multinomial(probs, 1)  # [B, 1]
             chosen_idx = elite_indices.gather(1, elite_pick)  # [B, 1]
         

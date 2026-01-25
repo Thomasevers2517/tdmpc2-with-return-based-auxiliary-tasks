@@ -51,7 +51,7 @@ parameters:
   greedy_train_action_selection:
     value: false
   fix_kl_order:
-    value: true
+    values: [true, false]
   kl_scale_min:
     value: 0.1
   local_td_bootstrap:
