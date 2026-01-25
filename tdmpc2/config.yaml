@@ -256,7 +256,7 @@ kl_scale_min: 0.1                           # Minimum value for KL loss RunningS
 log_std_min: -10
 log_std_max: 2
 end_entropy_coeff: 1e-6
-start_entropy_coeff: 3e-5
+start_entropy_coeff: 1e-4
 # Entropy scaling by action dimension.
 # scaled_entropy = entropy * (action_dim ** entropy_action_dim_power)
 # power=0: no extra scaling (entropy ~ D from Gaussian sum)
