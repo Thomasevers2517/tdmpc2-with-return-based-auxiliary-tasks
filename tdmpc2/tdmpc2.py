@@ -98,7 +98,8 @@ class TDMPC2(torch.nn.Module):
 		num_dynamics_heads = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))
 		num_reward_heads = int(getattr(self.cfg, 'num_reward_heads', 1))
 		num_q = int(getattr(self.cfg, 'num_q', 5))
-		num_aux_heads = len(self.cfg.multi_gamma_gammas) if getattr(self.cfg, 'multi_gamma_gammas', None) else 0
+		# Only count aux heads if loss_weight > 0 (otherwise heads aren't created)
+		num_aux_heads = len(self.cfg.multi_gamma_gammas) if (getattr(self.cfg, 'multi_gamma_gammas', None) and self.cfg.multi_gamma_loss_weight != 0) else 0
 		ensemble_lr_scaling = self.cfg.ensemble_lr_scaling
 		
 		lr_encoder = self.cfg.lr * self.cfg.enc_lr_scale
@@ -200,7 +201,8 @@ class TDMPC2(torch.nn.Module):
 		) if self.cfg.multitask else torch.tensor(self._get_discount(cfg.episode_length), device=self.device)
 		# Compose full gamma list internally: primary discount first + auxiliary gammas from config.
 		# New semantics: cfg.multi_gamma_gammas contains ONLY auxiliary discounts.
-		if getattr(self.cfg, 'multi_gamma_gammas', None):
+		# Only include auxiliary gammas if loss_weight > 0 (otherwise heads aren't created)
+		if getattr(self.cfg, 'multi_gamma_gammas', None) and self.cfg.multi_gamma_loss_weight != 0:
 			self._all_gammas = [float(self.discount)] + list(self.cfg.multi_gamma_gammas)
 		else:
 			self._all_gammas = [float(self.discount)]

@@ -30,8 +30,8 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
     latent_dis = None
     if lat_all.shape[0] > 1:
         final_all = lat_all[:, 0, 0, -1, :]  # [H,L] - index B=0, N=0, t=-1
-        # Compute disagreement with N=1; returns shape [1]
-        latent_dis = compute_disagreement(final_all.unsqueeze(1))
+        # Compute disagreement expects [H,B,N,L]; here B=1, N=1 → unsqueeze twice
+        latent_dis = compute_disagreement(final_all.unsqueeze(1).unsqueeze(1))
     score = combine_scores(vals_scaled, latent_dis, lambda_latent)
     return vals_scaled, latent_dis, val_dis, score
 

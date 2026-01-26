@@ -316,7 +316,7 @@ encoder_dropout: 0.0  # Dropout for state encoder. When > 0, encodes twice (trai
 reward_dropout_enabled: false  # Whether to apply dropout to reward heads (uses same dropout rate as value heads)
 simnorm_dim: 8
 
-reward_dim_div: 32 # reward MLP dimension is mlp_dim divided by this value
+reward_dim_div: 8 # reward MLP dimension is mlp_dim divided by this value
 num_reward_layers: 1 # number of hidden layers in reward MLP (1 or 2)
 value_dim_div: 1 # value (V) MLP dimension is mlp_dim divided by this value
 num_value_layers: 2 # number of hidden layers in value (V) MLP

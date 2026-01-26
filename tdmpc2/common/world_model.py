@@ -149,7 +149,9 @@ class WorldModel(nn.Module):
 		self._detach_aux_joint_Vs = None
 		self._detach_aux_separate_Vs = None	
   
-		if getattr(cfg, 'multi_gamma_gammas', None):
+		# Only create auxiliary heads if gammas are specified AND loss weight > 0
+		# When loss_weight=0, skip creating heads entirely to save memory/compute
+		if getattr(cfg, 'multi_gamma_gammas', None) and cfg.multi_gamma_loss_weight != 0:
 			gammas = cfg.multi_gamma_gammas
 			self._num_aux_gamma = len(gammas)
 			# Auxiliary V heads: input is latent only (no action)

@@ -211,6 +211,21 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			cfg[reanalyze_key] = cfg[base_key]
 
 	# ----------------------------------------------------------------------
+	# bmpc_policy_parameterization auto-derivation from policy_optimization_method
+	# ----------------------------------------------------------------------
+	# When bmpc_policy_parameterization is null, derive it from policy_optimization_method:
+	#   - "distillation" or "both" → true (bounded mean space, KL-friendly)
+	#   - "svg" → false (standard squashed Gaussian with Jacobian correction)
+	# Note: W&B sweeps convert YAML null to string "None", so check for both
+	bmpc_val = cfg.get('bmpc_policy_parameterization')
+	if bmpc_val is None or bmpc_val == 'None':
+		policy_method = cfg.get('policy_optimization_method', 'distillation')
+		if policy_method in ('distillation', 'both'):
+			cfg.bmpc_policy_parameterization = True
+		else:  # 'svg'
+			cfg.bmpc_policy_parameterization = False
+
+	# ----------------------------------------------------------------------
 	# value_std_coef resolution: convert "opt"/"pess" strings to numeric values
 	# ----------------------------------------------------------------------
 	# All std_coef params can be:

@@ -67,6 +67,7 @@ class OnlineTrainer(Trainer):
   
 		for i in range(self.cfg.eval_episodes):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
+			self.agent.reset_planner_state()  # Reset warm start for each eval episode
 			self.val_tds = [self.to_td(obs)]
 			if self.cfg.save_video:
 				self.logger.video.init(self.env, enabled=(i==0))
