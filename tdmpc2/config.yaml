@@ -238,18 +238,19 @@ temperature: 0.5
 # Used for policy distillation: KL(expert || policy) loss.
 reanalyze_interval: 10              # 0 = disabled. >0 = steps between lazy reanalyze
 reanalyze_batch_size: 64           # How many samples to reanalyze per interval
-reanalyze_horizon: 3                # Planning horizon for reanalyze
-reanalyze_iterations: 6             # MPPI iterations for reanalyze
-reanalyze_num_samples: 512          # Samples per MPPI iteration during reanalyze
-reanalyze_num_elites: 64            # Number of elites for reanalyze
-reanalyze_num_pi_trajs: 24          # Policy-seeded trajectories during reanalyze (0 = none)
-reanalyze_temperature: 0.5          # Temperature for elite selection during reanalyze
-reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral, >0 = optimistic, <0 = pessimistic)
+# Reanalyze planner params: null = inherit from main planner (horizon, iterations, etc.)
+reanalyze_horizon: null             # Planning horizon for reanalyze (null = inherit)
+reanalyze_iterations: null          # MPPI iterations for reanalyze (null = inherit)
+reanalyze_num_samples: null         # Samples per MPPI iteration during reanalyze (null = inherit)
+reanalyze_num_elites: null          # Number of elites for reanalyze (null = inherit)
+reanalyze_num_pi_trajs: null        # Policy-seeded trajectories during reanalyze (null = inherit)
+reanalyze_temperature: null         # Temperature for elite selection during reanalyze (null = inherit)
+reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral, >0 = optimistic, <0 = pessimistic) - does NOT inherit
 policy_optimization_method: distillation    # 'svg' (backprop through model) | 'distillation' (KL to expert) | 'both'
 optimistic_policy_optimization_method: same  # 'same' = same as policy_optimization_method | 'svg' | 'distillation' | 'both'
 policy_svg_distill_ratio: 0.5               # When method='both': ratio of distillation loss. 0=pure SVG, 1=pure distillation
                                             # Combined loss = (1 - ratio) * svg_loss + ratio * distill_loss
-fix_kl_order: true                          # If true, use KL(expert || policy); if false, use KL(policy || expert)
+fix_kl_order: false                          # If true, use KL(expert || policy); if false, use KL(policy || expert)
 kl_scale_min: 0.1                           # Minimum value for KL loss RunningScale (1.0 = no amplification, <1.0 allows amplifying small losses)
 
 # actor

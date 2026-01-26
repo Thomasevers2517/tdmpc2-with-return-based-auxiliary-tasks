@@ -196,6 +196,21 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		print(f"Overriding rho schedule to end at final_rho = {cfg.final_rho} at horizon = {cfg.horizon}, setting rho = {cfg.rho:.6f}")
 
 	# ----------------------------------------------------------------------
+	# Reanalyze param inheritance: if null, inherit from main planner params
+	# ----------------------------------------------------------------------
+	reanalyze_param_map = {
+		'reanalyze_iterations': 'iterations',
+		'reanalyze_num_samples': 'num_samples',
+		'reanalyze_num_elites': 'num_elites',
+		'reanalyze_num_pi_trajs': 'num_pi_trajs',
+		'reanalyze_temperature': 'temperature',
+		'reanalyze_horizon': 'horizon',
+	}
+	for reanalyze_key, base_key in reanalyze_param_map.items():
+		if cfg.get(reanalyze_key) is None:
+			cfg[reanalyze_key] = cfg[base_key]
+
+	# ----------------------------------------------------------------------
 	# value_std_coef resolution: convert "opt"/"pess" strings to numeric values
 	# ----------------------------------------------------------------------
 	# All std_coef params can be:

@@ -88,4 +88,4 @@ bash utils/slurm/run_sweep.sh \
 - Use `eval_freq` to control evaluation cadence and `save_video=false` to avoid overhead.
 - To run without MPC during training for ablations: `train_mpc=false` (evaluation still uses MPC if `eval_mpc=true`).
 - Logs are under `logs/YYYYMMDD_HHMMSS/`. Set `wandb_*` keys in `config.yaml` to enable/disable Weights & Biases.
-- Always activate the `tdmpc2` conda environment before running scripts.
+- Always activate the `bmpc` conda environment before running scripts.
