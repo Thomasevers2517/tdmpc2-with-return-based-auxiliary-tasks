@@ -232,6 +232,7 @@ horizon: 3
 min_std: 0.05
 max_std: 1
 temperature: 0.5
+mult_by_temp: true                  # If true, multiply scores by temp (softer). If false, divide by temp (sharper).
 
 # reanalyze (planner distillation)
 # Generate expert targets by re-running planner on observations.

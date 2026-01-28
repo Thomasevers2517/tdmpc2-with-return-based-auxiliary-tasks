@@ -250,7 +250,7 @@ srun --output="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.out" \
        # Set up compilation cache directory
        if [[ "${PERSISTENT_CACHE:-0}" == "1" ]]; then
          # Persistent cache in repo directory (reused across jobs)
-         TASK_CACHE="${REPO_ROOT}/.compilation_files/task_${SLURM_PROCID}"
+         TASK_CACHE="${REPO_ROOT}/.compilation_files/job_${SLURM_JOB_ID}/task_${SLURM_PROCID}"
        else
          # Per-task cache on local scratch (fast but ephemeral)
          TASK_CACHE="${TMPDIR:-/tmp}/compile_cache_task_${SLURM_PROCID}"

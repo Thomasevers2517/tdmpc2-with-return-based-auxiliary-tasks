@@ -288,9 +288,13 @@ class Planner(torch.nn.Module):
             # Elite selection per batch element: [B, E] -> [B, K]
             elite_scores, elite_indices = torch.topk(scores, K, dim=1, largest=True, sorted=True)  # [B, K]
             
-            # Compute weights over elite scores per batch (BMPC-style: subtract max, multiply by temp)
+            # Compute weights over elite scores per batch (BMPC-style: subtract max, scale by temp)
             max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
-            w = torch.exp(temp * (elite_scores - max_elite))  # [B, K]
+            score_delta = elite_scores - max_elite  # [B, K]
+            if bool(self.cfg.mult_by_temp):
+                w = torch.exp(temp * score_delta)  # [B, K] - multiply: higher temp = softer
+            else:
+                w = torch.exp(score_delta / temp)  # [B, K] - divide: higher temp = softer
             w = w / (w.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             
             # Gather elite actions: [B, E, T, A] -> [B, K, T, A]
@@ -323,9 +327,13 @@ class Planner(torch.nn.Module):
         if use_greedy:
             chosen_idx = scores.argmax(dim=1, keepdim=True)  # [B, 1]
         else:
-            # BMPC-style: subtract max, multiply by temp
+            # BMPC-style: subtract max, scale by temp
             max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
-            probs = torch.exp(temp * (elite_scores - max_elite))  # [B, K]
+            score_delta = elite_scores - max_elite  # [B, K]
+            if bool(self.cfg.mult_by_temp):
+                probs = torch.exp(temp * score_delta)  # [B, K] - multiply: higher temp = softer
+            else:
+                probs = torch.exp(score_delta / temp)  # [B, K] - divide: higher temp = softer
             probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             elite_pick = torch.multinomial(probs, 1)  # [B, 1]
             chosen_idx = elite_indices.gather(1, elite_pick)  # [B, 1]
