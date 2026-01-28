@@ -206,8 +206,10 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		'reanalyze_temperature': 'temperature',
 		'reanalyze_horizon': 'horizon',
 	}
+	# Note: W&B sweeps convert YAML null to string "None", so check for both
 	for reanalyze_key, base_key in reanalyze_param_map.items():
-		if cfg.get(reanalyze_key) is None:
+		val = cfg.get(reanalyze_key)
+		if val is None or val == 'None':
 			cfg[reanalyze_key] = cfg[base_key]
 
 	# ----------------------------------------------------------------------
