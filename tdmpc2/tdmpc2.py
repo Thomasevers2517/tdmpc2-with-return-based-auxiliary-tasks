@@ -169,7 +169,11 @@ class TDMPC2(torch.nn.Module):
 		# - kl_scale: for KL distillation (calc_pi_distillation_losses), min_scale from config
 		self.q_scale = RunningScale(cfg, min_scale=1.0)
 		self.kl_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
-		self.cfg.iterations += 2*int(cfg.action_dim >= 20) # Heuristic for large action spaces
+		# Heuristic for large action spaces: add 2 iterations if action_dim >= threshold
+		extra_iter_thresh = int(cfg.extra_iter_action_dim_threshold)
+		high_dim_adjustment = 2 * int(extra_iter_thresh > 0 and cfg.action_dim >= extra_iter_thresh)
+		self.cfg.iterations += high_dim_adjustment
+		self.cfg.reanalyze_iterations += high_dim_adjustment
 		# Logging/instrumentation step counter (used for per-loss gradient logging gating)
 		self._step = 0  # incremented at end of _update
 		self._last_reanalyze_step = -1  # Track last step where reanalyze was run (prevent duplicates with utd_ratio > 1)
