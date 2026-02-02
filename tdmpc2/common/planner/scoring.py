@@ -11,6 +11,7 @@ def compute_values(
     value_std_coef: float = 0.0,
     reward_head_mode: str = "all",
     use_ema_value: bool = False,
+    aggregate_horizon: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute trajectory values using dynamics heads and reward heads.
     
@@ -30,6 +31,15 @@ def compute_values(
       value_std_coef > 0: max over H (optimistic)
       value_std_coef < 0: min over H (pessimistic)
       value_std_coef = 0: mean over H (neutral)
+    
+    AGGREGATE HORIZON (λ-style compound return):
+    When aggregate_horizon=True, instead of only bootstrapping at z_T, we compute
+    returns at each intermediate horizon τ ∈ {1, ..., T}:
+      G_τ = Σ_{t=0}^{τ-1}(α_t × r_t) + α_τ × V(z_τ)
+    And take the uniform average: G = (1/T) Σ_τ G_τ
+    
+    This reduces model exploitation by averaging over different bootstrap depths.
+    Uncertainty is propagated correctly using cumulative variance.
 
     Args:
         latents_all (Tensor[H, B, N, T+1, L]): Latent rollouts for all dynamics heads.
@@ -42,6 +52,7 @@ def compute_values(
         reward_head_mode: 'single' uses only head 0, 'all' uses all reward heads.
             During eval, use 'single' to match single dynamics head for fair comparison.
         use_ema_value: If True, use EMA target network for V; otherwise use online network.
+        aggregate_horizon: If True, compute λ-style compound return averaging over all horizons.
 
     Returns:
         Tuple[Tensor[B, N], Tensor[B, N], Tensor[B, N], Tensor[B, N]]: 
@@ -55,6 +66,7 @@ def compute_values(
     device = latents_all.device
     dtype = latents_all.dtype
 
+    # =========== STEP 1: Rewards & alive probs (SHARED) ===========
     # Reward computation across all dynamics heads in parallel.
     z_t = latents_all[:, :, :, :-1, :]                      # float32[H, B, N, T, L]
     # Broadcast actions to all dynamics heads: [B, N, T, A] -> [H, B, N, T, A]
@@ -97,36 +109,81 @@ def compute_values(
     r_mean_per_h = r_all.mean(dim=0)  # float32[H, B, N, T] - mean over R
     r_std_per_h = r_all.std(dim=0, unbiased=(R > 1))  # float32[H, B, N, T] - std over R
 
-    # Get V values for ALL Ve ensemble heads at terminal state
-    z_last = latents_all[:, :, :, -1, :]                    # float32[H, B, N, L]
-    z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
-    
-    # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
-    v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)  # float32[Ve, H*B*N, K]
-    v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
-    v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
-    
-    # Per dynamics head h, compute value mean and std across Ve value heads
-    # v_all: [Ve, H, B, N]
-    v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
-    v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
-    
-    # Compute alive-weighted return mean per dynamics head
-    # μ_h = sum_t(alive_probs[t] * r_mean_{h,t}) + alive_probs[T] * v_mean_h
-    # alive_probs[:,:,:,:T] for rewards, alive_probs[:,:,:,T] for bootstrap
-    returns_mean_per_h = (r_mean_per_h * alive_probs[:, :, :, :T]).sum(dim=3)  # float32[H, B, N]
-    total_mean_per_h = returns_mean_per_h + alive_probs[:, :, :, T] * v_mean_per_h  # float32[H, B, N]
-    
-    # Compute aggregated std per dynamics head using alive-weighted variance addition
-    # σ_h = sqrt(sum_t(alive_probs[t]² * σ^r_{h,t}²) + alive_probs[T]² * σ^v_h²)
-    reward_var_sum_per_h = ((r_std_per_h * alive_probs[:, :, :, :T]) ** 2).sum(dim=3)  # float32[H, B, N]
-    total_var_per_h = reward_var_sum_per_h + (alive_probs[:, :, :, T] * v_std_per_h) ** 2  # float32[H, B, N]
-    total_std_per_h = total_var_per_h.sqrt()  # float32[H, B, N]
-    
-    # Compute Q_h = μ_h + value_std_coef × σ_h per dynamics head
-    q_per_h = total_mean_per_h + value_std_coef * total_std_per_h  # float32[H, B, N]
-    
-    # Reduce over dynamics heads based on sign of value_std_coef
+    # =========== STEP 2: Get V values ===========
+    if aggregate_horizon:
+        # Aggregate horizon: V at ALL intermediate states z_1, ..., z_T (single batched call)
+        # z_inter contains states after each action: z_1=next(z_0,a_0), z_2=next(z_1,a_1), etc.
+        z_inter = latents_all[:, :, :, 1:, :]                   # float32[H, B, N, T, L]
+        z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
+        
+        # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
+        v_logits_all = world_model.V(z_inter_flat, task, return_type='all', target=use_ema_value)
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
+        v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
+        
+        # Per dynamics head h, compute value mean and std across Ve value heads at each horizon
+        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T] - mean over Ve
+        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N, T] - std over Ve
+    else:
+        # Single horizon: V only at terminal z_T (original behavior)
+        z_last = latents_all[:, :, :, -1, :]                    # float32[H, B, N, L]
+        z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
+        
+        # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
+        v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
+        v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
+        
+        # Per dynamics head h, compute value mean and std across Ve value heads
+        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
+        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
+
+    # =========== STEP 3: Compute returns ===========
+    if aggregate_horizon:
+        # Aggregate horizon: compute G_τ for each horizon τ ∈ {1, ..., T}, then average
+        # G_τ = Σ_{t=0}^{τ-1}(α_t × r_t) + α_τ × V(z_τ)
+        
+        # Cumulative weighted rewards: cumsum_r[τ] = Σ_{t=0}^{τ-1}(α_t × r_t)
+        # Index τ-1 in 0-indexed array gives sum of rewards up to step τ-1
+        weighted_r = r_mean_per_h * alive_probs[:, :, :, :T]  # float32[H, B, N, T]
+        cumsum_r = weighted_r.cumsum(dim=3)  # float32[H, B, N, T] - cumsum_r[τ-1] = Σ_{t=0}^{τ-1}(...)
+        
+        # Alive probs for bootstrap at each horizon: α_1, α_2, ..., α_T
+        alive_bootstrap = alive_probs[:, :, :, 1:T+1]  # float32[H, B, N, T]
+        
+        # Returns mean at each horizon: G_τ = cumsum_r[τ-1] + α_τ × V(z_τ)
+        # cumsum_r[τ-1] is cumsum_r[:,:,:,τ-1], and we want τ=1..T, so indices 0..T-1
+        returns_mean_per_h_per_tau = cumsum_r + alive_bootstrap * v_mean_per_h  # float32[H, B, N, T]
+        
+        # Variance at each horizon: cumulative reward variance + bootstrap variance
+        # σ²_G_τ = Σ_{t=0}^{τ-1}(α_t × σ^r_t)² + (α_τ × σ^v_τ)²
+        weighted_r_var = (r_std_per_h * alive_probs[:, :, :, :T]) ** 2  # float32[H, B, N, T]
+        cumvar_r = weighted_r_var.cumsum(dim=3)  # float32[H, B, N, T]
+        total_var_per_h_per_tau = cumvar_r + (alive_bootstrap * v_std_per_h) ** 2  # float32[H, B, N, T]
+        total_std_per_h_per_tau = total_var_per_h_per_tau.sqrt()  # float32[H, B, N, T]
+        
+        # Q_{h,τ} = G_{h,τ} + value_std_coef × σ_{h,τ}
+        q_per_h_per_tau = returns_mean_per_h_per_tau + value_std_coef * total_std_per_h_per_tau  # float32[H, B, N, T]
+        
+        # Average over horizons: Q_h = (1/T) Σ_τ Q_{h,τ}
+        q_per_h = q_per_h_per_tau.mean(dim=3)  # float32[H, B, N]
+        total_std_per_h = total_std_per_h_per_tau.mean(dim=3)  # float32[H, B, N]
+    else:
+        # Single horizon: original computation
+        # μ_h = sum_t(alive_probs[t] * r_mean_{h,t}) + alive_probs[T] * v_mean_h
+        # alive_probs[:,:,:,:T] for rewards, alive_probs[:,:,:,T] for bootstrap
+        returns_mean_per_h = (r_mean_per_h * alive_probs[:, :, :, :T]).sum(dim=3)  # float32[H, B, N]
+        total_mean_per_h = returns_mean_per_h + alive_probs[:, :, :, T] * v_mean_per_h  # float32[H, B, N]
+        
+        # σ_h = sqrt(sum_t(alive_probs[t]² * σ^r_{h,t}²) + alive_probs[T]² * σ^v_h²)
+        reward_var_sum_per_h = ((r_std_per_h * alive_probs[:, :, :, :T]) ** 2).sum(dim=3)  # float32[H, B, N]
+        total_var_per_h = reward_var_sum_per_h + (alive_probs[:, :, :, T] * v_std_per_h) ** 2  # float32[H, B, N]
+        total_std_per_h = total_var_per_h.sqrt()  # float32[H, B, N]
+        
+        # Q_h = μ_h + value_std_coef × σ_h
+        q_per_h = total_mean_per_h + value_std_coef * total_std_per_h  # float32[H, B, N]
+
+    # =========== STEP 4: Reduce over dynamics heads (SHARED) ===========
     if value_std_coef > 0:
         # Optimistic: max over dynamics heads
         values_unscaled, _ = q_per_h.max(dim=0)  # float32[B, N]

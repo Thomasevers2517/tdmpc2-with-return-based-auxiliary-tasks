@@ -104,6 +104,14 @@ optimistic_policy_value_std_coef: 1
 planner_value_std_coef_train: 1
 planner_value_std_coef_eval: -1
 
+# Aggregate horizon (λ-style compound return) for planner value estimation.
+# If true, compute returns at each intermediate horizon τ ∈ {1, ..., T}:
+#   G_τ = Σ_{t=0}^{τ-1}(α_t × r_t) + α_τ × V(z_τ)
+# And take the uniform average: G = (1/T) Σ_τ G_τ
+# This reduces model exploitation by averaging over different bootstrap depths.
+# Cost: T× more V calls (mitigated by batching all horizons in one forward pass).
+planner_aggregate_value: false
+
 # Evaluation-specific planner head configuration.
 # If true, eval uses all dynamics heads.
 # If false, eval uses only head 0 (single head, no reduction needed).

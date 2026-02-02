@@ -140,6 +140,7 @@ class Planner(torch.nn.Module):
 
         use_ema_value = bool(self.cfg.ema_value_planning)
         policy_elites_first_iter_only = bool(self.cfg.planner_policy_elites_first_iter_only)
+        aggregate_horizon = bool(self.cfg.planner_aggregate_value)
 
         # Initialize mean/std with batch dimension [B, T, A]
         if use_warm_start and B == 1:
@@ -172,6 +173,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
+                aggregate_horizon=aggregate_horizon,
             )
             # vals_*: [B, S]
             latent_dis_p = None
@@ -226,6 +228,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
+                aggregate_horizon=aggregate_horizon,
             )
             # vals_*: [B, N]
             
