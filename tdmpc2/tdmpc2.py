@@ -148,7 +148,19 @@ class TDMPC2(torch.nn.Module):
 			if num_aux_heads > 0:
 				log.info('  aux_value:  %.6f (base_lr, no scaling)', lr_aux_value)
 		
-		self.optim = torch.optim.Adam(param_groups, lr=self.cfg.lr, capturable=True)
+		# Select optimizer class based on config
+		optim_type = self.cfg.optimizer_type.lower()
+		weight_decay = float(self.cfg.weight_decay)
+		if optim_type == 'adamw':
+			OptimClass = torch.optim.AdamW
+			optim_kwargs = {'weight_decay': weight_decay}
+			log.info('Using AdamW optimizer (weight_decay=%.2e)', weight_decay)
+		else:
+			OptimClass = torch.optim.Adam
+			optim_kwargs = {}
+			log.info('Using Adam optimizer')
+		
+		self.optim = OptimClass(param_groups, lr=self.cfg.lr, capturable=True, **optim_kwargs)
 		lr_pi = self.cfg.lr * getattr(self.cfg, 'pi_lr_scale', 1.0)
 		log.info('  policy:     %.6f (base_lr * pi_lr_scale = %.4f * %.2f)', lr_pi, self.cfg.lr, getattr(self.cfg, 'pi_lr_scale', 1.0))
 		# Dual policy: combine both policies' params into single optimizer
@@ -157,7 +169,7 @@ class TDMPC2(torch.nn.Module):
 			log.info('  dual_policy: enabled (pessimistic + optimistic)')
 		else:
 			pi_params = self.model._pi.parameters()
-		self.pi_optim = torch.optim.Adam(pi_params, lr=lr_pi, eps=1e-5, capturable=True)
+		self.pi_optim = OptimClass(pi_params, lr=lr_pi, eps=1e-5, capturable=True, **optim_kwargs)
 
 		# Store initial encoder LR for step-change schedule
 		self._enc_lr_initial = lr_encoder

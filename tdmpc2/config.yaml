@@ -197,6 +197,8 @@ imagine_value_loss_coef_mult: 1 # weight for value loss on imagined rollouts, on
 
 rho: 0.5
 lr: 3e-4
+optimizer_type: adam  # 'adam' or 'adamw'
+weight_decay: 0.01  # Weight decay for AdamW (ignored for Adam)
 enc_lr_scale: 0.3
 # Encoder LR step-change schedule
 # At (1 - enc_lr_step_ratio) * steps, encoder LR is multiplied by enc_lr_step_scale
