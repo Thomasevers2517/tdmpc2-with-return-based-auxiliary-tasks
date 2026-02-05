@@ -409,7 +409,12 @@ class TDMPC2(torch.nn.Module):
 				reanalyze=True,
 			)
 			# mean, std: [B, T, A] -> take first timestep [:, 0, :] -> [B, A]
-			expert_mean = mean[:, 0, :]  # float32[B, A]
+			# chosen_action: [B, A] (planner already returns first timestep only)
+			# BMPC uses chosen_action as expert mean; default uses planner distribution mean
+			if self.cfg.reanalyze_use_chosen_action:
+				expert_mean = chosen_action  # float32[B, A] - already first timestep
+			else:
+				expert_mean = mean[:, 0, :]  # float32[B, A]
 			expert_std = std[:, 0, :]    # float32[B, A]
 			
 			# Ensure std is within valid range (defensive; planner should already clamp)
@@ -2054,35 +2059,58 @@ class TDMPC2(torch.nn.Module):
 		if should_reanalyze:
 			self._last_reanalyze_step = self._step
 			with maybe_range('update/lazy_reanalyze', self.cfg):
-				# Get first-timestep observations and indices
-				# obs: [T+1, B, *obs_shape], indices: [T+1, B]
-				# Buffer stores (obs_{t+1}, action_t, expert_dist_t) together, so:
-				# - obs[0] is o₀ (first observation)
-				# - indices[1] is where expert_dist for o₀ is stored (not indices[0], which has NaN)
-				reanalyze_batch_size = int(getattr(self.cfg, 'reanalyze_batch_size', obs.shape[1]))
+				# Two modes:
+				# 1. Independent mode (reanalyze_slice_mode=False): Sample B_re independent t=0 obs
+				# 2. Slice mode (reanalyze_slice_mode=True): Sample fewer slices, reanalyze ALL timesteps
+				#
+				# Buffer alignment after from_td with [1:] slice:
+				# - obs: [T+1, B, *obs_shape] - all observations (T+1 = horizon+1)
+				# - expert_action_dist: [T, B, A, 2] - sliced, expert[t] corresponds to obs[t]
+				# - indices: [T+1, B] - indices[t] is storage index for obs[t]
+				# 
+				# Storage convention: entry i stores (s_{t+1}, a_t, expert(s_t)) - obs is one step ahead.
+				# After [1:] slice on expert: expert[t] = expert for obs[t].
+				# To write expert for obs[t] back to storage, use indices[t+1] (shifted by 1).
+				
+				reanalyze_batch_size = int(self.cfg.reanalyze_batch_size)
 				reanalyze_batch_size = min(reanalyze_batch_size, obs.shape[1])
+				slice_mode = bool(getattr(self.cfg, 'reanalyze_slice_mode', False))
 				
-				# Take first timestep obs, but indices[1] (where expert_dist for obs[0] is stored)
-				obs_reanalyze = obs[0, :reanalyze_batch_size]  # float32[B_re, *obs_shape]
-				indices_reanalyze = indices[1, :reanalyze_batch_size]  # [B_re] - use index 1, not 0!
+				# Extract observations and indices based on mode
+				T_exp = expert_action_dist.shape[0]  # Number of expert entries (= horizon)
+				if slice_mode:
+					# BMPC slice mode: fewer slices, all T_exp timesteps per slice
+					num_slices = max(1, reanalyze_batch_size // T_exp)
+					num_slices = min(num_slices, obs.shape[1])
+					# obs_reanalyze: [T_exp, num_slices, *obs_shape] -> [T_exp*num_slices, *obs_shape]
+					obs_reanalyze = obs[:T_exp, :num_slices].reshape(-1, *obs.shape[2:])
+					# indices_flat: storage indices for expert write-back, shifted by 1
+					indices_flat = indices[1:T_exp+1, :num_slices].reshape(-1)  # [T_exp*num_slices]
+					# old_expert_dist: [T_exp, num_slices, A, 2] -> [T_exp*num_slices, A, 2]
+					old_expert_dist = expert_action_dist[:, :num_slices].clone().reshape(-1, expert_action_dist.shape[-2], 2)
+					update_shape = (T_exp, num_slices)
+				else:
+					# Independent mode: B_re independent t=0 observations
+					obs_reanalyze = obs[0, :reanalyze_batch_size]  # [B_re, *obs_shape]
+					indices_flat = indices[1, :reanalyze_batch_size]  # [B_re] - shifted by 1 for storage
+					old_expert_dist = expert_action_dist[0, :reanalyze_batch_size].clone()  # [B_re, A, 2]
+					update_shape = None
 				
-				# Get old expert distributions before reanalyze (for KL logging)
-				# expert_action_dist: [T+1, B, A, 2] -> [B_re, A, 2]
-				old_expert_dist = expert_action_dist[1, :reanalyze_batch_size].clone()  # float32[B_re, A, 2]
-				
-				# Run reanalyze to get new expert targets
+				# Run reanalyze (same call for both modes)
 				expert_action_dist_new, expert_value_new, reanalyze_info = self.reanalyze(obs_reanalyze, task=task)
 				
-				# Update expert_action_dist tensor in-place for this update
-				# expert_action_dist: [T+1, B, A, 2], update index 1 (where obs[0] targets live)
-				expert_action_dist[1, :reanalyze_batch_size] = expert_action_dist_new
+				# Update expert_action_dist tensor in-place (for this training batch)
+				if slice_mode:
+					expert_action_dist[:, :num_slices] = expert_action_dist_new.reshape(*update_shape, -1, 2)
+				else:
+					expert_action_dist[0, :reanalyze_batch_size] = expert_action_dist_new
 				
-				# Update buffer for future samples
-				buffer.update_expert_data(indices_reanalyze, expert_action_dist_new, expert_value_new)
+				# Update buffer (uses flattened indices for both modes)
+				buffer.update_expert_data(indices_flat, expert_action_dist_new, expert_value_new)
 				
-				# Store logging info for after _update (when we have the info dict)
+				# Store logging info
 				reanalyze_log_pending = {
-					'reanalyze_info': reanalyze_info,
+					'reanalyze_info': reanalyze_info if not slice_mode else None,
 					'old_expert_dist': old_expert_dist,
 					'new_expert_dist': expert_action_dist_new,
 				}

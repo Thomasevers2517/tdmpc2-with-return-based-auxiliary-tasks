@@ -258,6 +258,8 @@ reanalyze_num_elites: null          # Number of elites for reanalyze (null = inh
 reanalyze_num_pi_trajs: null        # Policy-seeded trajectories during reanalyze (null = inherit)
 reanalyze_temperature: null         # Temperature for elite selection during reanalyze (null = inherit)
 reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral, >0 = optimistic, <0 = pessimistic) - does NOT inherit
+reanalyze_use_chosen_action: false  # If true, use chosen action as expert mean (BMPC style); if false, use planner distribution mean
+reanalyze_slice_mode: false         # If true, reanalyze all timesteps in fewer slices (BMPC style); if false, sample independent t=0 obs
 policy_optimization_method: distillation    # 'svg' (backprop through model) | 'distillation' (KL to expert) | 'both'
 optimistic_policy_optimization_method: same  # 'same' = same as policy_optimization_method | 'svg' | 'distillation' | 'both'
 policy_svg_distill_ratio: 0.5               # When method='both': ratio of distillation loss. 0=pure SVG, 1=pure distillation
