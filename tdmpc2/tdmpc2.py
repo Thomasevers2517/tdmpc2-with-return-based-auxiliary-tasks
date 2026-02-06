@@ -1478,8 +1478,7 @@ class TDMPC2(torch.nn.Module):
 			- B_expanded = S * B_orig * num_rollouts
 
 			Note: Due to num_rollouts, z_seq[0] contains each starting state duplicated
-			num_rollouts times. When using for policy training (actor_source='ac'),
-			consider skipping t=0 to avoid training on duplicated initial states.
+			num_rollouts times. The z[0] states are identical within each N-group.
 		"""
 		S, B_orig, L = start_z.shape  # start_z: float32[S, B_orig, L]
 		A = self.cfg.action_dim
@@ -1576,86 +1575,131 @@ class TDMPC2(torch.nn.Module):
 
 
 
-	def calculate_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None):
-		"""Compute primary critic loss on imagined latent sequences with proper rho weighting.
+	def calculate_value_loss(self, z_true, z_rollout, full_detach, update_world_model, task=None):
+		"""Compute primary critic loss with proper rho weighting.
 		
-		With V-function, we predict V(z) for each state in the sequence and
-		train against TD targets r + γ * V(next_z). Value predictions use head 0
-		only (all heads are identical before dynamics rollout). TD targets use all
-		heads for next-state diversity, then reduce over H.
+		This function handles both:
+		1. V predictions: which states the V network learns to predict values for (critic_source)
+		2. TD targets: which states are used as starting point for imagination (critic_target_source)
 		
-		Rho weighting is applied on the S dimension (replay buffer time steps that
-		were used as starting states for imagination), NOT on T_imag (imagination steps).
-
+		Internally calls imagined_rollout to create TD targets via 1-step imagination.
+		
 		Args:
-			z_seq (Tensor[T_imag+1, H, S, B, N, L]): Latent sequences where:
-				- T_imag = imagination horizon (typically 1)
-				- H = num dynamics heads
-				- S = replay buffer horizon + 1 (starting states from different replay steps)
-				- B = batch size
-				- N = num_rollouts per starting state
-				- L = latent dimension
-			actions (Tensor[T_imag, 1, S, B, N, A]): Actions (shared across heads).
-			rewards (Tensor[T_imag, R, H, S, B, N, 1]): Rewards with R reward heads, H dynamics heads.
-			terminated (Tensor[T_imag, H, S, B, N, 1]): Termination signals per head.
-			full_detach (bool): Whether to detach z_seq from graph.
+			z_true (Tensor[S, B, L]): True encoded states from encoder.
+			z_rollout (Tensor[S, B, L] | None): WM rollout states (None if WM not updated).
+			full_detach (bool): Whether to detach latents from graph.
+			update_world_model (bool): Whether WM is being updated (affects gradient flow).
 			task: Task index for multitask.
 
 		Returns:
-			Tuple[Tensor, TensorDict]: Scalar loss and info dict.
+			Tuple[Tensor, TensorDict, dict]: (loss, info, imagined_data) where imagined_data
+				contains z_seq, rewards, terminated for potential reuse by aux losses.
 		"""
-		# z_seq: [T_imag+1, H, S, B, N, L]
-		T_imag_plus_1, H, S, B, N, L = z_seq.shape
-		T_imag = T_imag_plus_1 - 1
+		S, B, L = z_true.shape
+		device = z_true.device
+		dtype = z_true.dtype
 		K = self.cfg.num_bins
-		device = z_seq.device
-		dtype = z_seq.dtype
+		N = int(self.cfg.num_rollouts)
+		R = int(self.cfg.num_reward_heads)
+		T_imag = int(self.cfg.imagination_horizon)
 
-		# Rho weighting on S (replay buffer time steps), NOT T_imag
+		# Rho weighting on S (replay buffer time steps)
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))  # float32[S]
 		if self.cfg.normalize_rho_weights:
 			rho_pows = rho_pows / rho_pows.sum()
 
-		z_seq = z_seq.detach() if full_detach else z_seq  # float32[T_imag+1, H, S, B, N, L]
-		rewards = rewards.detach()  # float32[T_imag, R, H, S, B, N, 1]
-		terminated = terminated.detach()  # float32[T_imag, H, S, B, N, 1]
+		# -------------------------------------------------------------------------
+		# 1. Determine which states V learns to predict values for (critic_source)
+		# -------------------------------------------------------------------------
+		critic_source = self.cfg.critic_source
+		if critic_source == 'replay_rollout':
+			if z_rollout is None:
+				raise ValueError("critic_source='replay_rollout' requires z_rollout (update_world_model=True)")
+			z_for_v = z_rollout.detach() if full_detach else z_rollout  # float32[S, B, L]
+		elif critic_source == 'replay_true':
+			z_for_v = z_true.detach() if full_detach else z_true  # float32[S, B, L]
+		else:
+			raise ValueError(f"critic_source must be 'replay_rollout' or 'replay_true', got '{critic_source}'")
 
-		# Merge B*N for V prediction, keep S separate for rho weighting
+		# -------------------------------------------------------------------------
+		# 2. Determine starting states for TD target imagination (critic_target_source)
+		# -------------------------------------------------------------------------
+		td_source = self.cfg.critic_target_source
+		# When z_rollout is None (WM not updated), force replay_true
+		if z_rollout is None:
+			td_source = 'replay_true'
+		
+		if td_source == 'replay_true':
+			# Gradient flow: keep attached if WM is updated, else detach
+			start_z = z_true.detach() if not update_world_model else z_true
+		elif td_source == 'replay_rollout':
+			# z_rollout[0] = encoder output, z_rollout[1:] = dynamics predictions
+			# Keep z_rollout[0] attached for encoder gradients, detach dynamics
+			if not update_world_model:
+				start_z = z_rollout.detach()
+			else:
+				start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
+		else:
+			raise ValueError(f"critic_target_source must be 'replay_true' or 'replay_rollout', got '{td_source}'")
+
+		# -------------------------------------------------------------------------
+		# 3. Imagination rollout for TD targets
+		# -------------------------------------------------------------------------
+		imagined = self.imagined_rollout(
+			start_z,
+			task=task,
+			rollout_len=T_imag,
+			use_target_policy=self.cfg.td_target_use_ema_policy,
+		)
+		
+		# Get dimensions from imagined output
+		H = imagined['z_seq'].shape[1]  # num dynamics heads (may be 1)
+		
+		# Reshape outputs: [*, S*B*N, *] -> [*, S, B, N, *]
+		z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B, N, L)  # float32[T+1, H, S, B, N, L]
+		rewards = imagined['rewards'].view(T_imag, R, H, S, B, N, 1)  # float32[T, R, H, S, B, N, 1]
+		terminated = imagined['terminated'].view(T_imag, H, S, B, N, 1)  # float32[T, H, S, B, N, 1]
+		
+		# Detach imagined trajectory if needed
+		if full_detach:
+			z_seq = z_seq.detach()
+		rewards = rewards.detach()
+		terminated = terminated.detach()
+
+		# -------------------------------------------------------------------------
+		# 4. V predictions on critic_source states
+		# -------------------------------------------------------------------------
 		BN = B * N
-
-		# V-function: use head 0 only for value predictions (all heads identical at t=0)
-		# z_seq[:-1, 0]: [T_imag, S, B, N, L] -> merge to [T_imag, S, BN, L]
-		z_for_v = z_seq[:-1, 0]  # float32[T_imag, S, B, N, L]
-		z_for_v_merged = z_for_v.view(T_imag, S, BN, L)  # float32[T_imag, S, BN, L]
-		z_for_v_flat = z_for_v_merged.view(T_imag * S * BN, L)  # flatten for V call
+		# z_for_v: [S, B, L] -> expand to [T_imag, S, B, N, L] for compatibility with TD structure
+		z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B, N, L)  # float32[T_imag, S, B, N, L]
+		z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN, L)  # float32[T_imag, S, BN, L]
+		z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN, L)  # flatten for V call
 		
 		vs_flat = self.model.V(z_for_v_flat, task, return_type='all')  # float32[Ve, T_imag*S*BN, K]
 		Ve = vs_flat.shape[0]
 		vs = vs_flat.view(Ve, T_imag, S, BN, K)  # float32[Ve, T_imag, S, BN, K]
 
+		# -------------------------------------------------------------------------
+		# 5. TD targets from imagined next states
+		# -------------------------------------------------------------------------
 		with maybe_range('Value/td_target', self.cfg):
 			with torch.no_grad():
-				# Merge S*B*N into batch for _td_target, then split back
-				# _td_target expects: next_z [T, H, Batch, L], rewards [T, R, H, Batch, 1], etc.
 				next_z = z_seq[1:]  # [T_imag, H, S, B, N, L]
 				next_z_flat = next_z.view(T_imag, H, S * BN, L)  # [T_imag, H, S*BN, L]
-				rewards_flat = rewards.view(T_imag, -1, H, S * BN, 1)  # [T_imag, R, H, S*BN, 1]
-				R = rewards_flat.shape[1]
+				rewards_flat = rewards.view(T_imag, R, H, S * BN, 1)  # [T_imag, R, H, S*BN, 1]
 				terminated_flat = terminated.view(T_imag, H, S * BN, 1)  # [T_imag, H, S*BN, 1]
 				
 				td_targets_flat, td_mean_flat, td_std_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
-				# td_targets_flat: [Ve, T_imag, S*BN, 1] - reduced targets (mean + coef×std)
-				# td_mean_flat: [T_imag, S*BN, 1] - mean across all Ve×R×H combinations
-				# td_std_flat: [T_imag, S*BN, 1] - std across all Ve×R×H combinations
 				
 				# Split back: [Ve, T_imag, S*BN, 1] -> [Ve, T_imag, S, BN, 1]
 				td_targets = td_targets_flat.view(Ve, T_imag, S, BN, 1)
 				td_mean = td_mean_flat.view(T_imag, S, BN, 1)  # float32[T_imag, S, BN, 1]
 				td_std = td_std_flat.view(T_imag, S, BN, 1)    # float32[T_imag, S, BN, 1]
 
+		# -------------------------------------------------------------------------
+		# 6. Compute cross-entropy loss
+		# -------------------------------------------------------------------------
 		with maybe_range('Value/ce', self.cfg):
-			# TD targets: [Ve, T_imag, S, BN, 1], vs: [Ve, T_imag, S, BN, K]
-			# Flatten for soft_ce
 			vs_flat_ce = vs.contiguous().view(Ve * T_imag * S * BN, K)
 			td_flat_ce = td_targets.contiguous().view(Ve * T_imag * S * BN, 1)
 			
@@ -1669,17 +1713,18 @@ class TDMPC2(torch.nn.Module):
 		weighted = val_ce_per_s * rho_pows  # float32[S]
 		loss = weighted.mean()
 
+		# -------------------------------------------------------------------------
+		# 7. Logging
+		# -------------------------------------------------------------------------
 		info = TensorDict({
 			'value_loss': loss
 		}, device=device, non_blocking=True)
 
-		# Log per replay step (S dimension)
 		for s in range(S):
 			info.update({f'value_loss/replay_step{s}': val_ce_per_s[s]}, non_blocking=True)
 		
 		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN, 1]
 		
-		# Log td_target statistics (mean and std across all Ve×R×H combinations)
 		info.update({
 			'td_target_mean': td_mean.mean(),
 			'td_target_std': td_std.mean(),
@@ -1697,14 +1742,11 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
 			
-			# Std across num_rollouts (N dimension) - diagnostic for rollout diversity
-			# Need to reshape back to include N: [Ve, T_imag, S, B, N, 1]
 			td_targets_with_n = td_targets.view(Ve, T_imag, S, B, N, 1)
-			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()  # std across N (different actions)
+			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()
 			info.update({'td_target_std_across_rollouts': td_std_across_rollouts}, non_blocking=True)
    
-		# Value error per replay step (S dimension)
-		value_error = value_pred - td_targets  # float32[Ve, T_imag, S, BN, 1]
+		value_error = value_pred - td_targets
 		for s in range(S):
 			info.update({
 				f'value_error_abs_mean/replay_step{s}': value_error[:, :, s].abs().mean(),
@@ -1712,7 +1754,13 @@ class TDMPC2(torch.nn.Module):
 				f'value_error_max/replay_step{s}': value_error[:, :, s].abs().max(),
 			}, non_blocking=True)
 
-		return loss, info
+		# Return imagined data for potential reuse by calculate_aux_value_loss
+		imagined_data = {
+			'z_seq': z_seq,  # float32[T+1, H, S, B, N, L]
+			'rewards': rewards,  # float32[T, R, H, S, B, N, 1]
+			'terminated': terminated,  # float32[T, H, S, B, N, 1]
+		}
+		return loss, info, imagined_data
 
 	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None):
 		"""Compute auxiliary multi-gamma critic losses with proper rho weighting on S dimension.
@@ -1892,94 +1940,21 @@ class TDMPC2(torch.nn.Module):
 			lat_all = None  # No multi-head rollout available
 
 		# Only compute value losses if update_value is True
-		# Always use imagination for value/aux losses (ac_source='imagine' hardcoded)
 		if update_value:
-			# Imagination starts from encoded/rollout latents and rolls forward with policy.
-			# imagine_initial_source controls starting point:
-			#   'replay_true': start from true encoded latents z_true
-			#   'replay_rollout': start from dynamics rollout z_rollout (head 0)
-			#
-			# TODO: To exactly match BMPC JAX, there should be TWO separate configs:
-			#   1. Which states V learns on (BMPC: rollout latents from WM training)
-			#   2. Which states TD targets start from (BMPC: true encoded latents)
-			# In BMPC JAX: V_logits = model.V(latent_zs), td_targets = td_target(encoder_zs)
-			# Currently, our code uses the same states for both V and TD (just offset by 1 step
-			# within the imagined trajectory). This is a design simplification that differs from
-			# BMPC JAX, where if dynamics is wrong, the TD target doesn't match the state it's
-			# used to train, but imagination always starts from "clean" true encodings.
-			# 
-			# Gradient flow logic:
-			#   - If update_world_model=False: fully detach start_z (no encoder gradients from value)
-			#   - If update_world_model=True and replay_true: keep attached (encoder gradients flow)
-			#   - If update_world_model=True and replay_rollout: partial detach (z[0] attached, z[1:] detached)
-			imagine_source = getattr(self.cfg, 'imagine_initial_source', 'replay_true')
-			# When z_rollout is None (WM not updated), force replay_true
-			if z_rollout is None:
-				imagine_source = 'replay_true'
-			if imagine_source == 'replay_true':
-				# When WM not updated: no WM gradients to encoder, so also block value gradients.
-				start_z = z_true.detach() if not update_world_model else z_true
-			elif imagine_source == 'replay_rollout':
-				# z_rollout[0] = encoder output (same as z_true[0]), z_rollout[1:] = dynamics predictions.
-				# When WM updated: keep z_rollout[0] attached for encoder gradients, detach z_rollout[1:]
-				# to block gradients to dynamics (already trained via consistency loss).
-				# When WM not updated: fully detach (no encoder gradients from value).
-				if not update_world_model:
-					start_z = z_rollout.detach()
-				else:
-					start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
-			else:
-				raise ValueError(f"imagine_initial_source must be 'replay_true' or 'replay_rollout', got '{imagine_source}'")
-			
-			# start_z: [S, B, L] where S = replay buffer horizon + 1
-			S, B_orig, L = start_z.shape
-			A = self.cfg.action_dim
-			N = int(self.cfg.num_rollouts)
-			R = int(self.cfg.num_reward_heads)
-			T_imag = int(self.cfg.imagination_horizon)
-			
-			# imagined_rollout flattens S*B into batch, uses N rollouts per state
-			# Returns tensors with B_expanded = S * B_orig * N
-			# H depends on td_target_use_all_dynamics_heads: 1 if False, planner_num_dynamics_heads if True
-			imagined = self.imagined_rollout(
-				start_z,
-				task=task,
-				rollout_len=T_imag,
-				use_target_policy=self.cfg.td_target_use_ema_policy,
-			)
-			
-			# Get actual H from returned tensor (may be 1 if td_target_use_all_dynamics_heads=False)
-			H = imagined['z_seq'].shape[1]
-			
-			# Reshape outputs from [*, B_expanded, *] to [*, S, B, N, *]
-			# z_seq: [T_imag+1, H, S*B*N, L] -> [T_imag+1, H, S, B, N, L]
-			z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B_orig, N, L)
-			# rewards: [T_imag, R, H, S*B*N, 1] -> [T_imag, R, H, S, B, N, 1]
-			rewards = imagined['rewards'].view(T_imag, R, H, S, B_orig, N, 1)
-			# terminated: [T_imag, H, S*B*N, 1] -> [T_imag, H, S, B, N, 1]
-			terminated_imag = imagined['terminated'].view(T_imag, H, S, B_orig, N, 1)
-			# actions: [T_imag, 1, S*B*N, A] -> [T_imag, 1, S, B, N, A]
-			actions = imagined['actions'].view(T_imag, 1, S, B_orig, N, A)
-			
 			full_detach = (not update_value) or self.cfg.detach_imagine_value
 			
-			value_loss, value_info = self.calculate_value_loss(
-				z_seq,
-				actions,
-				rewards,
-				terminated_imag,
-				full_detach,
-				task=task,
+			value_loss, value_info, imagined_data = self.calculate_value_loss(
+				z_true, z_rollout, full_detach, update_world_model, task
 			)
 
 			aux_loss = torch.zeros((), device=device)
 			aux_info = TensorDict({}, device=device)
 			if self.cfg.multi_gamma_loss_weight != 0 and self.model._num_aux_gamma > 0:
 				aux_loss, aux_info = self.calculate_aux_value_loss(
-					z_seq,
-					actions,
-					rewards,
-					terminated_imag,
+					imagined_data['z_seq'],
+					None,  # actions not used in aux loss
+					imagined_data['rewards'],
+					imagined_data['terminated'],
 					full_detach,
 					task=task,
 				)
@@ -1996,7 +1971,6 @@ class TDMPC2(torch.nn.Module):
 		info.update(aux_info, non_blocking=True)
   
 		critic_weighted = self.cfg.value_coef * value_loss
-		# Always apply imagine_value_loss_coef_mult since ac_source is always 'imagine'
 		critic_weighted = critic_weighted * self.cfg.imagine_value_loss_coef_mult
 		aux_weighted = self.cfg.multi_gamma_loss_weight * aux_loss
 		aux_weighted = aux_weighted * self.cfg.imagine_value_loss_coef_mult

@@ -163,25 +163,13 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# Note: std estimation is now adaptive - uses unbiased=True when n>=2, biased otherwise
 
 	# ----------------------------------------------------------------------
-	# Actor-critic source constraints (only 'imagine' mode supported)
+	# Imagination horizon constraint (only horizon=1 supported)
 	# ----------------------------------------------------------------------
 	# Rationale: The value loss optimization picks head 0 for V predictions
 	# (z_seq[:-1, 0]) because all dynamics heads are identical before the
 	# dynamics rollout. This assumption only holds when imagination_horizon=1.
-	# With replay_rollout or longer horizons, dynamics heads diverge after
-	# the first step, so heads would no longer be identical at t > 0.
-	if cfg.ac_source != 'imagine':
-		raise ValueError(
-			f"ac_source='{cfg.ac_source}' is not supported. Only ac_source='imagine' is supported. "
-			"The value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
-			"which only holds when imagination_horizon=1 (imagine mode)."
-		)
-	if cfg.aux_value_source != 'imagine':
-		raise ValueError(
-			f"aux_value_source='{cfg.aux_value_source}' is not supported. Only aux_value_source='imagine' is supported. "
-			"The auxiliary value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
-			"which only holds when imagination_horizon=1 (imagine mode)."
-		)
+	# With longer horizons, dynamics heads diverge after the first step,
+	# so heads would no longer be identical at t > 0.
 	if cfg.imagination_horizon != 1:
 		raise ValueError(
 			f"imagination_horizon={cfg.imagination_horizon} is not supported. Only imagination_horizon=1 is supported. "
