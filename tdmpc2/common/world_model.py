@@ -248,7 +248,31 @@ class WorldModel(nn.Module):
 			for h, sz in zip(self._detach_aux_separate_Vs, self.aux_separate_sizes):
 				vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
 				offset += sz
-   
+
+		# Target policy for trust region regularization OR for TD target imagination
+		# Create if trust region is enabled (coef > 0) or EMA policy is used for TD targets
+		need_target_pi = (
+			getattr(self.cfg, 'policy_trust_region_coef', 0.0) > 0 or
+			getattr(self.cfg, 'td_target_use_ema_policy', False)
+		)
+		if need_target_pi:
+			# Create frozen target clone (only once)
+			if not hasattr(self, '_target_pi') or self._target_pi is None:
+				self._target_pi = deepcopy(self._pi)
+				for p in self._target_pi.parameters():
+					p.requires_grad_(False)
+			# Optimistic policy target (if dual policy enabled)
+			if self.cfg.dual_policy_enabled and self._pi_optimistic is not None:
+				if not hasattr(self, '_target_pi_optimistic') or self._target_pi_optimistic is None:
+					self._target_pi_optimistic = deepcopy(self._pi_optimistic)
+					for p in self._target_pi_optimistic.parameters():
+						p.requires_grad_(False)
+			else:
+				self._target_pi_optimistic = None
+		else:
+			self._target_pi = None
+			self._target_pi_optimistic = None
+
 
 	def __repr__(self):
 		repr = 'TD-MPC2 World Model\n'
@@ -339,6 +363,16 @@ class WorldModel(nn.Module):
 			online_vec = parameters_to_vector(source_params).detach()
 			target_vec = parameters_to_vector(target_params).detach()
 			return torch.max(torch.abs(online_vec - target_vec))
+
+	def soft_update_target_pi(self):
+		"""Soft-update target policy networks for trust region regularization."""
+		if self._target_pi is None:
+			return
+		# Update primary policy target (policy_ema_tau resolved at config parse time)
+		self._soft_update_module(self._target_pi, self._pi, self.cfg.policy_ema_tau)
+		# Update optimistic policy target (if dual policy)
+		if self._target_pi_optimistic is not None:
+			self._soft_update_module(self._target_pi_optimistic, self._pi_optimistic, self.cfg.policy_ema_tau)
 				
 	def task_emb(self, x, task):
 		"""
@@ -454,7 +488,7 @@ class WorldModel(nn.Module):
 		return torch.sigmoid(logits)
 		
 
-	def pi(self, z, task, search_noise=False, optimistic=False):
+	def pi(self, z, task, search_noise=False, optimistic=False, target=False):
 		"""
 		Samples an action from the policy prior.
 		The policy prior is a Gaussian distribution with
@@ -465,12 +499,23 @@ class WorldModel(nn.Module):
 			task: Task identifier for multitask setup.
 			search_noise: Unused (legacy parameter).
 			optimistic: If True and dual_policy_enabled, use optimistic policy.
+			target: If True, use EMA target policy (for trust region regularization).
 		"""
 		with maybe_range('WM/pi', self.cfg):
-			if optimistic and self.cfg.dual_policy_enabled:
-				module = self._pi_optimistic
+			# Select module based on optimistic and target flags
+			if target:
+				if optimistic and self.cfg.dual_policy_enabled:
+					module = self._target_pi_optimistic
+				else:
+					module = self._target_pi
+				# Fall back to online if target not available
+				if module is None:
+					module = self._pi_optimistic if (optimistic and self.cfg.dual_policy_enabled) else self._pi
 			else:
-				module = self._pi
+				if optimistic and self.cfg.dual_policy_enabled:
+					module = self._pi_optimistic
+				else:
+					module = self._pi
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 			with self._autocast_context():
@@ -636,7 +681,7 @@ class WorldModel(nn.Module):
 			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False):
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False, use_target_policy: bool = False):
 		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
 
 		Args:
@@ -651,6 +696,8 @@ class WorldModel(nn.Module):
 				when `use_policy=True`. Ignored when `use_policy=False`.
 			use_optimistic_policy (bool): If True and dual_policy_enabled, use optimistic policy
 				for action sampling. Ignored when `use_policy=False`.
+			use_target_policy (bool): If True, use EMA target policy instead of online policy.
+				Ignored when `use_policy=False`.
 
 		Returns:
 			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
@@ -715,7 +762,7 @@ class WorldModel(nn.Module):
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
 							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy)
+							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy, target=use_target_policy)
 							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)

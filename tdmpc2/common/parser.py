@@ -264,4 +264,11 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			old_val = cfg[param]
 			cfg[param] = resolve_std_coef(old_val, default_mag)
 
+	# ----------------------------------------------------------------------
+	# policy_ema_tau inheritance: if null, inherit from tau
+	# ----------------------------------------------------------------------
+	policy_ema_tau_val = cfg.get('policy_ema_tau')
+	if policy_ema_tau_val is None or policy_ema_tau_val == 'None':
+		cfg.policy_ema_tau = cfg.tau
+
 	return cfg_to_dataclass(cfg)

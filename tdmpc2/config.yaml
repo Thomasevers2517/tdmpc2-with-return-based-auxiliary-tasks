@@ -214,6 +214,13 @@ pi_lr_scale: 1  # Policy LR = lr * pi_lr_scale. Lower than critic to stabilize t
 ensemble_lr_scaling: true  # if true, scale head LRs by ensemble size to compensate for mean-reduced gradients
 grad_clip_norm: 20
 tau: 0.003
+
+# Policy trust region regularization via EMA policy
+# KL(EMA_policy || current_policy) is added to policy loss to prevent rapid updates
+policy_trust_region_coef: 0.0     # Coefficient for trust region KL loss (0 = disabled)
+policy_ema_tau: null              # EMA tau for policy (null = inherit from tau)
+td_target_use_ema_policy: false   # Use EMA policy (instead of online) to generate imagined trajectories for TD targets
+
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
@@ -258,7 +265,7 @@ reanalyze_num_elites: null          # Number of elites for reanalyze (null = inh
 reanalyze_num_pi_trajs: null        # Policy-seeded trajectories during reanalyze (null = inherit)
 reanalyze_temperature: null         # Temperature for elite selection during reanalyze (null = inherit)
 reanalyze_value_std_coef: 0.0       # Value std coef for reanalyze (0 = neutral, >0 = optimistic, <0 = pessimistic) - does NOT inherit
-reanalyze_use_chosen_action: false  # If true, use chosen action as expert mean (BMPC style); if false, use planner distribution mean
+reanalyze_use_chosen_action: true   # If true, use chosen action as expert mean (BMPC style); if false, use planner distribution mean
 reanalyze_slice_mode: false         # If true, reanalyze all timesteps in fewer slices (BMPC style); if false, sample independent t=0 obs
 policy_optimization_method: distillation    # 'svg' (backprop through model) | 'distillation' (KL to expert) | 'both'
 optimistic_policy_optimization_method: same  # 'same' = same as policy_optimization_method | 'svg' | 'distillation' | 'both'

@@ -179,8 +179,10 @@ class TDMPC2(torch.nn.Module):
 		# Separate running scales for different policy loss types:
 		# - q_scale: for SVG (calc_pi_losses), min_scale=1.0 (legacy behavior)
 		# - kl_scale: for KL distillation (calc_pi_distillation_losses), min_scale from config
+		# - trust_region_scale: for trust region KL to EMA policy
 		self.q_scale = RunningScale(cfg, min_scale=1.0)
 		self.kl_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
+		self.trust_region_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
 		# Heuristic for large action spaces: add 2 iterations if action_dim >= threshold
 		extra_iter_thresh = int(cfg.extra_iter_action_dim_threshold)
 		high_dim_adjustment = 2 * int(extra_iter_thresh > 0 and cfg.action_dim >= extra_iter_thresh)
@@ -798,6 +800,62 @@ class TDMPC2(torch.nn.Module):
 		
 		return pi_loss, info_out
 
+	def calc_trust_region_kl_loss(self, z, task, optimistic=False):
+		"""Compute trust region KL loss between current policy and EMA target policy.
+		
+		Regularizes policy updates by penalizing divergence from the EMA policy.
+		KL(EMA_policy || current_policy) encourages the current policy to stay
+		close to its recent history.
+		
+		Args:
+			z (Tensor[T+1, B, L]): Latent states. Uses z[:-1] for policy.
+			task: Task identifier for multitask setup.
+			optimistic (bool): If True, use optimistic policy. If False, also updates scale.
+		
+		Returns:
+			Tuple[Tensor, TensorDict]: Scaled KL loss (scalar) and info dict.
+				Returns (0, empty_info) if trust region is disabled.
+		"""
+		# Check if trust region is enabled
+		target_pi = self.model._target_pi_optimistic if optimistic else self.model._target_pi
+		if target_pi is None:
+			return torch.tensor(0.0, device=self.device), TensorDict({}, device=self.device)
+		
+		# Use z[:-1] for policy (same convention as distillation)
+		z_for_pi = z[:-1]  # float32[T, B, L]
+		
+		# Get current policy distribution
+		_, curr_info = self.model.pi(z_for_pi, task, optimistic=optimistic, target=False)
+		curr_mean = curr_info["mean"]          # float32[T, B, A]
+		curr_std = curr_info["log_std"].exp()  # float32[T, B, A]
+		
+		# Get EMA target policy distribution
+		_, ema_info = self.model.pi(z_for_pi, task, optimistic=optimistic, target=True)
+		ema_mean = ema_info["mean"]          # float32[T, B, A]
+		ema_std = ema_info["log_std"].exp()  # float32[T, B, A]
+		
+		# KL(EMA || current) - penalize deviation from EMA
+		tr_kl_per_dim = math.kl_div_gaussian(ema_mean, ema_std, curr_mean, curr_std)  # float32[T, B, A]
+		tr_kl_per_sample = tr_kl_per_dim.sum(dim=-1)  # float32[T, B] - sum over action dims
+		tr_kl_loss = tr_kl_per_sample.mean()  # scalar
+		
+		# Update scale with pessimistic policy only; both use same scale
+		if not optimistic:
+			self.trust_region_scale.update(tr_kl_per_sample.flatten().unsqueeze(-1))
+		
+		# Scale the loss
+		tr_kl_scaled = tr_kl_loss / self.trust_region_scale.value
+		
+		prefix = 'opti_tr' if optimistic else 'tr'
+		info = TensorDict({
+			f'{prefix}_kl_loss': tr_kl_loss,
+			f'{prefix}_kl_per_dim': tr_kl_per_dim.mean(),
+			f'{prefix}_kl_scaled': tr_kl_scaled,
+			f'{prefix}_scale': self.trust_region_scale.value,
+		}, device=self.device)
+		
+		return tr_kl_scaled, info
+
 	def update_pi(self, zs, task, expert_action_dist=None):
 		"""
 		Update policy using a sequence of latent states.
@@ -886,6 +944,21 @@ class TDMPC2(torch.nn.Module):
 			
 			# Sum losses with equal weight
 			pi_loss = pi_loss + opti_pi_loss
+		
+		# Trust region regularization: KL(EMA_policy || current_policy)
+		# Prevents rapid policy changes by penalizing divergence from EMA
+		trust_region_coef = float(self.cfg.policy_trust_region_coef)
+		if trust_region_coef > 0:
+			# Pessimistic policy trust region (also updates scale)
+			tr_kl_scaled, tr_info = self.calc_trust_region_kl_loss(zs, task, optimistic=False)
+			pi_loss = pi_loss + trust_region_coef * tr_kl_scaled
+			info.update(tr_info)
+			
+			# Optimistic policy trust region (uses same scale, no update)
+			if self.cfg.dual_policy_enabled:
+				opti_tr_kl_scaled, opti_tr_info = self.calc_trust_region_kl_loss(zs, task, optimistic=True)
+				pi_loss = pi_loss + trust_region_coef * opti_tr_kl_scaled
+				info.update(opti_tr_info)
 		
 		return pi_loss, info
 
@@ -1362,7 +1435,7 @@ class TDMPC2(torch.nn.Module):
 
 	# rollout_dynamics removed; world_model.rollout_latents handles vectorized rollouts
 
-	def imagined_rollout(self, start_z, task=None, rollout_len=None):
+	def imagined_rollout(self, start_z, task=None, rollout_len=None, use_target_policy=False):
 		"""Roll out imagined trajectories from latent start states using world_model.rollout_latents.
 
 		Uses all dynamics heads (head_mode='all') for multi-head pessimism.
@@ -1375,6 +1448,7 @@ class TDMPC2(torch.nn.Module):
 				separate starting point for imagination.
 			task: Optional task index for multitask.
 			rollout_len (int): Number of imagination steps (must be 1 when H > 1).
+			use_target_policy (bool): If True, use EMA target policy instead of online policy.
 
 		Returns:
 			Dict with tensors:
@@ -1426,6 +1500,7 @@ class TDMPC2(torch.nn.Module):
 				num_rollouts=n_rollouts,
 				head_mode=head_mode,  # 'all' or 'random' based on config
 				task=task,
+				use_target_policy=use_target_policy,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
 		# H equals planner_num_dynamics_heads when head_mode='all'
@@ -1839,7 +1914,12 @@ class TDMPC2(torch.nn.Module):
 			# imagined_rollout flattens S*B into batch, uses N rollouts per state
 			# Returns tensors with B_expanded = S * B_orig * N
 			# H depends on td_target_use_all_dynamics_heads: 1 if False, planner_num_dynamics_heads if True
-			imagined = self.imagined_rollout(start_z, task=task, rollout_len=T_imag)
+			imagined = self.imagined_rollout(
+				start_z,
+				task=task,
+				rollout_len=T_imag,
+				use_target_policy=self.cfg.td_target_use_ema_policy,
+			)
 			
 			# Get actual H from returned tensor (may be 1 if td_target_use_all_dynamics_heads=False)
 			H = imagined['z_seq'].shape[1]
@@ -1983,6 +2063,8 @@ class TDMPC2(torch.nn.Module):
 			# Soft updates: only update targets when corresponding component is updated
 			if update_value:
 				self.model.soft_update_target_V()
+			if update_pi:
+				self.model.soft_update_target_pi()
 
 			if self._step % self.cfg.log_freq == 0 or self.log_detailed:
 				info = self.update_end(info.detach(), grad_norm.detach(), pi_grad_norm.detach(), total_loss.detach(), pi_info.detach())
