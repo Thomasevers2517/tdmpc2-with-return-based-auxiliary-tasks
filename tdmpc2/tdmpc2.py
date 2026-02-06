@@ -358,6 +358,10 @@ class TDMPC2(torch.nn.Module):
 
 				# Planner already applies any training noise and clamps
 				# Squeeze batch dim for single-sample acting
+				# Attach mean/std to planner_info for initial_expert_from_behavior
+				if planner_info is not None:
+					planner_info.action_mean = mean.squeeze(0)  # [T, A]
+					planner_info.action_std = std.squeeze(0)    # [T, A]
 				return chosen_action.squeeze(0), planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
@@ -648,6 +652,8 @@ class TDMPC2(torch.nn.Module):
 			
 			# Temporal weighting
 			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+			if self.cfg.normalize_rho_weights:
+				rho_pows = rho_pows / rho_pows.sum()
 			
 			# Entropy from policy (always use scaled_entropy with configurable action_dim power)
 			entropy_term = info["scaled_entropy"]  # float32[T, B*N, 1]
@@ -748,6 +754,10 @@ class TDMPC2(torch.nn.Module):
 		expert_mean = expert_action_dist[..., 0]  # float32[T, B, A]
 		expert_std = expert_action_dist[..., 1]   # float32[T, B, A]
 		
+		# Apply BMPC-style expert std scaling before clipping
+		expert_std = expert_std * self.cfg.expert_std_scale
+		expert_std = expert_std.clamp(min=self.cfg.min_std, max=self.cfg.max_std)
+		
 		# Validate expert values are reasonable
 		assert not torch.isnan(expert_mean).any(), "expert_mean contains NaN"
 		assert not torch.isnan(expert_std).any(), "expert_std contains NaN"
@@ -775,6 +785,8 @@ class TDMPC2(torch.nn.Module):
 		
 		# Temporal weighting with rho (exponential decay)
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+		if self.cfg.normalize_rho_weights:
+			rho_pows = rho_pows / rho_pows.sum()
 		
 		# Final loss: minimize (KL - entropy_coeff * entropy), weighted by rho
 		# Note: KL is already a "loss" (minimize), entropy is a bonus (maximize -> subtract)
@@ -1197,6 +1209,8 @@ class TDMPC2(torch.nn.Module):
 		dtype = z_true.dtype
 
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=device, dtype=dtype))  # float32[T]
+		if self.cfg.normalize_rho_weights:
+			rho_pows = rho_pows / rho_pows.sum()
 
 		consistency_losses = torch.zeros(T, device=device, dtype=dtype)
 		encoder_consistency_losses = torch.zeros(T, device=device, dtype=dtype)
@@ -1599,6 +1613,8 @@ class TDMPC2(torch.nn.Module):
 
 		# Rho weighting on S (replay buffer time steps), NOT T_imag
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))  # float32[S]
+		if self.cfg.normalize_rho_weights:
+			rho_pows = rho_pows / rho_pows.sum()
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # float32[T_imag+1, H, S, B, N, L]
 		rewards = rewards.detach()  # float32[T_imag, R, H, S, B, N, 1]
@@ -1736,6 +1752,8 @@ class TDMPC2(torch.nn.Module):
 
 		# Rho weighting on S (replay buffer time steps), NOT T_imag
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))  # float32[S]
+		if self.cfg.normalize_rho_weights:
+			rho_pows = rho_pows / rho_pows.sum()
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # float32[T_imag+1, H, S, B, N, L]
 		rewards = rewards.detach()  # float32[T_imag, R, H, S, B, N, 1]
@@ -1880,6 +1898,15 @@ class TDMPC2(torch.nn.Module):
 			# imagine_initial_source controls starting point:
 			#   'replay_true': start from true encoded latents z_true
 			#   'replay_rollout': start from dynamics rollout z_rollout (head 0)
+			#
+			# TODO: To exactly match BMPC JAX, there should be TWO separate configs:
+			#   1. Which states V learns on (BMPC: rollout latents from WM training)
+			#   2. Which states TD targets start from (BMPC: true encoded latents)
+			# In BMPC JAX: V_logits = model.V(latent_zs), td_targets = td_target(encoder_zs)
+			# Currently, our code uses the same states for both V and TD (just offset by 1 step
+			# within the imagined trajectory). This is a design simplification that differs from
+			# BMPC JAX, where if dynamics is wrong, the TD target doesn't match the state it's
+			# used to train, but imagination always starts from "clean" true encodings.
 			# 
 			# Gradient flow logic:
 			#   - If update_world_model=False: fully detach start_z (no encoder gradients from value)

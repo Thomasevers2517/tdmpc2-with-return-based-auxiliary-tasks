@@ -231,11 +231,23 @@ class OnlineTrainer(Trainer):
 				action = action.cpu()
 				if basic_log_flag:
 					self.logger.log_planner_info(planner_info, self._step, category='train')
-				# Reanalyze current observation to get expert targets for distillation
-				# This is separate from act() - reanalyze uses different planner settings
-				expert_action_dist, expert_value, _ = self.agent.reanalyze(obs_device)
-				expert_action_dist = expert_action_dist.squeeze(0).cpu()  # [A, 2]
-				expert_value = expert_value.squeeze(0).cpu()  # scalar
+				
+				if self.cfg.initial_expert_from_behavior:
+					# Use planner output as expert (BMPC style - no separate reanalyze)
+					# reanalyze_use_chosen_action controls whether to use the actual action taken or distribution mean
+					if self.cfg.reanalyze_use_chosen_action:
+						expert_mean = action  # [A] - the actual action taken (may include noise)
+					else:
+						expert_mean = planner_info.action_mean[0, :].cpu()  # [A] - distribution mean at t=0
+					expert_std = planner_info.action_std[0, :].cpu()  # [A] - distribution std at t=0
+					expert_action_dist = torch.stack([expert_mean, expert_std], dim=-1)  # [A, 2]
+					expert_value = planner_info.value_chosen.cpu()
+				else:
+					# Reanalyze current observation to get expert targets for distillation
+					# This is separate from act() - reanalyze uses different planner settings
+					expert_action_dist, expert_value, _ = self.agent.reanalyze(obs_device)
+					expert_action_dist = expert_action_dist.squeeze(0).cpu()  # [A, 2]
+					expert_value = expert_value.squeeze(0).cpu()  # scalar
 			else:
 				action = self.env.rand_act()
 				expert_action_dist = None  # NaN filled in to_td()
