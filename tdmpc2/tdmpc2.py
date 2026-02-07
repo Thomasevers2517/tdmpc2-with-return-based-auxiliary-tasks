@@ -755,8 +755,9 @@ class TDMPC2(torch.nn.Module):
 		expert_std = expert_action_dist[..., 1]   # float32[T, B, A]
 		
 		# Apply BMPC-style expert std scaling before clipping
+		# min_expert_std is separate from planner min_std (BMPC: min_policy_std=0.1, min_plan_std=0)
 		expert_std = expert_std * self.cfg.expert_std_scale
-		expert_std = expert_std.clamp(min=self.cfg.min_std, max=self.cfg.max_std)
+		expert_std = expert_std.clamp(min=self.cfg.min_expert_std, max=self.cfg.max_std)
 		
 		# Validate expert values are reasonable
 		assert not torch.isnan(expert_mean).any(), "expert_mean contains NaN"

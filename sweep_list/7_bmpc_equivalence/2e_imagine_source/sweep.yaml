@@ -1,0 +1,39 @@
+# Sweep 2e: Imagination Initial Source on dog-run
+# Hypothesis: V learning on true encoded states (instead of dynamics rollout)
+# provides cleaner inputs but may not expose policy to dynamics errors.
+# BMPC baseline: critic_source=replay_rollout (V on dynamics states)
+# Override: critic_source=replay_true (V on true encoded states)
+# 2 tasks × 1 config × 2 seeds = 4 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  critic_source:
+    value: replay_true
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

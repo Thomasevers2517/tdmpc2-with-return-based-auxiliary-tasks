@@ -1,0 +1,36 @@
+# Easy DMC Tasks: Baseline + UTD Ablation
+# 4 tasks × 3 UTD values × 1 seed = 12 runs
+# Tests BMPC baseline on easy tasks and whether higher UTD helps.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [quadruped-walk, hopper-hop, acrobot-swingup, cartpole-swingup_sparse]
+
+  seed:
+    values: [1]
+
+  utd_ratio:
+    values: [1, 2, 4]
+
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

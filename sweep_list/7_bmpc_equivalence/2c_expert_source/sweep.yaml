@@ -1,0 +1,41 @@
+# Sweep 2c: Expert Mean / Initial Expert Source on dog-run
+# Hypothesis: Source of expert targets for policy distillation affects learning.
+# BMPC baseline: reanalyze_use_chosen_action=false, initial_expert_from_behavior=true
+# Grid: reanalyze_use_chosen_action × initial_expert_from_behavior
+# 2 tasks × 2 × 2 × 2 seeds = 16 runs (includes baseline combo)
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  # Grid parameters
+  reanalyze_use_chosen_action:
+    values: [true, false]
+  initial_expert_from_behavior:
+    values: [true, false]
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

@@ -1,0 +1,49 @@
+# Sweep 2h: Dual Policy Exploration on dog-run
+# Hypothesis: Separate optimistic policy for exploration combined with
+# ensemble uncertainty improves sample efficiency.
+# BMPC baseline: no dual policy, no ensemble, no optimism.
+# Fixed overrides: 2 dynamics heads, full optimism, local bootstrap,
+# ensemble LR scaling, dual policy enabled.
+# 2 tasks × 1 config × 2 seeds = 4 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  # Fixed overrides from baseline
+  planner_num_dynamics_heads:
+    value: 2
+  planner_value_std_coef_train:
+    value: 1
+  local_td_bootstrap:
+    value: true
+  ensemble_lr_scaling:
+    value: true
+  dual_policy_enabled:
+    value: true
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false
