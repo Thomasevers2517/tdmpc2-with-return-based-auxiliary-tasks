@@ -287,6 +287,26 @@ class TDMPC2(torch.nn.Module):
 		frac = episode_length/self.cfg.discount_denom
 		return min(max((frac-1)/(frac), self.cfg.discount_min), self.cfg.discount_max)
 
+	def _needs_expert_data(self) -> bool:
+		"""
+		Check if expert action distributions are needed based on policy optimization methods.
+
+		Expert data (from planner/reanalyze) is required when:
+		- policy_optimization_method is 'distillation' or 'both', OR
+		- dual_policy_enabled AND optimistic_policy_optimization_method is 'distillation' or 'both'
+
+		Returns:
+			bool: True if expert data is required for training, False otherwise.
+		"""
+		method = str(self.cfg.policy_optimization_method).lower()
+		opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
+		opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
+
+		needs_expert = method in ('distillation', 'both') or (
+			self.cfg.dual_policy_enabled and opti_method in ('distillation', 'both')
+		)
+		return needs_expert
+
 	def save(self, fp):
 		"""
 		Save state dict of the agent to filepath.
@@ -2143,8 +2163,10 @@ class TDMPC2(torch.nn.Module):
 		reanalyze_interval = int(getattr(self.cfg, 'reanalyze_interval', 0))
 		# Check both interval AND that we haven't already reanalyzed at this step
 		# (prevents multiple reanalyze calls per env step when utd_ratio > 1)
+		# Also skip reanalyze entirely if expert data is not needed (svg-only mode)
 		should_reanalyze = (
 			reanalyze_interval > 0
+			and self._needs_expert_data()
 			and self._step % reanalyze_interval == 0
 			and self._step > 0
 			and self._step != self._last_reanalyze_step
