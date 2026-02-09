@@ -216,7 +216,7 @@ class TDMPC2(torch.nn.Module):
 		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float tensor
 		# TODO(perf): This tensor causes a graph break from .item()/float() calls during
 		# torch.compile. Converting it to a Python scalar eliminates the graph break and the
-		# function compiles properly, but for an unknown reason that breaks learning entirely
+		# function compiles properly, but for an unknown reason that breaks learning entirely. The value error skyrockets, see sweep worppu3u
 		# (the agent does not learn on e.g. quadruped-walk). The root cause is unknown.
 		# To reproduce: change the single-task branch to `self._get_discount(cfg.episode_length)`
 		# (a bare Python float) and run quadruped-walk — you will see it does not learn.
