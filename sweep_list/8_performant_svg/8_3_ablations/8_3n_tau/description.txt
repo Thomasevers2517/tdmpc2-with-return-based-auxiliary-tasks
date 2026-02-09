@@ -1,0 +1,19 @@
+Sweep 8.3n: Tau (EMA Target Update Rate) Ablation
+==================================================
+
+Purpose:
+Test the EMA (exponential moving average) update rate for target networks.
+tau controls how quickly the target network tracks the online network:
+- Small tau (0.001): very slow target updates → stable but may lag behind
+- Medium tau (0.003, baseline): moderate tracking speed
+- Large tau (0.01, original TD-MPC2): fast tracking → less stable targets
+
+Previous results (series 4b) showed tau=0.01 slightly worsens dog-run but
+marginally helps quadruped-walk. Here we also test tau=0.001 (slower) to see
+if more conservative targets help on the expanded task suite.
+
+Ablated parameter: tau
+  Baseline: 0.003 (not run)
+  Ablate:   0.01, 0.001
+
+Total runs: 2 configs × 6 tasks × 2 seeds = 24

@@ -1,0 +1,29 @@
+# Pre-ablation 3: Exploration Optimism
+# planner_value_std_coef_train in {0.6, 1.0} (baseline=0.3). 2 configs x 3 tasks x 2 seeds = 12 runs.
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [hopper-hop, quadruped-walk, dog-run]
+  seed:
+    values: [1, 2]
+  steps:
+    value: 100000
+  planner_value_std_coef_train:
+    values: [0.6, 1.0]
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

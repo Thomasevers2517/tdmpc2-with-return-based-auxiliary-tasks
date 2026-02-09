@@ -1,0 +1,18 @@
+Sweep 8.3f: Prior Scale Ablation
+=================================
+
+Purpose:
+Test the scale of frozen random prior networks added to ensemble heads.
+Priors encourage diversity between ensemble members by adding a fixed random
+perturbation to each head's output. The scale controls how large these
+perturbations are relative to the learned output (dimension-aware, so
+prior_scale=1.0 means ~1.0 perturbation per output dimension).
+
+prior_scale=0 disables priors entirely (heads may collapse to similar predictions).
+Larger values force more diversity but may hurt prediction accuracy if too large.
+
+Ablated parameter: prior_scale
+  Baseline: 0.1 (not run)
+  Ablate:   0, 1, 3, 10
+
+Total runs: 4 configs × 6 tasks × 2 seeds = 48

@@ -1,0 +1,94 @@
+SWEEP RESULTS — 7_bmpc_equivalence
+===================================
+Running log of observations from each sweep.
+Updated as results come in. Low seed counts (typically 2); take conclusions as directional.
+
+
+================================================================================
+SERIES 4: SVG ENSEMBLE ABLATIONS
+================================================================================
+Baseline: 4a (SVG, 4 dyn heads, 8 value heads, UTD=4, tau=0.003, enc_lr_scale=0.3)
+Tasks: dog-run, hopper-hop, quadruped-walk | 2 seeds | 100k steps
+
+--------------------------------------------------------------------------------
+4a_baseline  [W&B: 3k7nb7ai]
+  Reference SVG ensemble config. All other 4x sweeps ablate one param from this.
+  Results: (pending)
+
+4b_tau  [W&B: kv8uwi5k]
+  Change: tau 0.003 → 0.01 (faster EMA target updates)
+  Results: Weak/marginal improvement on quadruped-walk, but worsens dog-run.
+  Effect size is small in both directions. tau=0.01 remains a viable option
+  since it means fewer hyperparameter changes from the original TD-MPC2 default.
+
+4c_no_optimism  [W&B: qea3i6cg]
+  Change: planner_value_std_coef_train 0.3 → 0 (no optimistic exploration bonus)
+  Results: Significantly worsens performance on hopper-hop — confirms that
+  optimistic exploration via ensemble disagreement is important for hard-exploration
+  tasks. No meaningful negative effect on quadruped-walk or dog-run (dog-run even
+  slightly better). Key takeaway: optimism clearly helps on hopper-hop.
+
+4d_global_bootstrap  [W&B: xt7ebwhk]
+  Change: local_td_bootstrap true → false (global reduction across all heads)
+  Results: Performance significantly worsens on all three tasks (dog-run, hopper-hop,
+  quadruped-walk). Local bootstrapping is clearly important — each value head
+  bootstrapping from itself preserves per-head variation and gives a much better
+  estimate of uncertainty. Global reduction collapses this diversity. Strong signal.
+
+4e_enc_lr  [W&B: dzgrswbl]
+  Change: enc_lr_scale 0.3 → 1.0 (full encoder learning rate)
+  Results: Very little change on any task. Either value works fine.
+  Recommendation: keep enc_lr_scale=0.3 as default (no reason to change).
+
+4f_temperature  [W&B: jpog8szs]
+  Change: temperature 0.5 → 1.0 (softer elite selection, more stochastic)
+  Results: Worsens performance on most tasks. Not a massive effect but
+  consistently worse. Recommendation: keep temperature=0.5.
+
+4g_long_run  [W&B: od40q3vc]
+  Same config as 4a but 400k steps on harder tasks:
+  dog-run, humanoid-walk, humanoid_h1-walk-v0, humanoid_h1-slide-v0 | 2 seeds
+  Results: (pending)
+
+
+================================================================================
+SERIES 3: BMPC DISTILLATION ABLATIONS
+================================================================================
+
+3a_exploration_prior  [W&B: jd4kos5j]
+  Grid: planner_value_std_coef_train ∈ {0,1} × prior_scale ∈ {0.1,1}
+  2 dyn heads, local bootstrap, ensemble LR scaling | 3 tasks × 2 seeds
+  Results: (pending)
+
+3b_trust_region  [W&B: c0xdy8iq]
+  Grid: policy_trust_region_coef ∈ {0,1} × td_target_use_ema_policy ∈ {true,false}
+  utd_ratio=2, value_update_freq=2, pi_update_freq=2, policy_ema_tau=0.01
+  Results: (pending)
+
+3c_reanalyze_horizon  [W&B: 5xiyxn23]
+  Change: reanalyze_horizon=1 | 3 tasks × 2 seeds
+  Results: (pending)
+
+3d_reanalyze_slice_mode  [W&B: lj6issnq]
+  Change: reanalyze_slice_mode=false | 3 tasks × 2 seeds
+  Results: (pending)
+
+3e_ensemble_deep_dive  [W&B: lgmk6f7a]
+  Grid: planner_num_dynamics_heads ∈ {2,4} × greedy_train_action_selection ∈ {true,false}
+        × planner_value_std_coef_train ∈ {0,1}, prior_scale=1
+  dog-run only | 2 seeds | 10h walltime
+  Results: (pending)
+
+
+================================================================================
+SERIES 2: INITIAL ABLATIONS
+================================================================================
+
+2a_utd  Results: (pending)
+2b_multihead  Results: (pending)
+2c_expert_source  Results: (pending)
+2d_num_rollouts  Results: (pending)
+2e_imagine_source  Results: (pending)
+2f_encoder_cons  Results: (pending)
+2g_trust_region  Results: (pending)
+2h_exploration  Results: (pending)

@@ -536,41 +536,49 @@ class WorldModel(nn.Module):
 			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
 			action_dim = eps.shape[-1] if action_dims is None else action_dims
 			
-			# Sample action using either BMPC-style or standard squash parameterization
+			# --- Squash actions & compute two entropy variants ---
+			presquash_mean = mean
 			if self.cfg.bmpc_policy_parameterization:
-				# BMPC-style: squash mean first, then add noise with clamp
-				# mean = tanh(mean_raw), action = (mean + eps * std).clamp(-1, 1)
-				# No Jacobian correction needed since we don't squash the full sample
-				mean = torch.tanh(mean)
-				presquash_mean = mean  # Already squashed
+				# BMPC-style: squash mean only, add noise with clamp.
+				# No Jacobian correction since the *sample* is not squashed.
+				mean = torch.tanh(presquash_mean)
 				action = (mean + eps * log_std.exp()).clamp(-1, 1)
-				log_prob = log_prob_presquash  # No Jacobian correction
+				true_log_prob = log_prob_presquash
+				maximized_log_prob = log_prob_presquash
 			else:
-				# Standard squashed Gaussian: action = tanh(mean + eps * std)
-				# jacobian_correction_scale controls how much we penalize action saturation:
-				#   1.0 = correct entropy (full Jacobian penalty near ±1)
-				#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
-				action = mean + eps * log_std.exp()
-				presquash_mean = mean
+				presquash_action = presquash_mean + eps * log_std.exp()
+
+				# True entropy: squash with full Jacobian (scale=1.0)
+				mean, action, true_log_prob = math.squash(
+					presquash_mean, presquash_action, log_prob_presquash, jacobian_scale=1.0
+				)
+
+				# Maximized entropy: squash with configured Jacobian scale.
+				# This is what the policy loss actually maximizes.
 				jacobian_scale = float(self.cfg.jacobian_correction_scale)
-				mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
-			
-			# Entropy and scaled_entropy for policy loss
-			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)
-			# When jacobian_scale=1, log_prob includes full Jacobian correction (correct)
-			entropy = -log_prob
+				_, _, maximized_log_prob = math.squash(
+					presquash_mean, presquash_action, log_prob_presquash, jacobian_scale=jacobian_scale
+				)
+
+			# Entropy = -log_prob; scale by action_dim^power
 			entropy_multiplier = torch.tensor(
-				action_dim, dtype=log_prob.dtype, device=log_prob.device
+				action_dim, dtype=true_log_prob.dtype, device=true_log_prob.device
 			).pow(self.cfg.entropy_action_dim_power)
-			scaled_entropy = entropy * entropy_multiplier
-			
+
+			true_entropy = -true_log_prob                                    # float32[..., 1]
+			true_scaled_entropy = true_entropy * entropy_multiplier          # float32[..., 1]
+			maximized_entropy = -maximized_log_prob                          # float32[..., 1]
+			maximized_scaled_entropy = maximized_entropy * entropy_multiplier  # float32[..., 1]
+
 			info = TensorDict({
 				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,
-				"entropy": entropy,
-				"scaled_entropy": scaled_entropy,
+				"entropy": maximized_entropy,                # used in policy loss
+				"scaled_entropy": maximized_scaled_entropy,  # used in policy loss
+				"true_entropy": true_entropy,                # for logging only
+				"true_scaled_entropy": true_scaled_entropy,  # for logging only
 				"entropy_multiplier": entropy_multiplier,
 			}, device=z.device, non_blocking=True)
 			return action, info

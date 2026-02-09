@@ -1,0 +1,17 @@
+Sweep 8.3m: Entropy Coefficient Ablation
+=========================================
+
+Purpose:
+Test the scale of entropy regularization in the policy loss. Entropy encourages
+the policy to maintain stochasticity, preventing premature convergence to
+deterministic (and potentially suboptimal) behavior.
+
+The baseline uses 3e-5, which is a small but non-zero bonus. Higher values (1e-4)
+encourage more exploration through policy randomness but may prevent fine-grained
+control. Lower values (1e-5) allow the policy to become more deterministic sooner.
+
+Ablated parameter: start_entropy_coeff
+  Baseline: 3e-5 (not run)
+  Ablate:   1e-4, 1e-5
+
+Total runs: 2 configs × 6 tasks × 2 seeds = 24

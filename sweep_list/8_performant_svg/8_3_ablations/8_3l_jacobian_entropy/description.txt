@@ -1,0 +1,25 @@
+Sweep 8.3l: Jacobian Entropy Fix Ablation
+==========================================
+
+Purpose:
+Test whether using the mathematically correct entropy (with Jacobian correction
+for tanh squashing) matters vs the legacy "wrong" entropy (without correction).
+
+When bmpc_policy_parameterization=false, actions are squashed via tanh. The correct
+entropy requires a Jacobian correction term: log|det(dF/dx)| = sum(log(1 - tanh²(x))).
+This penalizes policies that push actions toward boundaries (±1), because tanh
+compresses the distribution there.
+
+With jacobian_correction_scale=0.0 (legacy TD-MPC2), the penalty is removed.
+The policy may exploit boundary actions without entropy cost, leading to very
+low *true* entropy even if the "wrong" entropy metric looks fine.
+
+IMPORTANT: This sweep requires a code change to always LOG the true entropy
+(jac_scale=1.0) regardless of what scale is used in the loss. This lets us
+observe the true entropy collapse when jac_scale=0.0 is used for training.
+
+Ablated parameter: jacobian_correction_scale
+  Baseline: 1.0 (not run)
+  Ablate:   0.0
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

@@ -1,0 +1,29 @@
+# Pre-ablation 2: Dynamics Heads
+# planner_num_dynamics_heads=2 (baseline=4). 3 tasks x 2 seeds = 6 runs.
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [hopper-hop, quadruped-walk, dog-run]
+  seed:
+    values: [1, 2]
+  steps:
+    value: 100000
+  planner_num_dynamics_heads:
+    value: 2
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

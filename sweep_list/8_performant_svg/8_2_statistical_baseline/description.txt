@@ -1,0 +1,18 @@
+Sweep 8.2: Statistical Baseline
+================================
+
+Purpose:
+Run the SVG ensemble baseline with 5 seeds on a representative set of tasks to
+establish tight confidence intervals. These numbers serve as the reference for
+all 8.3 ablation sweeps.
+
+Configuration:
+- 5 seeds
+- 100k steps
+- 6 tasks: dog-run, hopper-hop, quadruped-walk, humanoid-walk,
+           cartpole-swingup-sparse, humanoid_h1-walk-v0
+- All config.yaml defaults (SVG ensemble baseline)
+
+NOTE: humanoid_h1-walk-v0 requires the 'bmpc' conda env.
+
+Total runs: 30

@@ -1,0 +1,20 @@
+Sweep 8.1: Broad Coverage
+=========================
+
+Purpose:
+Run the SVG ensemble baseline (current config.yaml defaults) across ALL supported
+single-task environments to check generalization. This is a quick 1-seed sanity
+check — not for statistical claims, just to see if anything breaks or if certain
+task families behave unexpectedly.
+
+Configuration:
+- 1 seed
+- 100k steps
+- 21 easy DMC + 7 hard DMC + 14 HumanoidBench = 42 tasks
+- All config.yaml defaults (SVG ensemble baseline)
+
+NOTE: HumanoidBench tasks require the 'bmpc' conda env when submitting to SLURM.
+Consider splitting into separate SLURM submissions for DMC (tdmpc2-new env) and
+HumanoidBench (bmpc env) tasks.
+
+Total runs: 42

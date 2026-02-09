@@ -1,0 +1,78 @@
+# Sweep 8.1: Broad Coverage — SVG ensemble baseline on all tasks
+# 1 seed × 42 tasks = 42 runs
+# Quick generalization check across the full task suite.
+# NOTE: HumanoidBench tasks need 'bmpc' conda env for SLURM submission.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      # Easy DMC (21 tasks)
+      - walker-stand
+      - walker-walk
+      - walker-run
+      - cheetah-run
+      - reacher-easy
+      - reacher-hard
+      - acrobot-swingup
+      - pendulum-swingup
+      - cartpole-balance
+      - cartpole-balance-sparse
+      - cartpole-swingup
+      - cartpole-swingup-sparse
+      - cup-catch
+      - finger-spin
+      - finger-turn-easy
+      - finger-turn-hard
+      - fish-swim
+      - hopper-stand
+      - hopper-hop
+      - quadruped-walk
+      - quadruped-run
+      # Hard DMC (7 tasks)
+      - humanoid-stand
+      - humanoid-walk
+      - humanoid-run
+      - dog-stand
+      - dog-walk
+      - dog-run
+      - dog-trot
+      # HumanoidBench (14 tasks)
+      - humanoid_h1-run-v0
+      - humanoid_h1-stand-v0
+      - humanoid_h1-slide-v0
+      - humanoid_h1-balance_simple-v0
+      - humanoid_h1-balance_hard-v0
+      - humanoid_h1-sit_simple-v0
+      - humanoid_h1-sit_hard-v0
+      - humanoid_h1-crawl-v0
+      - humanoid_h1-hurdle-v0
+      - humanoid_h1-reach-v0
+      - humanoid_h1-maze-v0
+      - humanoid_h1-stair-v0
+      - humanoid_h1-pole-v0
+
+  seed:
+    values: [1]
+
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

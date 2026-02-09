@@ -1,0 +1,37 @@
+# Sweep 8.3j: Value Update Frequency Ablation
+# Baseline value_update_freq=2 (not run). Ablate: 1.
+# 1 config × 6 tasks × 2 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk, humanoid-walk, cartpole-swingup-sparse, humanoid_h1-pole-v0, acrobot-swingup]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # ABLATION
+  value_update_freq:
+    value: 1
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

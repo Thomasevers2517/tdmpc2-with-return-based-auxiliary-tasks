@@ -673,6 +673,8 @@ class TDMPC2(torch.nn.Module):
 			# For logging, reshape and average over N rollouts
 			info_entropy = info["entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
 			info_scaled_entropy = info["scaled_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			info_true_entropy = info["true_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			info_true_scaled_entropy = info["true_scaled_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
 			info_mean = info["mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			info_log_std = info["log_std"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
 			info_presquash_mean = info["presquash_mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
@@ -683,6 +685,8 @@ class TDMPC2(torch.nn.Module):
 				"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
 				"pi_entropy": info_entropy,
 				"pi_scaled_entropy": info_scaled_entropy,
+				"pi_true_entropy": info_true_entropy,
+				"pi_true_scaled_entropy": info_true_scaled_entropy,
 				"pi_entropy_multiplier": info["entropy_multiplier"],
 				"pi_q_scale": self.q_scale.value,
 				"pi_std": info_log_std.mean(),
@@ -802,6 +806,8 @@ class TDMPC2(torch.nn.Module):
 			"pi_kl_per_dim": kl_per_dim.mean(),
 			"pi_entropy": info["entropy"].mean(),
 			"pi_scaled_entropy": info["scaled_entropy"].mean(),
+			"pi_true_entropy": info["true_entropy"].mean(),
+			"pi_true_scaled_entropy": info["true_scaled_entropy"].mean(),
 			"pi_kl_scale": self.kl_scale.value,
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
