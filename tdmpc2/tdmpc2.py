@@ -213,12 +213,16 @@ class TDMPC2(torch.nn.Module):
 			"dynamic_entropy_coeff",
 			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
 		)
-		# Discount(s): multi-task -> vector (num_tasks,), single-task -> Python scalar float
-		# NOTE: Single-task uses Python float (not tensor) to avoid graph breaks in torch.compile
-		# from .item() / float() calls during training.
+		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float tensor
+		# TODO(perf): This tensor causes a graph break from .item()/float() calls during
+		# torch.compile. Converting it to a Python scalar eliminates the graph break and the
+		# function compiles properly, but for an unknown reason that breaks learning entirely
+		# (the agent does not learn on e.g. quadruped-walk). The root cause is unknown.
+		# To reproduce: change the single-task branch to `self._get_discount(cfg.episode_length)`
+		# (a bare Python float) and run quadruped-walk — you will see it does not learn.
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
-		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
+		) if self.cfg.multitask else torch.tensor(self._get_discount(cfg.episode_length), device=self.device)
 		# Compose full gamma list internally: primary discount first + auxiliary gammas from config.
 		# New semantics: cfg.multi_gamma_gammas contains ONLY auxiliary discounts.
 		# Only include auxiliary gammas if loss_weight > 0 (otherwise heads aren't created)
@@ -605,8 +609,8 @@ class TDMPC2(torch.nn.Module):
 				gamma_scalar = self.discount.mean().item()  # for std discounting
 			else:
 				task_flat = None
-				gamma = self.discount  # Python scalar (broadcasts with tensors)
-				gamma_scalar = self.discount  # Already a Python float (no .item() needed)
+				gamma = self.discount  # scalar tensor
+				gamma_scalar = float(self.discount)
 			
 			# Predict reward r(z, a) from ALL reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
@@ -1048,10 +1052,10 @@ class TDMPC2(torch.nn.Module):
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
 
-		# NOTE: For single-task, self.discount is a Python scalar (not tensor) to avoid
-		# graph breaks from .item()/float() calls during torch.compile.
+		# WARNING: See discount initialization comment — .item()/float() cause graph breaks
+		# but keeping discount as a tensor is required for learning (see note at __init__).
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		discount_scalar = self.discount.mean().item() if self.cfg.multitask else self.discount
+		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
 		
 		std_coef = float(self.cfg.td_target_std_coef)
 		
