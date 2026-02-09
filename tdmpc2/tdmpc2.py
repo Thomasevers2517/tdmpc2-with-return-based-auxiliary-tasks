@@ -213,10 +213,12 @@ class TDMPC2(torch.nn.Module):
 			"dynamic_entropy_coeff",
 			torch.tensor(self.cfg.start_entropy_coeff, device=self.device, dtype=torch.float32),
 		)
-		# Discount(s): multi-task -> vector (num_tasks,), single-task -> scalar float
+		# Discount(s): multi-task -> vector (num_tasks,), single-task -> Python scalar float
+		# NOTE: Single-task uses Python float (not tensor) to avoid graph breaks in torch.compile
+		# from .item() / float() calls during training.
 		self.discount = torch.tensor(
 			[self._get_discount(ep_len) for ep_len in cfg.episode_lengths], device=self.device
-		) if self.cfg.multitask else torch.tensor(self._get_discount(cfg.episode_length), device=self.device)
+		) if self.cfg.multitask else self._get_discount(cfg.episode_length)
 		# Compose full gamma list internally: primary discount first + auxiliary gammas from config.
 		# New semantics: cfg.multi_gamma_gammas contains ONLY auxiliary discounts.
 		# Only include auxiliary gammas if loss_weight > 0 (otherwise heads aren't created)
@@ -583,8 +585,8 @@ class TDMPC2(torch.nn.Module):
 				gamma_scalar = self.discount.mean().item()  # for std discounting
 			else:
 				task_flat = None
-				gamma = self.discount  # scalar
-				gamma_scalar = float(self.discount)
+				gamma = self.discount  # Python scalar (broadcasts with tensors)
+				gamma_scalar = self.discount  # Already a Python float (no .item() needed)
 			
 			# Predict reward r(z, a) from ALL reward heads
 			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
@@ -1026,9 +1028,10 @@ class TDMPC2(torch.nn.Module):
 		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
 		
 
-		#TODO WARNING, fixing this and replacing this .item() call somehow breaks the performance of the algo, I do no know why. Someone should fix it for faster compile.
+		# NOTE: For single-task, self.discount is a Python scalar (not tensor) to avoid
+		# graph breaks from .item()/float() calls during torch.compile.
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
-		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
+		discount_scalar = self.discount.mean().item() if self.cfg.multitask else self.discount
 		
 		std_coef = float(self.cfg.td_target_std_coef)
 		

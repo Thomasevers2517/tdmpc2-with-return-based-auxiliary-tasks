@@ -5,7 +5,7 @@ os.environ['TORCHDYNAMO_INLINE_INBUILT_NN_MODULES'] = "1"
 # Debug: get proper CUDA error locations (disable for production)
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # os.environ['TORCH_USE_CUDA_DSA'] = '1'
-# os.environ['TORCH_LOGS'] = "+recompiles"
+os.environ['TORCH_LOGS'] = "+recompiles"
 import warnings
 warnings.filterwarnings('ignore')
 import logging

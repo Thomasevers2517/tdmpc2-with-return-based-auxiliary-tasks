@@ -1,0 +1,51 @@
+# Sweep: value_dim_div=2 (smaller value heads)
+# Purpose: Test performance impact of reducing value head hidden dimension by 2x
+# 1 task × 4 seeds = 4 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # SWEEP PARAMETERS
+  #############################################
+
+  task:
+    values: [quadruped-walk]
+
+  value_dim_div:
+    value: 2
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 500000
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  enable_wandb:
+    value: true
+
+  wandb_project:
+    value: tdmpc2-tdmpc2
+
+  wandb_entity:
+    value: thomasevers9
+
+  compile:
+    value: true
+
+  save_video:
+    value: false
