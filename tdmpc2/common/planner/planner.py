@@ -105,11 +105,9 @@ class Planner(torch.nn.Module):
             K = int(self.cfg.reanalyze_num_elites)
             temp = float(self.cfg.reanalyze_temperature)
             lambda_latent = 0.0  # No exploration bonus during reanalyze
-            head_mode = 'all'
-            reward_head_mode = 'all'
             value_std_coef = float(self.cfg.reanalyze_value_std_coef)
         elif eval_mode:
-            # Eval mode: value-only scoring, optionally single head
+            # Eval mode: all heads, value-only scoring
             T = int(self.cfg.horizon)
             iterations = int(self.cfg.iterations)
             N = int(self.cfg.num_samples)
@@ -117,10 +115,7 @@ class Planner(torch.nn.Module):
             K = int(self.cfg.num_elites)
             temp = float(self.cfg.temperature)
             lambda_latent = 0.0
-            use_all_heads_eval = bool(self.cfg.planner_use_all_heads_eval)
-            head_mode = 'all' if use_all_heads_eval else 'single'
-            reward_head_mode = head_mode
-            value_std_coef = float(self.cfg.planner_value_std_coef_eval) if use_all_heads_eval else 0.0
+            value_std_coef = float(self.cfg.planner_value_std_coef_eval)
         else:
             # Training mode: full ensemble with exploration bonus
             T = int(self.cfg.horizon)
@@ -130,8 +125,6 @@ class Planner(torch.nn.Module):
             K = int(self.cfg.num_elites)
             temp = float(self.cfg.temperature)
             lambda_latent = float(self.cfg.planner_lambda_disagreement)
-            head_mode = 'all'
-            reward_head_mode = 'all'
             value_std_coef = float(self.cfg.planner_value_std_coef_train)
 
         # Allow explicit override (rare, mostly for testing)
@@ -159,7 +152,6 @@ class Planner(torch.nn.Module):
                 use_policy=True,
                 horizon=T,
                 num_rollouts=S,
-                head_mode=head_mode,
                 task=task,
                 policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
                 use_optimistic_policy=use_optimistic,
@@ -171,7 +163,6 @@ class Planner(torch.nn.Module):
                 self.world_model,
                 task,
                 value_std_coef=value_std_coef,
-                reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
             )
@@ -215,7 +206,7 @@ class Planner(torch.nn.Module):
             # World model rollout: z0 [B, L], actions [B, N, T, A]
             # Returns latents [H, B, N, T+1, L], actions [B, N, T, A]
             latents_s, actions_s = self.world_model.rollout_latents(
-                z0, actions=actions_s, use_policy=False, head_mode=head_mode, task=task
+                z0, actions=actions_s, use_policy=False, task=task
             )
             # latents_s: [H, B, N, T+1, L], actions_s: [B, N, T, A]
 
@@ -226,7 +217,6 @@ class Planner(torch.nn.Module):
                 self.world_model,
                 task,
                 value_std_coef=value_std_coef,
-                reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
             )
@@ -453,7 +443,6 @@ class Planner(torch.nn.Module):
                 z0=z0[0].detach(),
                 task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
-                head_mode=head_mode,
                 value_std_coef=value_std_coef,
                 T=T,
                 use_ema_value=use_ema_value,

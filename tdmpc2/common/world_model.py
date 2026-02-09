@@ -48,7 +48,9 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
-		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
+		# Multi-head dynamics ensemble: vectorized via Ensemble (vmap + functional_call).
+		# NOTE: We apply weight_init to each head before wrapping in Ensemble because
+		# Ensemble stores params in TensorDictParams which self.apply() does not traverse.
 		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
 		# Unified prior config for ensemble diversity
 		prior_hidden_div = int(cfg.prior_hidden_div)
@@ -56,7 +58,7 @@ class WorldModel(nn.Module):
 		# Dynamics head config: layer count and dropout
 		dynamics_num_layers = int(getattr(cfg, 'dynamics_num_layers', 2))
 		dynamics_dropout = float(getattr(cfg, 'dynamics_dropout', 0.0))
-		self._dynamics_heads = nn.ModuleList([
+		dyn_heads = [
 			layers.DynamicsHeadWithPrior(
 				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
 				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
@@ -67,9 +69,12 @@ class WorldModel(nn.Module):
 				dropout=dynamics_dropout,
 			)
 			for _ in range(h_total)
-		])
-		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
-		self._dynamics = self._dynamics_heads[0]
+		]
+		for dyn_head in dyn_heads:
+			dyn_head.apply(init.weight_init)
+		self._dynamics_heads = layers.Ensemble(dyn_heads)
+		# Keep a reference for __repr__ (legacy code paths expecting _dynamics)
+		self._dynamics = self._dynamics_heads
 		
 		# Multi-head reward ensemble for pessimistic reward estimation
 		# Uses Ensemble (vmap) for efficient vectorized forward pass.
@@ -406,43 +411,27 @@ class WorldModel(nn.Module):
 				out = encoder[self.cfg.obs](obs)
 			return out.float()
 
-	def next(self, z, a, task, head_mode=None):
-		"""Predict next latent(s) for one step.
+	def next(self, z, a, task, split_data=False):
+		"""Predict next latent(s) using all dynamics heads in one vectorized call.
 
 		Args:
-			z (Tensor[B, L]): Current latent.
-			a (Tensor[B, A]): Current action.
+			z: Current latent(s).
+				Broadcast (split_data=False): Tensor[B, L] — same data to all heads.
+				Split    (split_data=True):  Tensor[H, B, L] — per-head data.
+			a: Current action(s).  Shape mirrors z (with A instead of L).
 			task: Optional task id for multitask (passed to task_emb when enabled).
-			head_mode (str|None): If None, returns Tensor[B,L] using head 0 (legacy path).
-				If 'single', returns Tensor[1,B,L] using head 0.
-				If 'random', returns Tensor[1,B,L] using a random head per call.
-				If 'all', returns Tensor[H,B,L] stacked over all dynamics heads.
+			split_data: If True, z and a have a leading H dim sliced per-head.
 
 		Returns:
-			Tensor[..., B, L]: Next latent(s) with optional head dimension leading.
+			Tensor[H, B, L]: Next latent(s) with leading head dimension.
 		"""
 		with maybe_range('WM/dynamics', self.cfg):
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
-			H = len(self._dynamics_heads)
-			if head_mode is None:
-				# Legacy behavior: single head (0), no head dimension in output
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float()
-			if head_mode == 'single':
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float().unsqueeze(0)
-			elif head_mode == 'all':
-				outs = []
-				with self._autocast_context():
-					for head in self._dynamics_heads:
-						outs.append(head(za)) 
-				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
-			else:
-				raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
+			with self._autocast_context():
+				out = self._dynamics_heads(za, split_data=split_data)  # float32[H, B, L]
+			return out.float()
 
 	def reward(self, z, a, task, head_mode='single'):
 		"""
@@ -689,27 +678,30 @@ class WorldModel(nn.Module):
 			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False, use_target_policy: bool = False):
-		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False, use_target_policy: bool = False):
+		"""Roll out latent trajectories vectorized over all H dynamics heads.
+
+		All H dynamics heads are always used (no head_mode selection).
+		At each timestep each head advances its own latent independently via
+		a single batched ``next(..., split_data=True)`` call.
 
 		Args:
 			z0 (Tensor[L] or Tensor[B,L]): Initial latent(s).
-			actions (Tensor[B,N,T,A], optional): Action sequences when `use_policy=False`.
-			use_policy (bool): If True, ignore `actions` and sample actions from policy using head-0 latents.
-			horizon (int, optional): Number of steps `T` when `use_policy=True`.
-			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
-			head_mode (str): 'single' uses head 0 only; 'all' uses all dynamics heads.
+			actions (Tensor[B,N,T,A], optional): Action sequences when ``use_policy=False``.
+			use_policy (bool): If True, ignore ``actions`` and sample from the policy
+				using head-0 latents.
+			horizon (int, optional): Number of steps T when ``use_policy=True``.
+			num_rollouts (int, optional): Number of sequences N when ``use_policy=True``.
 			task: Optional task id for multitask.
-			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
-				when `use_policy=True`. Ignored when `use_policy=False`.
-			use_optimistic_policy (bool): If True and dual_policy_enabled, use optimistic policy
-				for action sampling. Ignored when `use_policy=False`.
-			use_target_policy (bool): If True, use EMA target policy instead of online policy.
-				Ignored when `use_policy=False`.
+			policy_action_noise_std (float): Std of Gaussian noise added to policy
+				actions when ``use_policy=True``.
+			use_optimistic_policy (bool): If True and dual_policy_enabled, sample from
+				the optimistic policy.
+			use_target_policy (bool): If True, use EMA target policy.
 
 		Returns:
-			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
-				H_sel is 1 for 'single', H_total for 'all'.
+			Tuple[Tensor[H,B,N,T+1,L], Tensor[B,N,T,A]]:
+				Latent trajectories (all H heads) and actions used.
 		"""
 		if use_policy:
 			if actions is not None:
@@ -727,26 +719,13 @@ class WorldModel(nn.Module):
 			if horizon is not None and horizon != T:
 				raise ValueError('Provided horizon does not match actions.shape[2].')
 
-		device = next(self.parameters()).device
 		# Normalize z0 to [B,L]
 		if z0.ndim == 1:
 			z0 = z0.unsqueeze(0)  # [1,L] -> [B=1,L]
 		B = z0.shape[0]
 		L = z0.shape[-1]
 
-		H_total = len(self._dynamics_heads)
-		if head_mode == 'single':
-			H_sel = 1
-			head_indices = [0]
-		elif head_mode == 'all':
-			H_sel = H_total
-			head_indices = list(range(H_total))
-		elif head_mode == 'random':
-			# Randomly select one dynamics head per update (for single-head imagination)
-			H_sel = 1
-			head_indices = [torch.randint(0, H_total, (1,)).item()]
-		else:
-			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single', 'all', or 'random'.")
+		H = len(self._dynamics_heads)
 
 		# Determine action dim
 		if not use_policy:
@@ -754,59 +733,44 @@ class WorldModel(nn.Module):
 		else:
 			A = self.cfg.action_dim
 
-		# Build per-step lists to avoid in-place writes on graph tensors
-		# t=0 state for all heads: broadcast z0 over N, then tile over heads
-		z0_bn = z0.unsqueeze(1).expand(B, N, L)  # float32[B,N,L]
-		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)  # float32[H_sel,B,N,L]
+		# t=0 state for all heads: broadcast z0 over N, then expand over H
+		z0_bn = z0.unsqueeze(1).expand(B, N, L)         # float32[B, N, L]
+		z0_hbn = z0_bn.unsqueeze(0).expand(H, B, N, L)  # float32[H, B, N, L]
 		latents_steps = [z0_hbn]
-		actions_steps = []  # each entry: float32[B,N,A]
+		actions_steps = []  # each entry: float32[B, N, A]
 
 		with maybe_range('WM/rollout_latents', self.cfg):
-			# Time loop over T
 			for t in range(T):
 				with maybe_range('WM/rollout_latents/step_loop', self.cfg):
-					# Select actions at time t
+					# --- Action selection ---
 					if use_policy:
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
 							# Use head-0 latents for policy sampling
-							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
+							z_for_pi = latents_steps[t][0].reshape(B * N, L)  # float32[B*N, L]
 							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy, target=use_target_policy)
-							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
+							a_t = a_flat.reshape(B, N, A).detach()  # float32[B, N, A]
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
 								a_t = (a_t + noise).clamp(-1.0, 1.0)
 					else:
-						a_t = actions[:, :, t, :]  # float32[B,N,A]
+						a_t = actions[:, :, t, :]  # float32[B, N, A]
 					actions_steps.append(a_t)
 
-					# Advance each selected head independently
-					next_heads = []  # will hold float32[B,N,L] per head
-					for h in range(H_sel):
-						# h indexes into latents_steps (0..H_sel-1)
-						# head_indices[h] gives the actual dynamics head to use
-						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
-							z_curr = latents_steps[t][h].view(B * N, L)  # float32[B*N,L]
-							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
-							if self.cfg.multitask:
-								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
-							else:
-								z_cat = z_curr
-							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
-							with self._autocast_context():
-								next_flat = self._dynamics_heads[head_indices[h]](za)  # float32[B*N,L]
-							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
-							next_heads.append(next_bn)
-
-					# Aggregate heads for next timestep
-					next_hbn = torch.stack(next_heads, dim=0)  # float32[H_sel,B,N,L]
+					# --- Advance all H dynamics heads in one batched call ---
+					with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
+						z_all = latents_steps[t].reshape(H, B * N, L)    # float32[H, B*N, L]
+						a_all = a_t.contiguous().reshape(B * N, A)       # float32[B*N, A]
+						a_all = a_all.unsqueeze(0).expand(H, -1, -1)    # float32[H, B*N, A]
+						# next() with split_data=True: each head gets its own z,a slice
+						next_all = self.next(z_all, a_all, task, split_data=True)  # float32[H, B*N, L]
+						next_hbn = next_all.reshape(H, B, N, L)          # float32[H, B, N, L]
 					latents_steps.append(next_hbn)
 
 		# Stack over time to produce final outputs
 		with maybe_range('WM/rollout_latents/finalize', self.cfg):
-			latents = torch.stack(latents_steps, dim=3).contiguous()  # float32[H_sel,B,N,T+1,L]
-			actions_out = torch.stack(actions_steps, dim=2).contiguous()  # float32[B,N,T,A]
+			latents = torch.stack(latents_steps, dim=3).contiguous()      # float32[H, B, N, T+1, L]
+			actions_out = torch.stack(actions_steps, dim=2).contiguous()   # float32[B, N, T, A]
 
-		# Cheap sanity: ensure contiguity for downstream views
 		assert latents.is_contiguous(), "latents expected contiguous"
 		assert actions_out.is_contiguous(), "actions_out expected contiguous"
 		return latents, actions_out

@@ -1,5 +1,5 @@
 # Copilot Instructions (Concise)
-
+- add any files or temporary tests to /"copilot files"
 - Descriptive naming: Explicit, self-explanatory names for variables, tensors, functions, classes, and files. Prefer `verb_object_detail` (e.g., `compute_episode_returns`). Avoid unclear abbreviations.
 - Minimal & modular: Implement only what’s needed. Inline is fine for true single-use; on second use, refactor into a shared utility and replace call sites.
 - Tensor shapes everywhere: Annotate shapes at introduction or transformation.

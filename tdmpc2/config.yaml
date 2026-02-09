@@ -92,7 +92,6 @@ critic_target_source: replay_true   # replay_true | replay_rollout
 local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
 td_target_std_coef: 0     # TD = mu + std_coef * sigma. Also accepts "opt"/"pess" strings.
 td_target_dynamics_reduction: mean  # "from_std_coef" | "min" | "max" | "mean"
-td_target_use_all_dynamics_heads: true
 td_target_use_ema_policy: false
 value_std_coef_default: 1.0  # Default magnitude for "opt"/"pess" string values of std_coef.
 n_mc_samples_target: 1
@@ -162,7 +161,6 @@ mult_by_temp: true
 planner_value_std_coef_train: 0.3
 planner_value_std_coef_eval: -1
 planner_aggregate_value: false
-planner_use_all_heads_eval: true
 planner_lambda_disagreement: 0
 planner_policy_elites_first_iter_only: false
 

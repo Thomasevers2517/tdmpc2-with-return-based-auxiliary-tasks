@@ -182,28 +182,56 @@ class Ensemble(nn.Module):
 		"""Template module (on meta device). Exposed for backward compatibility."""
 		return self._module
 
-	def forward(self, *args, **kwargs):
-		"""
-		Vectorized forward pass using functional_call.
-		
-		Instead of mutating self.module with to_module(), we use functional_call
-		which is a pure function: functional_call(module, params, args) runs the
-		module's forward with the given params without modifying the module.
+	def forward(self, *args, split_data: bool = False, **kwargs):
+		"""Vectorized forward pass using functional_call + vmap.
+
+		When ``split_data=False`` (default / broadcast mode), all ensemble members
+		receive the **same** input tensors — vmap iterates only over the stacked
+		parameters.
+
+		When ``split_data=True``, the **first positional arg** must have its dim-0
+		equal to the ensemble size H.  vmap then slices both the parameters *and*
+		that first arg in lockstep, so member *i* sees ``args[0][i]``.  Any
+		remaining positional / keyword args are still broadcast.
+
+		Args:
+			*args: Positional inputs forwarded to the wrapped module.
+			split_data: If True, slice ``args[0]`` along dim 0 per member.
+			**kwargs: Keyword inputs forwarded to the wrapped module.
+
+		Returns:
+			Tensor[H, *batch, out_dim]: Stacked outputs, one per member.
 		"""
 		from torch.func import functional_call
-		
+
 		module = self._module  # Template module on meta device (not registered as submodule)
-		
-		def call_single(params_slice):
-			# params_slice is a TensorDict with params for one ensemble member
-			# Convert to flat dict format for functional_call: {"layer.weight": tensor, ...}
-			# flatten_keys(".") converts ("main_mlp", "0", "weight") -> "main_mlp.0.weight"
-			params_dict = dict(params_slice.flatten_keys(".").items())
-			# functional_call runs module.forward with the given params (no mutation)
-			return functional_call(module, params_dict, args, kwargs)
-		
-		# vmap over the first dimension of self.params (the ensemble dimension)
-		return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
+
+		if split_data:
+			# --- per-member data mode ---
+			assert len(args) >= 1, "split_data=True requires at least one positional arg"
+			assert args[0].shape[0] == len(self), (
+				f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
+				f"!= ensemble size ({len(self)})"
+			)
+			first_arg = args[0]       # Tensor[H, *batch, features]  — will be sliced
+			rest_args = args[1:]       # broadcast (shared across members)
+
+			def call_single(params_slice, x_slice):
+				params_dict = dict(params_slice.flatten_keys(".").items())
+				return functional_call(module, params_dict, (x_slice, *rest_args), kwargs)
+
+			# in_dims=(0, 0): slice params AND first arg along dim 0
+			return torch.vmap(call_single, in_dims=(0, 0), randomness="different")(
+				self.params, first_arg
+			)
+		else:
+			# --- broadcast mode (original behaviour) ---
+			def call_single(params_slice):
+				params_dict = dict(params_slice.flatten_keys(".").items())
+				return functional_call(module, params_dict, args, kwargs)
+
+			# in_dims=0: slice only params along dim 0; args broadcast
+			return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
 
 	def __repr__(self):
 		return f'Vectorized {len(self)}x ' + self._repr
@@ -363,9 +391,6 @@ class DynamicsHeadWithPrior(nn.Module):
 		
 		# SimNorm applied after MLPWithPrior
 		self.simnorm = SimNorm(cfg)
-		
-		# Expose main_mlp for weight_init compatibility
-		self.main_mlp = self.mlp_with_prior.main_mlp
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""

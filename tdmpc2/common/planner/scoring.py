@@ -9,7 +9,6 @@ def compute_values(
     world_model,
     task=None,
     value_std_coef: float = 0.0,
-    reward_head_mode: str = "all",
     use_ema_value: bool = False,
     aggregate_horizon: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -49,8 +48,6 @@ def compute_values(
         task: Optional task index for multitask setups.
         value_std_coef: Coefficient for mean + coef × std reduction.
             >0 = optimistic (max over dynamics), <0 = pessimistic (min over dynamics), 0 = neutral (mean).
-        reward_head_mode: 'single' uses only head 0, 'all' uses all reward heads.
-            During eval, use 'single' to match single dynamics head for fair comparison.
         use_ema_value: If True, use EMA target network for V; otherwise use online network.
         aggregate_horizon: If True, compute λ-style compound return averaging over all horizons.
 
@@ -95,9 +92,8 @@ def compute_values(
         # Non-episodic: always alive
         alive_probs = torch.ones(H, B, N, T + 1, device=device, dtype=dtype)
 
-    # Get reward logits from reward heads: [R, H*B*N, T, K]
-    # R=1 if reward_head_mode='single', R=num_reward_heads if 'all'
-    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode=reward_head_mode)
+    # Get reward logits from all reward heads: [R, H*B*N, T, K]
+    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode='all')
     R = rew_logits_all.shape[0]  # number of reward heads
     
     # Convert to scalar rewards: [R, H*B*N, T, K] -> [R, H*B*N, T, 1] -> [R, H, B, N, T]

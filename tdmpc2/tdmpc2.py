@@ -619,7 +619,7 @@ class TDMPC2(torch.nn.Module):
 			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B*N, 1]
 			
 			# Roll through ALL dynamics heads to get next states z'
-			next_z_all = self.model.next(z_flat, action_flat, task_flat, head_mode='all')  # float32[H, T*B*N, L]
+			next_z_all = self.model.next(z_flat, action_flat, task_flat)  # float32[H, T*B*N, L]
 			H = next_z_all.shape[0]  # number of dynamics heads
 			
 			# Evaluate V(z') for each dynamics head using ALL Ve value heads
@@ -1262,7 +1262,7 @@ class TDMPC2(torch.nn.Module):
 			# Use vectorized multi-head rollout over provided actions
 			actions_in = action.permute(1, 0, 2).unsqueeze(1)  # [B,1,T,A]
 			lat_all, _ = self.model.rollout_latents(
-				z_true[0], actions=actions_in, use_policy=False, head_mode='all', task=task
+				z_true[0], actions=actions_in, use_policy=False, task=task
 			)  # lat_all: [H,B,1,T+1,L]
 			# Consistency over heads: average MSE across heads and batch per time step
 			# Align dims to [H,T,B,L] for both predicted and true latents
@@ -1486,7 +1486,7 @@ class TDMPC2(torch.nn.Module):
 	def imagined_rollout(self, start_z, task=None, rollout_len=None, use_target_policy=False):
 		"""Roll out imagined trajectories from latent start states using world_model.rollout_latents.
 
-		Uses all dynamics heads (head_mode='all') for multi-head pessimism.
+		Uses all dynamics heads for multi-head pessimism.
 		When rollout_len=1, all heads share the same action since the policy samples
 		from the initial state before any dynamics step.
 
@@ -1518,16 +1518,7 @@ class TDMPC2(torch.nn.Module):
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
 		
-		# Determine head_mode based on td_target_use_all_dynamics_heads
-		# When false, use a randomly-selected dynamics head (cheaper but no H-std)
-		# When true, use all heads for full (R × H × Ve) combinations
-		if self.cfg.td_target_use_all_dynamics_heads:
-			head_mode = 'all'
-			H = int(self.cfg.planner_num_dynamics_heads)
-		else:
-			head_mode = 'random'  # Use single randomly-selected head
-			H = 1  # Only one head in output
-		
+		H = int(self.cfg.planner_num_dynamics_heads)
 		# Multi-head imagination requires rollout_len=1 so all heads share the same action
 		# (policy samples at z[0] before dynamics step)
 		if H > 1:
@@ -1545,12 +1536,10 @@ class TDMPC2(torch.nn.Module):
 				use_policy=True,
 				horizon=rollout_len,
 				num_rollouts=n_rollouts,
-				head_mode=head_mode,  # 'all' or 'random' based on config
 				task=task,
 				use_target_policy=use_target_policy,
 			)
 		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
-		# H equals planner_num_dynamics_heads when head_mode='all'
 		assert latents.shape[0] == H, f"Expected {H} heads, got {latents.shape[0]}"
 
 		with maybe_range('Imagined/permute_view', self.cfg):
