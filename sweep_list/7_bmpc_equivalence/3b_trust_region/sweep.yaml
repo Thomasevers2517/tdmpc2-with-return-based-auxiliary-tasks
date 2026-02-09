@@ -1,0 +1,53 @@
+# Sweep 3b: Trust Region + Update Frequency
+# Hypothesis: Higher update freq (UTD-like) + EMA policy trust region stabilizes learning.
+# Fixed: value_update_freq=2, pi_update_freq=2, policy_ema_tau=0.01
+# Grid: policy_trust_region_coef × td_target_use_ema_policy
+# 4 configs × 3 tasks × 2 seeds = 24 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # Higher update frequency
+  utd_ratio:
+    value: 2
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 2
+
+  # EMA policy
+  policy_ema_tau:
+    value: 0.01
+
+  # Sweep axes
+  policy_trust_region_coef:
+    values: [0, 1]
+  td_target_use_ema_policy:
+    values: [true, false]
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

@@ -1,0 +1,38 @@
+# Sweep 3d: Reanalyze Slice Mode = false
+# Hypothesis: Sampling independent t=0 obs (instead of BMPC-style slicing)
+# may produce more diverse expert targets.
+# 1 config × 3 tasks × 2 seeds = 6 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # Override
+  reanalyze_slice_mode:
+    value: false
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

@@ -1,0 +1,53 @@
+# Sweep 3e: Ensemble Deep Dive (heads × greedy × optimism)
+# Based on 3a but deeper: sweep dynamics heads, greedy action selection, and optimism.
+# Fixed: prior_scale=1, local bootstrap, ensemble LR scaling, no action noise.
+# Grid: planner_num_dynamics_heads × greedy_train_action_selection × planner_value_std_coef_train
+# 2 × 2 × 2 = 8 configs × 1 task × 3 seeds = 24 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    value: dog-run
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 200000
+
+  # Ensemble setup (fixed)
+  local_td_bootstrap:
+    value: true
+  ensemble_lr_scaling:
+    value: true
+  train_act_std_coeff:
+    value: 0
+  prior_scale:
+    value: 1
+
+  # Sweep axes
+  planner_num_dynamics_heads:
+    values: [2, 4]
+  greedy_train_action_selection:
+    values: [true, false]
+  planner_value_std_coef_train:
+    values: [0, 1]
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

@@ -1,0 +1,55 @@
+# Sweep 3a: Exploration (Ensemble + Prior Scale)
+# Hypothesis: Optimistic planner scoring + random prior diversity improve exploration.
+# Fixed: 2 dynamics heads, local bootstrap, ensemble LR scaling, no greedy, no action noise.
+# Grid: planner_value_std_coef_train × prior_scale
+# 4 configs × 3 tasks × 2 seeds = 24 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # Ensemble setup
+  planner_num_dynamics_heads:
+    value: 2
+  local_td_bootstrap:
+    value: true
+  ensemble_lr_scaling:
+    value: true
+
+  # Action selection
+  greedy_train_action_selection:
+    value: false
+  train_act_std_coeff:
+    value: 0
+
+  # Sweep axes
+  planner_value_std_coef_train:
+    values: [0, 1]
+  prior_scale:
+    values: [0.1, 1]
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false
