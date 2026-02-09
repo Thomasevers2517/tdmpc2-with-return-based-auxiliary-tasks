@@ -3,12 +3,11 @@ defaults:
     - override hydra/launcher: basic
 
 # ===========================================================================
-# Core Training
+#  1. Task & Training Setup
 # ===========================================================================
 task: reacher-easy
 obs: state
 steps: 100_000
-batch_size: 256
 seed: 1
 compile: true
 compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
@@ -17,47 +16,7 @@ debug: false  # If true, emit a log line after every agent.update (heavy).
 nvtx_profiler: false  # If true: add lightweight NVTX record_function ranges (disables compile).
 
 # ===========================================================================
-# Discount & Returns
-# ===========================================================================
-discount_denom: 5
-discount_min: 0.95
-discount_max: 0.995
-rho: 0.5
-final_rho: -1  # if >0, overrides rho schedule so end-of-horizon discount = final_rho. -1 = disabled.
-
-# ===========================================================================
-# Optimization
-# ===========================================================================
-lr: 3e-4
-optimizer_type: adamw  # 'adam' or 'adamw'
-weight_decay: 0  # Weight decay for AdamW (ignored for Adam)
-tau: 0.003
-grad_clip_norm: 20
-enc_lr_scale: 0.3
-# Encoder LR step-change schedule:
-#   At (1 - enc_lr_step_ratio) * steps, encoder LR *= enc_lr_step_scale.
-enc_lr_step_ratio: 0.5   # Fraction of training after which to step-change LR
-enc_lr_step_scale: 1      # Multiplier for encoder LR after step (0.0 = freeze)
-pi_lr_scale: 1             # Policy LR = lr * pi_lr_scale
-ensemble_lr_scaling: true  # Scale head LRs by ensemble size to compensate for mean-reduced gradients
-utd_ratio: 4               # World model updates per environment step
-value_update_freq: 2        # Value updates per env step. -1 = same as utd_ratio.
-pi_update_freq: 1           # Policy updates per env step.
-
-# ===========================================================================
-# Loss Coefficients
-# ===========================================================================
-reward_coef: 0.1
-value_coef: 0.1
-consistency_coef: 10
-termination_coef: 1
-policy_coef: 1
-encoder_consistency_coef: 0
-encoder_consistency_warmup_ratio: 0.0
-imagine_value_loss_coef_mult: 1
-
-# ===========================================================================
-# Architecture
+#  2. Architecture
 # ===========================================================================
 model_size: ???
 latent_dim: 512
@@ -73,9 +32,7 @@ vmax: +10
 dropout: 0.01
 encoder_dropout: 0.0  # When > 0, encodes twice (train + eval mode for stable targets)
 
-# ===========================================================================
-# Ensemble (Dynamics, Reward, Value)
-# ===========================================================================
+# --- Ensemble sizes & per-head architecture ---
 planner_num_dynamics_heads: 4
 num_q: 8
 num_reward_heads: 1
@@ -87,41 +44,78 @@ value_dim_div: 1
 num_value_layers: 2
 reward_dropout_enabled: false
 
-# ===========================================================================
-# Prior Networks (frozen random priors for ensemble diversity)
-# ===========================================================================
+# --- Prior networks (frozen random priors for ensemble diversity) ---
 prior_hidden_div: 16   # prior_hidden_dim = network_hidden_dim // div
 prior_scale: 0.1       # Per-dimension perturbation magnitude. 0 = no prior.
 prior_logit_scale: 1.0 # Multiplier for prior two-hot logits
 
 # ===========================================================================
-# Critic & TD Targets
+#  3. Optimizer & Learning Rates
 # ===========================================================================
-critic_type: V  # Only 'V' is implemented.
+lr: 3e-4
+optimizer_type: adamw  # 'adam' or 'adamw'
+weight_decay: 0  # Weight decay for AdamW (ignored for Adam)
+grad_clip_norm: 20
+tau: 0.003  # EMA rate for target networks
+enc_lr_scale: 0.3
+# Encoder LR step-change schedule:
+#   At (1 - enc_lr_step_ratio) * steps, encoder LR *= enc_lr_step_scale.
+enc_lr_step_ratio: 0.5   # Fraction of training after which to step-change LR
+enc_lr_step_scale: 1      # Multiplier for encoder LR after step (0.0 = freeze)
+pi_lr_scale: 1             # Policy LR = lr * pi_lr_scale
+ensemble_lr_scaling: true  # Scale head LRs by ensemble size to compensate for mean-reduced gradients
 
-# What latent states V learns on vs where TD targets start:
+# ===========================================================================
+#  4. Training Loop (update frequencies)
+# ===========================================================================
+batch_size: 256
+utd_ratio: 4               # World model updates per environment step
+value_update_freq: 2        # Value updates per env step. -1 = same as utd_ratio.
+pi_update_freq: 1           # Policy updates per env step.
+
+# ===========================================================================
+#  5. Discount & Value Estimation
+# ===========================================================================
+# --- Discount schedule ---
+discount_denom: 5
+discount_min: 0.95
+discount_max: 0.995
+rho: 0.5
+final_rho: -1  # if >0, overrides rho schedule so end-of-horizon discount = final_rho. -1 = disabled.
+
+# --- Critic type & latent source ---
+critic_type: V  # Only 'V' is implemented.
 critic_source: replay_rollout       # replay_rollout | replay_true
 critic_target_source: replay_true   # replay_true | replay_rollout
 
-# Local: each value head bootstraps itself. Global: all heads get same target.
-local_td_bootstrap: true
-
-# TD = mu + std_coef * sigma. Also accepts "opt"/"pess" strings.
-td_target_std_coef: 0
+# --- TD targets ---
+local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
+td_target_std_coef: 0     # TD = mu + std_coef * sigma. Also accepts "opt"/"pess" strings.
 td_target_dynamics_reduction: mean  # "from_std_coef" | "min" | "max" | "mean"
 td_target_use_all_dynamics_heads: true
 td_target_use_ema_policy: false
+value_std_coef_default: 1.0  # Default magnitude for "opt"/"pess" string values of std_coef.
+n_mc_samples_target: 1
 
+# --- Imagination bootstrapping ---
 imagination_horizon: 1
 detach_imagine_value: false
 ema_value_planning: false
 
-# Default magnitude for "opt"/"pess" string values of std_coef.
-value_std_coef_default: 1.0
-n_mc_samples_target: 1
+# ===========================================================================
+#  6. Loss Coefficients
+# ===========================================================================
+consistency_coef: 10
+reward_coef: 0.1
+value_coef: 0.1
+policy_coef: 1
+termination_coef: 1
+encoder_consistency_coef: 0
+encoder_consistency_warmup_ratio: 0.0
+imagine_value_loss_coef_mult: 1
 
 # ===========================================================================
-# Policy (SVG / Entropy / Parameterization)
+#  7. Policy (SVG / Entropy)
 # ===========================================================================
 policy_optimization_method: svg  # 'svg' | 'distillation' | 'both'
 bmpc_policy_parameterization: false
@@ -149,7 +143,7 @@ policy_trust_region_coef: 0.0
 policy_ema_tau: null  # null = inherit from tau
 
 # ===========================================================================
-# Planner (MPPI/CEM)
+#  8. Planner (MPPI / CEM)
 # ===========================================================================
 eval_mpc: true
 train_mpc: true
@@ -164,34 +158,27 @@ max_std: 2
 temperature: 0.5
 mult_by_temp: true
 
+# --- Planner value aggregation ---
 planner_value_std_coef_train: 0.3
 planner_value_std_coef_eval: -1
 planner_aggregate_value: false
 planner_use_all_heads_eval: true
-policy_seed_noise_std: 0.05
-planner_action_noise_std: 0.0
-greedy_train_action_selection: false
 planner_lambda_disagreement: 0
 planner_policy_elites_first_iter_only: false
 
 # ===========================================================================
-# Exploration & Rollouts
+#  9. Exploration & Rollouts
 # ===========================================================================
-train_act_std_coeff: 0
 num_rollouts: 4
 pred_from: rollout  # rollout | true_state
 buffer_update_interval: 1
+train_act_std_coeff: 0
+policy_seed_noise_std: 0.05
+planner_action_noise_std: 0.0
+greedy_train_action_selection: false
 
 # ===========================================================================
-# Dual Policy (optimistic + pessimistic)
-# ===========================================================================
-dual_policy_enabled: false
-optimistic_policy_value_std_coef: 0
-optimistic_entropy_mult: 100
-optimistic_policy_optimization_method: same
-
-# ===========================================================================
-# Evaluation
+# 10. Evaluation
 # ===========================================================================
 checkpoint: ???
 eval_episodes: 5
@@ -200,7 +187,7 @@ eval_mean_head_reduce: false
 best_eval: true
 
 # ===========================================================================
-# Replay Buffer
+# 11. Replay Buffer
 # ===========================================================================
 buffer_size: 1000_000
 hot_buffer_enabled: false
@@ -210,7 +197,7 @@ pin_memory: true
 prefetch: 1
 
 # ===========================================================================
-# Logging & W&B
+# 12. Logging & W&B
 # ===========================================================================
 wandb_project: tdmpc2-tdmpc2
 wandb_entity: thomasevers9
@@ -226,7 +213,15 @@ exp_name: default
 data_dir: ???
 
 # ===========================================================================
-# Reanalyze / Distillation (mostly unused with SVG baseline)
+# 13. Dual Policy (optimistic + pessimistic — research feature)
+# ===========================================================================
+dual_policy_enabled: false
+optimistic_policy_value_std_coef: 0
+optimistic_entropy_mult: 100
+optimistic_policy_optimization_method: same
+
+# ===========================================================================
+# 14. Reanalyze / Distillation (mostly unused with SVG baseline)
 # ===========================================================================
 reanalyze_interval: 10
 reanalyze_batch_size: 60
@@ -248,7 +243,7 @@ fix_kl_order: false
 kl_scale_min: 0.1
 
 # ===========================================================================
-# Multi-Gamma Auxiliary Value Supervision (Research Feature)
+# 15. Multi-Gamma Auxiliary Value Supervision (research feature)
 # ===========================================================================
 multi_gamma_gammas: [0.9, 0.95]
 joint_aux_dim_mult: 1
@@ -259,7 +254,7 @@ multi_gamma_log_num_examples: 4
 auxiliary_value_ema: true
 
 # ===========================================================================
-# Environment-Specific
+# 16. Environment-Specific
 # ===========================================================================
 episodic: false
 knn_entropy_k: 5
@@ -269,7 +264,7 @@ distracted_difficulty: medium
 davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/envs/custom_envs/distracting_control/DAVIS/JPEGImages/480p
 
 # ===========================================================================
-# Deprecated / Legacy (no effect)
+# 17. Deprecated / Legacy (no effect)
 # ===========================================================================
 sac_style_td: false
 hinge_power: 4
@@ -293,7 +288,7 @@ seed_steps: ???
 bin_size: ???
 
 # ===========================================================================
-# Hydra logging and run directory configuration
+# Hydra
 # ===========================================================================
 hydra:
     job:
