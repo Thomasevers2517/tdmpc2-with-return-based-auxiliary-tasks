@@ -524,187 +524,134 @@ class TDMPC2(torch.nn.Module):
 			return torch.tensor(0.0, device=device or torch.device('cuda:0'))
 		return torch.sqrt(accum)
 
-	def calc_hinge_loss(self, presquash_mean: torch.Tensor, rho_pows: torch.Tensor) -> torch.Tensor:
-		"""Hinge^p penalty on pre-squash mean μ, aggregated with same time-weighting as policy loss.
-
-		Args:
-			presquash_mean: Tensor of shape (T, B, A).
-			rho_pows: Tensor of shape (T,) containing rho^t weights.
-
-		Config (must exist):
-			- pi_hinge_power (int)
-			- pi_hinge_tau (float)
-			- pi_hinge_lambda (float) [not used here, applied at caller]
-		"""
-		p = int(self.cfg.hinge_power)
-		tau = float(self.cfg.hinge_tau)
-		if self.cfg.pred_from == "rollout":
-			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))  # (T,)
-			return (hinge_t * rho_pows).mean()
-		else:  # true_state
-			hinge_t = F.relu(presquash_mean.abs() - tau).pow(p).mean(dim=(1, 2))
-			return hinge_t.mean() * rho_pows.mean()
-
 	def calc_pi_losses(self, z, task, optimistic=False):
-		"""
-		Compute policy loss using state-value function V(s).
-		
+		"""Compute policy loss using state-value function V(s) with per-head dynamics.
+
 		For V-learning, we maximize: r(z, a) + γ * V(z') + entropy_bonus
 		where z' is reached by taking action a from policy pi(z) and rolling
 		through dynamics. The dynamics, reward, and value function are frozen
 		during policy optimization (SAC-style backprop through frozen model).
-		
-		CORRECT OPTIMISM: For each dynamics head h, compute:
-		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std)
-		  Q_h = μ_h + value_std_coef × σ_h
-		Then reduce over dynamics heads:
-		  value_std_coef > 0: max over H (optimistic)
-		  value_std_coef < 0: min over H (pessimistic)
-		  value_std_coef = 0: mean over H (neutral)
-		
-		When num_rollouts > 1, samples multiple actions per state to reduce
-		variance in policy gradients.
-		
+
+		Each dynamics head h processes only its own latents z[:, h] via
+		``split_data=True``, ensuring head-specific rollout states are
+		propagated by the correct dynamics head.
+
+		Reward ensemble (R heads) and value ensemble (Ve heads) provide
+		uncertainty within each (h, t, b, n) sample. If ``value_std_coef != 0``,
+		the per-sample Q is shifted by reward+value ensemble std.
+
 		Args:
-			z (Tensor[T, B, L]): Current latent states.
+			z (Tensor[T+1, H, B, L]): Per-head latent states from dynamics rollout.
 			task: Task identifier for multitask setup.
 			optimistic: If True, use optimistic policy with +1.0 std_coef and
 				scaled entropy. If False, use pessimistic policy with -1.0 std_coef.
-			
+
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
 		"""
-		T, B, L = z.shape
-		# Number of action samples per state: num_rollouts if pi_multi_rollout enabled, else 1
+		assert z.ndim == 4, f"Expected z: [T+1, H, B, L], got {z.shape}"
+		T_plus_1, H, B, L = z.shape
+		T = T_plus_1 - 1
 		N = int(self.cfg.num_rollouts) if self.cfg.pi_multi_rollout else 1
-		
-		# Ensure contiguity for torch.compile compatibility
-		z = z.contiguous()  # Required: z may be non-contiguous after detach/indexing ops
-		
+		B_eff = H * B  # effective batch with all heads flattened
+
+		z = z[:-1].contiguous()  # float32[T, H, B, L]
+
 		# Select std_coef based on optimistic flag
 		if optimistic:
-			value_std_coef = self.cfg.optimistic_policy_value_std_coef  # +1.0 for optimistic
+			value_std_coef = self.cfg.optimistic_policy_value_std_coef
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
 		else:
-			value_std_coef = self.cfg.policy_value_std_coef  # -1.0 for pessimistic
+			value_std_coef = self.cfg.policy_value_std_coef
 			entropy_coeff = self.dynamic_entropy_coeff
-			
+
 		with maybe_range('Agent/update_pi', self.cfg):
-			# Expand z to have N rollouts: [T, B, L] -> [T, B, N, L] -> [T, B*N, L]
-			# This allows sampling N different actions per state for variance reduction
-			z_expanded = z.unsqueeze(2).expand(T, B, N, L).reshape(T, B * N, L)  # float32[T, B*N, L]
-			
-			# Sample action from policy at current state (policy has gradients)
-			# Due to stochasticity, each of the N copies gets a different action
-			action, info = self.model.pi(z_expanded, task, optimistic=optimistic)  # action: float32[T, B*N, A]
-			
-			# Flatten for model calls
-			z_flat = z_expanded.view(T * B * N, L)              # float32[T*B*N, L]
-			action_flat = action.view(T * B * N, -1)  # float32[T*B*N, A]
-			
-			# Get discount factor
+			# Flatten H into batch for policy: [T, H*B, L]
+			z_for_pi = z.reshape(T, B_eff, L)  # float32[T, H*B, L]
+
+			# Expand with N rollouts: [T, H*B*N, L]
+			z_expanded = z_for_pi.unsqueeze(2).expand(T, B_eff, N, L).reshape(T, B_eff * N, L)
+
+			# Sample action from policy (policy has gradients)
+			action, info = self.model.pi(z_expanded, task, optimistic=optimistic)  # float32[T, H*B*N, A]
+			A = action.shape[-1]
+
+			# ---- Task handling ----
 			if self.cfg.multitask:
-				task_flat = task.repeat(T * N) if task is not None else None
-				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*B*N, 1]
-				gamma_scalar = self.discount.mean().item()  # for std discounting
+				# task: [B] → expand to [H*B] then repeat for T*N → [T*H*B*N]
+				task_hb = task.unsqueeze(0).expand(H, B).reshape(B_eff)  # float32[H*B]
+				task_flat = task_hb.repeat(T * N)  # float32[T*H*B*N]
+				gamma = self.discount[task_flat].unsqueeze(-1)  # float32[T*H*B*N, 1]
+				gamma_scalar = self.discount.mean().item()
 			else:
+				task_hb = None
 				task_flat = None
 				gamma = self.discount  # scalar tensor
 				gamma_scalar = float(self.discount)
-			
-			# Predict reward r(z, a) from ALL reward heads
-			# reward() returns distributional logits [R, T*B*N, K], convert to scalar
-			reward_logits_all = self.model.reward(z_flat, action_flat, task_flat, head_mode='all')  # float32[R, T*B*N, K]
-			R = reward_logits_all.shape[0]  # number of reward heads
-			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*B*N, 1]
-			
-			# Roll through ALL dynamics heads to get next states z'
-			next_z_all = self.model.next(z_flat, action_flat, task_flat)  # float32[H, T*B*N, L]
-			H = next_z_all.shape[0]  # number of dynamics heads
-			
-			# Evaluate V(z') for each dynamics head using ALL Ve value heads
-			# Reshape to evaluate all heads at once: [H*T*B*N, L]
-			next_z_all_flat = next_z_all.view(H * T * B * N, L)  # float32[H*T*B*N, L]
-			task_flat_expanded = task_flat.repeat(H) if task_flat is not None else None
-			# return_type='all_values' returns [Ve, H*T*B*N, 1] for all Ve heads
-			v_next_all_flat = self.model.V(next_z_all_flat, task_flat_expanded, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-			Ve = v_next_all_flat.shape[0]  # number of value heads
-			v_next_all = v_next_all_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
-			
-			# CORRECT OPTIMISM: Compute per dynamics head
-			# reward_all: [R, T*B*N, 1] - same reward for all dynamics heads
-			# v_next_all: [Ve, H, T*B*N, 1] - different values per dynamics head
-			
-			# Reward mean and std across R reward heads (same for all dynamics heads)
-			reward_mean = reward_all.mean(dim=0)  # float32[T*B*N, 1]
-			reward_std = reward_all.std(dim=0, unbiased=(R > 1))  # float32[T*B*N, 1]
-			
-			# Value mean and std across Ve value heads, per dynamics head h
-			v_mean_per_h = v_next_all.mean(dim=0)  # float32[H, T*B*N, 1]
-			v_std_per_h = v_next_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
-			
-			# Q_h = (r_mean + γ * v_mean_h) + std_coef * (r_std + γ * v_std_h)
-			# Total mean per dynamics head: μ_h = r_mean + γ * v_mean_h
-			q_mean_per_h = reward_mean + gamma * v_mean_per_h  # float32[H, T*B*N, 1]
-			
-			# Total std per dynamics head: σ_h = r_std + γ * v_std_h
-			q_std_per_h = reward_std + gamma_scalar * v_std_per_h  # float32[H, T*B*N, 1]
-			
-			# Q_h = μ_h + std_coef * σ_h
-			q_per_h = q_mean_per_h + value_std_coef * q_std_per_h  # float32[H, T*B*N, 1]
-			
-			# Reduce over dynamics heads based on sign of value_std_coef
-			if value_std_coef > 0:
-				# Optimistic: max over dynamics heads
-				q_estimate_flat, _ = q_per_h.max(dim=0)  # float32[T*B*N, 1]
-			elif value_std_coef < 0:
-				# Pessimistic: min over dynamics heads
-				q_estimate_flat, _ = q_per_h.min(dim=0)  # float32[T*B*N, 1]
-			else:
-				# Neutral: mean over dynamics heads
-				q_estimate_flat = q_per_h.mean(dim=0)  # float32[T*B*N, 1]
-			
-			q_estimate = q_estimate_flat.view(T, B * N, 1)  # float32[T, B*N, 1]
-			
-			# For logging: std across dynamics heads (disagreement)
-			q_std = q_per_h.std(dim=0, unbiased=(H > 1))  # float32[T*B*N, 1]
-			
-			# Update scale with the Q-estimate (first timestep batch for stability)
-			# NOTE: Only update scale for pessimistic policy to avoid inplace op conflict
-			# when computing both policies in a single backward pass.
+
+			# ---- Reward r(z, a) from ALL R reward heads ----
+			z_rew_flat = z_expanded.view(T * B_eff * N, L)   # float32[T*H*B*N, L]
+			a_rew_flat = action.view(T * B_eff * N, A)        # float32[T*H*B*N, A]
+			reward_logits_all = self.model.reward(z_rew_flat, a_rew_flat, task_flat, head_mode='all')  # float32[R, T*H*B*N, K]
+			R = reward_logits_all.shape[0]
+			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H*B*N, 1]
+
+			# ---- Dynamics with split_data=True ----
+			# Reshape so head dim is leading: [H, T*B*N, L] and [H, T*B*N, A]
+			z_for_dyn = z_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
+			a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
+			# task for split_data: [T*B*N] (NOT multiplied by H; each head gets its slice)
+			task_dyn = task_hb[:B].repeat(T * N) if self.cfg.multitask else None  # float32[T*B*N]  (base B per head)
+			next_z_all = self.model.next(z_for_dyn, a_for_dyn, task_dyn, split_data=True)  # float32[H, T*B*N, L]
+
+			# ---- V(z') for all Ve value heads ----
+			next_z_flat = next_z_all.reshape(H * T * B * N, L)  # float32[H*T*B*N, L]
+			task_flat_v = task_flat if task_flat is not None else None
+			# Reorder task to match [H, T*B*N] → [H*T*B*N] layout
+			if self.cfg.multitask:
+				task_flat_v = task_dyn.unsqueeze(0).expand(H, T * B * N).reshape(H * T * B * N)
+			v_next_flat = self.model.V(next_z_flat, task_flat_v, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
+			Ve = v_next_flat.shape[0]
+			# Reshape to [Ve, H, T*B*N, 1] then reorder to match reward layout [Ve, T*H*B*N, 1]
+			v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
+			# Permute to align with reward: [Ve, T, H, B*N, 1] → [Ve, T*H*B*N, 1]
+			v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+
+			# ---- Q estimate per sample ----
+			# reward_all: [R, T*H*B*N, 1], v_next: [Ve, T*H*B*N, 1]
+			reward_mean = reward_all.mean(dim=0)                         # float32[T*H*B*N, 1]
+			reward_std = reward_all.std(dim=0, unbiased=(R > 1))         # float32[T*H*B*N, 1]
+			v_mean = v_next_reord.mean(dim=0)                            # float32[T*H*B*N, 1]
+			v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))           # float32[T*H*B*N, 1]
+
+			q_mean = reward_mean + gamma * v_mean                        # float32[T*H*B*N, 1]
+			q_std = reward_std + gamma_scalar * v_std                    # float32[T*H*B*N, 1]
+			q_estimate_flat = q_mean + value_std_coef * q_std            # float32[T*H*B*N, 1]
+
+			q_estimate = q_estimate_flat.view(T, B_eff * N, 1)          # float32[T, H*B*N, 1]
+
+			# ---- Scale and loss ----
 			if not optimistic:
 				self.q_scale.update(q_estimate[0])
-			q_scaled = self.q_scale(q_estimate)  # float32[T, B*N, 1]
-			
-			# Temporal weighting
-			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+			q_scaled = self.q_scale(q_estimate)  # float32[T, H*B*N, 1]
+
+			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))
 			if self.cfg.normalize_rho_weights:
 				rho_pows = rho_pows / rho_pows.sum()
-			
-			# Entropy from policy (always use scaled_entropy with configurable action_dim power)
-			entropy_term = info["scaled_entropy"]  # float32[T, B*N, 1]
-			
-			# Policy loss: maximize (q_scaled + entropy_coeff * entropy)
-			# Uncertainty handling is now via value_std_coef in q_estimate computation
-			# Apply rho weighting across time
-			# Average over both B and N dimensions to reduce variance from multiple rollouts
-			objective = q_scaled + entropy_coeff * entropy_term  # float32[T, B*N, 1]
+
+			entropy_term = info["scaled_entropy"]  # float32[T, H*B*N, 1]
+			objective = q_scaled + entropy_coeff * entropy_term
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
-			# Add hinge^p penalty on pre-squash mean μ
-			lam = float(self.cfg.hinge_coef)
-			hinge_loss = self.calc_hinge_loss(info["presquash_mean"].view(T, B, N, -1)[:, :, 0, :], rho_pows)  # Use first rollout for hinge
-			pi_loss = pi_loss + lam * hinge_loss
-
-			# For logging, reshape and average over N rollouts
-			info_entropy = info["entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
-			info_scaled_entropy = info["scaled_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
-			info_true_entropy = info["true_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
-			info_true_scaled_entropy = info["true_scaled_entropy"].view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
-			info_mean = info["mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
-			info_log_std = info["log_std"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
-			info_presquash_mean = info["presquash_mean"].view(T, B, N, -1).mean(dim=2)  # float32[T, B, A]
-			q_estimate_avg = q_estimate.view(T, B, N, 1).mean(dim=2)  # float32[T, B, 1]
+			# ---- Logging (average over H and N) ----
+			info_entropy = info["entropy"].view(T, B_eff, N, 1).mean(dim=2)                 # float32[T, H*B, 1]
+			info_scaled_entropy = info["scaled_entropy"].view(T, B_eff, N, 1).mean(dim=2)
+			info_true_entropy = info["true_entropy"].view(T, B_eff, N, 1).mean(dim=2)
+			info_true_scaled_entropy = info["true_scaled_entropy"].view(T, B_eff, N, 1).mean(dim=2)
+			info_mean = info["mean"].view(T, B_eff, N, -1).mean(dim=2)                      # float32[T, H*B, A]
+			info_log_std = info["log_std"].view(T, B_eff, N, -1).mean(dim=2)
+			info_presquash_mean = info["presquash_mean"].view(T, B_eff, N, -1).mean(dim=2)
+			q_estimate_avg = q_estimate.view(T, B_eff, N, 1).mean(dim=2)                    # float32[T, H*B, 1]
 
 			info = TensorDict({
 				"pi_loss": pi_loss,
@@ -728,9 +675,9 @@ class TDMPC2(torch.nn.Module):
 				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate_avg.mean(),
 				"pi_reward_mean": reward_all.mean(),
-				"pi_v_next_mean": v_next_all.mean(),
-				"pi_q_std": q_std.mean(),  # Std across (Ve × H × R) - now used in q_estimate via value_std_coef
-				"pi_num_rollouts": float(N),  # Log how many rollouts used (float for mean() compatibility)
+				"pi_v_next_mean": v_next_flat.mean(),
+				"pi_q_std": q_std.mean(),
+				"pi_num_rollouts": float(N),
 			}, device=self.device)
 
 			return pi_loss, info
@@ -902,78 +849,70 @@ class TDMPC2(torch.nn.Module):
 		return tr_kl_scaled, info
 
 	def update_pi(self, zs, task, expert_action_dist=None):
-		"""
-		Update policy using a sequence of latent states.
-		
+		"""Update policy using a sequence of per-head latent states.
+
 		Supports policy optimization methods:
-		- 'svg': Backprop through world model (calc_pi_losses)
-		- 'distillation': KL divergence to expert planner targets (calc_pi_distillation_losses)
+		- 'svg': Backprop through world model (calc_pi_losses) — uses all H heads
+		- 'distillation': KL divergence to expert planner targets — uses head-0
 		- 'both': Sum of SVG and distillation losses (pessimistic only)
-		
-		Pessimistic policy uses cfg.policy_optimization_method.
-		Optimistic policy uses cfg.optimistic_policy_optimization_method (svg or distillation).
 
 		Args:
-			zs (torch.Tensor): Sequence of latent states [T+1, B, L].
-			task (torch.Tensor): Task index (only used for multi-task experiments).
-			expert_action_dist (torch.Tensor): Expert action distributions [T, B, A, 2].
-				Required when policy_optimization_method is 'distillation' or 'both',
-				or when optimistic_policy_optimization_method is 'distillation'.
+			zs (Tensor[T+1, H, B, L]): Per-head latent states from dynamics rollout.
+			task: Task index (only used for multi-task experiments).
+			expert_action_dist (Tensor[T, B, A, 2] | None): Expert action distributions.
 
 		Returns:
-			Tuple[float, TensorDict]: Total policy loss and info dict.
+			Tuple[Tensor, TensorDict]: Total policy loss and info dict.
 		"""
+		assert zs.ndim == 4, f"Expected zs: [T+1, H, B, L], got {zs.shape}"
+		# For distillation / trust region (no dynamics), use head-0 only
+		zs_head0 = zs[:, 0]  # float32[T+1, B, L]
+
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 		method = str(self.cfg.policy_optimization_method).lower()
-		
-		# Optimistic method: 'same' means use same as pessimistic
+
 		opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
 		opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
-		
-		# Validate expert_action_dist is provided when needed
+
 		needs_expert = method in ('distillation', 'both') or (
 			self.cfg.dual_policy_enabled and opti_method == 'distillation'
 		)
 		if needs_expert:
 			assert expert_action_dist is not None, \
 				f"expert_action_dist required for policy_optimization_method='{method}' or optimistic_policy_optimization_method='{opti_method}'"
-		
+
 		# Compute losses based on method (pessimistic policy)
 		if method == 'svg':
-			# Pure SVG: backprop through world model
 			pi_loss, info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
-			
+
 		elif method == 'distillation':
-			# Pure distillation: KL to expert targets (pessimistic policy only)
-			pi_loss, info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
-			
+			assert zs_head0.ndim == 3, f"distillation uses head-0 only: expected [T+1, B, L], got {zs_head0.shape}"
+			pi_loss, info = self.calc_pi_distillation_losses(zs_head0, expert_action_dist, task)
+
 		elif method == 'both':
-			# Combined: SVG + distillation with configurable ratio
-			# ratio=0 -> pure SVG, ratio=1 -> pure distillation
+			assert zs_head0.ndim == 3, f"distillation uses head-0 only: expected [T+1, B, L], got {zs_head0.shape}"
 			svg_loss, svg_info = self.calc_pi_losses(zs, task, optimistic=False) if (not log_grads or not self.cfg.compile) else self.calc_pi_losses_eager(zs, task)
-			distill_loss, distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task)
-			
+			distill_loss, distill_info = self.calc_pi_distillation_losses(zs_head0, expert_action_dist, task)
+
 			ratio = self.cfg.policy_svg_distill_ratio
 			pi_loss = (1.0 - ratio) * svg_loss + ratio * distill_loss
 			info = svg_info
 			info['svg_distill_ratio'] = ratio
-			# Merge distillation info with prefix
 			for k, v in distill_info.items():
 				info[f'distill_{k}'] = v
 		else:
 			raise ValueError(f"Unknown policy_optimization_method: '{method}'. Use 'svg', 'distillation', or 'both'.")
-		
+
 		# Optimistic policy loss (if dual policy enabled)
 		if self.cfg.dual_policy_enabled:
 			if opti_method == 'svg':
 				opti_pi_loss, opti_info = self.calc_pi_losses(zs, task, optimistic=True)
 			elif opti_method == 'distillation':
-				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
+				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(zs_head0, expert_action_dist, task, optimistic=True)
 			elif opti_method == 'both':
-				# Combined: SVG + distillation for optimistic with configurable ratio
 				opti_svg_loss, opti_svg_info = self.calc_pi_losses(zs, task, optimistic=True)
-				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(zs, expert_action_dist, task, optimistic=True)
-				
+				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(zs_head0, expert_action_dist, task, optimistic=True)
+
 				ratio = self.cfg.policy_svg_distill_ratio
 				opti_pi_loss = (1.0 - ratio) * opti_svg_loss + ratio * opti_distill_loss
 				opti_info = opti_svg_info
@@ -995,13 +934,13 @@ class TDMPC2(torch.nn.Module):
 		trust_region_coef = float(self.cfg.policy_trust_region_coef)
 		if trust_region_coef > 0:
 			# Pessimistic policy trust region (also updates scale)
-			tr_kl_scaled, tr_info = self.calc_trust_region_kl_loss(zs, task, optimistic=False)
+			tr_kl_scaled, tr_info = self.calc_trust_region_kl_loss(zs_head0, task, optimistic=False)
 			pi_loss = pi_loss + trust_region_coef * tr_kl_scaled
 			info.update(tr_info)
 			
 			# Optimistic policy trust region (uses same scale, no update)
 			if self.cfg.dual_policy_enabled:
-				opti_tr_kl_scaled, opti_tr_info = self.calc_trust_region_kl_loss(zs, task, optimistic=True)
+				opti_tr_kl_scaled, opti_tr_info = self.calc_trust_region_kl_loss(zs_head0, task, optimistic=True)
 				pi_loss = pi_loss + trust_region_coef * opti_tr_kl_scaled
 				info.update(opti_tr_info)
 		
@@ -1228,17 +1167,27 @@ class TDMPC2(torch.nn.Module):
 
 	def world_model_losses(self, z_true, z_target, action, reward, terminated, task=None):
 		"""Compute world-model losses (consistency, reward, termination).
-		
+
+		Reward and termination heads are trained on rollout latents from ALL
+		dynamics heads.  The full ``[T+1, H, B, L]`` rollout is returned so
+		that callers (value loss, policy) can decide how to consume the head
+		dimension via ``rollout_head_strategy``.
+
 		Args:
-			z_true: Encoded latents with gradients [T+1, B, L]
-			z_target: Stable latents for consistency targets (eval mode, no dropout) [T+1, B, L], 
-			          or None if encoder_dropout == 0
-			action: Actions [T, B, A]
-			reward: Rewards [T, B, 1]
-			terminated: Termination flags [T, B, 1]
-			task: Optional task indices
+			z_true (Tensor[T+1, B, L]): Encoded latents with gradients.
+			z_target (Tensor[T+1, B, L] | None): Stable encoder targets (eval mode).
+			action (Tensor[T, B, A]): Replay actions.
+			reward (Tensor[T, B, 1]): Replay rewards.
+			terminated (Tensor[T, B, 1]): Termination flags.
+			task: Optional task indices.
+
+		Returns:
+			Tuple[Tensor, TensorDict, Tensor]:
+				wm_loss       – scalar weighted sum of all WM losses.
+				info          – logging dict.
+				z_rollout     – float32[T+1, H, B, L] dynamics rollout (all heads).
 		"""
-		T, B, _ = action.shape
+		T, B, A = action.shape
 		device = z_true.device
 		dtype = z_true.dtype
 
@@ -1246,190 +1195,104 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.normalize_rho_weights:
 			rho_pows = rho_pows / rho_pows.sum()
 
-		consistency_losses = torch.zeros(T, device=device, dtype=dtype)
-		encoder_consistency_losses = torch.zeros(T, device=device, dtype=dtype)
-		
-		# Compute latent variance across batch (collapse detection metric)
-		# Take first timestep z_true[0]: [B, L], compute variance per dimension, then mean
-		# TODO: Could use simplex-wise cross-entropy instead of MSE for consistency loss
+		# Collapse detection metric
 		latent_batch_variance = z_true[0].var(dim=0).mean()  # float32[]
-		
-		# Use z_target for consistency targets if available (when encoder has dropout),
-		# otherwise fall back to z_true
+
+		# Stable consistency target (eval-mode encode when dropout > 0)
 		z_consistency_target = z_target if z_target is not None else z_true
 
+		# -----------------------------------------------------------------
+		# 1. Dynamics rollout  (all H heads, vectorised)
+		# -----------------------------------------------------------------
 		with maybe_range('Agent/world_model_rollout', self.cfg):
-			# Use vectorized multi-head rollout over provided actions
-			actions_in = action.permute(1, 0, 2).unsqueeze(1)  # [B,1,T,A]
+			actions_in = action.permute(1, 0, 2).unsqueeze(1)  # float32[B, 1, T, A]
 			lat_all, _ = self.model.rollout_latents(
-				z_true[0], actions=actions_in, use_policy=False, task=task
-			)  # lat_all: [H,B,1,T+1,L]
-			# Consistency over heads: average MSE across heads and batch per time step
-			# Align dims to [H,T,B,L] for both predicted and true latents
-			with maybe_range('WM/consistency', self.cfg):
-				pred_TBL = lat_all[:, :, 0, 1:, :].permute(0, 2, 1, 3)  # float32[H,T,B,L]
-				# Use stable targets (z_target) for consistency loss when encoder has dropout
-				target_TBL = z_consistency_target[1:].unsqueeze(0)  # [1,T,B,L]
-				delta = pred_TBL - target_TBL.detach()
-				delta_enc = pred_TBL.detach() - z_consistency_target[1:].unsqueeze(0)
-				consistency_losses = (delta.pow(2).mean(dim=(0, 2, 3)))  # float32[T]
-				encoder_consistency_losses = (delta_enc.pow(2).mean(dim=(0, 2, 3)))  # [T]
-			# For downstream consumers expecting a single rollout tensor, expose head-0 rollout
-			z_rollout = lat_all[0, :, 0].permute(1, 0, 2)  # float32[T+1,B,L]
+				z_true[0], actions=actions_in, use_policy=False, task=task,
+			)  # float32[H, B, 1, T+1, L]
+
+		# Drop the N=1 rollout dim → z_rollout: float32[H, B, T+1, L]
+		z_rollout = lat_all[:, :, 0]
+		H = z_rollout.shape[0]
+		L = z_rollout.shape[-1]
+
+		# Canonical views used below  (no copies, just permutes)
+		# z_curr: float32[H, T, B, L]   –  predicted latents at t=0..T-1
+		# z_next: float32[H, T, B, L]   –  predicted latents at t=1..T
+		z_curr = z_rollout[:, :, :-1, :].permute(0, 2, 1, 3)  # float32[H, T, B, L]
+		z_next = z_rollout[:, :, 1:, :].permute(0, 2, 1, 3)   # float32[H, T, B, L]
+
+		# -----------------------------------------------------------------
+		# 2. Consistency loss  (dynamics vs encoder, averaged over H)
+		# -----------------------------------------------------------------
+		with maybe_range('WM/consistency', self.cfg):
+			target_TBL = z_consistency_target[1:].unsqueeze(0)  # float32[1, T, B, L]
+			delta = z_next - target_TBL.detach()
+			delta_enc = z_next.detach() - target_TBL
+			consistency_losses = delta.pow(2).mean(dim=(0, 2, 3))          # float32[T]
+			encoder_consistency_losses = delta_enc.pow(2).mean(dim=(0, 2, 3))  # float32[T]
 
 		consistency_loss = (rho_pows * consistency_losses).mean()
 		encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
-		branches = []
-		if self.cfg.pred_from == 'rollout':
-			branches.append({
-				'latents': z_rollout[:-1],
-				'next_latents': z_rollout[1:],
-				'actions': action,
-				'reward_target': reward,
-				'terminated': terminated,
-				'weight_mode': 'rollout'
-			})
-		elif self.cfg.pred_from == 'true_state':
-			branches.append({
-				'latents': z_true[:-1],
-				'next_latents': z_true[1:],
-				'actions': action,
-				'reward_target': reward,
-				'terminated': terminated,
-				'weight_mode': 'true'
-			})
+		# -----------------------------------------------------------------
+		# 3. Reward loss  (all R reward heads × H dynamics heads)
+		# -----------------------------------------------------------------
+		with maybe_range('WM/reward_term', self.cfg):
+			# Flatten H into batch for a single reward-ensemble forward pass
+			z_flat = z_curr.permute(1, 0, 2, 3).reshape(T, H * B, L)              # float32[T, H*B, L]
+			a_flat = action.unsqueeze(1).expand(T, H, B, A).reshape(T, H * B, A)   # float32[T, H*B, A]
+
+			reward_logits_all = self.model.reward(z_flat, a_flat, task, head_mode='all')  # float32[R, T, H*B, K]
+			R = reward_logits_all.shape[0]
+			K = self.cfg.num_bins
+
+			# Cross-entropy per (R, T, H, B)
+			reward_target_exp = reward.unsqueeze(0).unsqueeze(2).expand(R, T, H, B, 1)  # float32[R, T, H, B, 1]
+			rew_ce = math.soft_ce(
+				reward_logits_all.reshape(R * T * H * B, K),
+				reward_target_exp.reshape(R * T * H * B, 1),
+				self.cfg,
+			).view(R, T, H, B)  # float32[R, T, H, B]
+
+			rew_ce_per_t = rew_ce.mean(dim=(0, 2, 3))  # float32[T]
+			reward_loss = (rho_pows * rew_ce_per_t).mean()
+
+			# Reward predictions for logging
+			reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg).view(R, T, H, B, 1)  # float32[R, T, H, B, 1]
+			reward_pred = reward_pred_all.mean(dim=(0, 2))  # float32[T, B, 1]
+			reward_error = (reward_pred.detach() - reward)   # float32[T, B, 1]
+
+		# -----------------------------------------------------------------
+		# 4. Termination loss  (averaged over H dynamics heads)
+		# -----------------------------------------------------------------
+		if self.cfg.episodic:
+			z_next_flat = z_next.reshape(H * T * B, L)  # float32[H*T*B, L]
+			term_logits_flat = self.model.termination(z_next_flat, task, unnormalized=True)
+			term_logits = term_logits_flat.view(H, T, B, 1)   # float32[H, T, B, 1]
+			# BCE against shared target (broadcast over H)
+			terminated_exp = terminated.unsqueeze(0).expand(H, T, B, 1)  # float32[H, T, B, 1]
+			termination_loss = F.binary_cross_entropy_with_logits(term_logits, terminated_exp)
 		else:
-			raise ValueError(f"Unsupported pred_from='{self.cfg.pred_from}'. Must be 'rollout' or 'true_state'.")
+			term_logits = torch.zeros(H, T, B, 1, device=device, dtype=dtype)
+			termination_loss = torch.zeros((), device=device, dtype=dtype)
 
-		branch_reward_losses = []
-		branch_rew_ce = []
-		branch_term_losses = []
-		termination_logits_cache = []
-		branch_reward_error = []
-		branch_reward_pred_all = []  # Store all-heads predictions for logging
-  
-		for branch in branches:
-			latents = branch['latents']
-			actions_branch = branch['actions']
-			reward_target = branch['reward_target']
-			terminated_target = branch['terminated']
-			next_latents = branch['next_latents']
-
-			# Reward/termination losses; if rollout branch, average over dynamics heads
-			if branch['weight_mode'] == 'rollout':
-				# Prepare per-head latents: [H,T,B,L] for t..t+T-1 and next latents [H,T,B,L]
-				lat_all = lat_all  # [H,B,1,T+1,L]
-				lat_TBL = lat_all[:, :, 0, :-1, :].permute(0, 2, 1, 3)  # [H,T,B,L]
-				next_TBL = lat_all[:, :, 0, 1:, :].permute(0, 2, 1, 3)  # [H,T,B,L]
-				H_dyn = lat_TBL.shape[0]  # number of dynamics heads
-				L_lat = lat_TBL.shape[3]  # latent dimension
-				
-				with maybe_range('WM/reward_term', self.cfg):
-					# Train all reward heads in parallel using Ensemble
-					# Flatten dynamics heads into batch: [H,T,B,L] -> [T, H*B, L]
-					lat_flat = lat_TBL.permute(1, 0, 2, 3).reshape(T, H_dyn * B, L_lat)  # float32[T, H*B, L]
-					actions_expanded = actions_branch.unsqueeze(1).expand(T, H_dyn, B, -1)  # [T, H, B, A]
-					actions_flat = actions_expanded.reshape(T, H_dyn * B, -1)  # float32[T, H*B, A]
-					
-					# Get all reward head logits: [R, T, H*B, K]
-					reward_logits_all = self.model.reward(lat_flat, actions_flat, task, head_mode='all')
-					R = reward_logits_all.shape[0]  # number of reward heads
-					
-					# Compute soft cross-entropy for all R heads: [R, T, H*B, K] -> [R, T, H, B]
-					reward_target_exp = reward_target.unsqueeze(0).unsqueeze(2).expand(R, T, H_dyn, B, 1)
-					reward_target_flat = reward_target_exp.reshape(R * T * H_dyn * B, 1)  # [R*T*H*B, 1]
-					logits_flat = reward_logits_all.reshape(R * T * H_dyn * B, self.cfg.num_bins)  # [R*T*H*B, K]
-					
-					rew_ce_flat = math.soft_ce(logits_flat, reward_target_flat, self.cfg)  # [R*T*H*B]
-					rew_ce_all = rew_ce_flat.view(R, T, H_dyn, B)  # [R, T, H, B]
-					
-					# Average over reward heads, dynamics heads, and batch; keep T for rho weighting
-					rew_ce = rew_ce_all.mean(dim=(0, 2, 3))  # float32[T]
-					reward_loss_branch = (rho_pows * rew_ce).mean()
-					
-					# Expected reward prediction for error logging: average over R and H
-					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, H*B, 1]
-					reward_pred_all = reward_pred_all.view(R, T, H_dyn, B, 1)  # [R, T, H, B, 1]
-					reward_pred = reward_pred_all.mean(dim=(0, 2))  # [T, B, 1]
-					# Store for logging: average over dynamics heads -> [R, T, B, 1]
-					reward_pred_all_for_log = reward_pred_all.mean(dim=2)  # [R, T, B, 1]
-					
-					# Termination loss over dynamics heads
-					head_term_losses = []
-					for h in range(H_dyn):
-						if self.cfg.episodic:
-							term_logits_h = self.model.termination(next_TBL[h], task, unnormalized=True)
-							term_loss_h = F.binary_cross_entropy_with_logits(term_logits_h, terminated_target)
-						else:
-							term_logits_h = torch.zeros_like(reward_target)
-							term_loss_h = torch.zeros((), device=device, dtype=dtype)
-						head_term_losses.append(term_loss_h)
-					term_loss_branch = torch.stack(head_term_losses).mean()
-					
-					# Average term logits across heads if episodic (for stats only)
-					term_logits = torch.stack([self.model.termination(next_TBL[h], task, unnormalized=True)
-												  if self.cfg.episodic else torch.zeros_like(reward_target)
-												  for h in range(H_dyn)]).mean(dim=0)
-			else:
-				# True-state branch uses single (true) latents, train all reward heads
-				# Get all reward head logits: [R, T, B, K]
-				reward_logits_all = self.model.reward(latents, actions_branch, task, head_mode='all')
-				R = reward_logits_all.shape[0]
-				
-				with maybe_range('WM/reward_term', self.cfg):
-					# Compute soft cross-entropy for all R heads
-					reward_target_exp = reward_target.unsqueeze(0).expand(R, T, B, 1)  # [R, T, B, 1]
-					reward_target_flat = reward_target_exp.reshape(R * T * B, 1)  # [R*T*B, 1]
-					logits_flat = reward_logits_all.reshape(R * T * B, self.cfg.num_bins)  # [R*T*B, K]
-					
-					rew_ce_flat = math.soft_ce(logits_flat, reward_target_flat, self.cfg)  # [R*T*B]
-					rew_ce_all = rew_ce_flat.view(R, T, B)  # [R, T, B]
-					
-					# Average over reward heads and batch; keep T for rho weighting
-					rew_ce = rew_ce_all.mean(dim=(0, 2))  # float32[T]
-					reward_loss_branch = (rho_pows * rew_ce).mean()
-					
-					# Expected reward prediction for error logging: average over R
-					reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg)  # [R, T, B, 1]
-					reward_pred = reward_pred_all.mean(dim=0)  # [T, B, 1]
-					reward_pred_all_for_log = reward_pred_all  # [R, T, B, 1] - already correct shape
-					
-				if self.cfg.episodic:
-					term_logits = self.model.termination(next_latents, task, unnormalized=True)
-					term_loss_branch = F.binary_cross_entropy_with_logits(term_logits, terminated_target)
-				else:
-					term_logits = torch.zeros_like(reward_target)
-					term_loss_branch = torch.zeros((), device=device, dtype=dtype)
-
-			branch_reward_losses.append(reward_loss_branch)
-			branch_rew_ce.append(rew_ce)
-			branch_term_losses.append(term_loss_branch)
-			termination_logits_cache.append(term_logits)
-			branch_reward_error.append(reward_pred.detach() - reward_target)
-			branch_reward_pred_all.append(reward_pred_all_for_log.detach())  # [R, T, B, 1]
-
-		reward_loss = torch.stack(branch_reward_losses).mean()
-		termination_loss = torch.stack(branch_term_losses).mean()
-		rew_ce_mean = torch.stack(branch_rew_ce).mean(dim=0)
-
-		# Scale losses by number of ensemble heads to restore per-head gradient magnitude.
-		# Without this, mean() over H heads dilutes gradients by 1/H per head.
-		H = int(getattr(self.cfg, 'planner_num_dynamics_heads', 1))  # dynamics heads
-		R = int(getattr(self.cfg, 'num_reward_heads', 1))  # reward heads
-
-		# Apply warmup: disable encoder consistency for first X% of training
+		# -----------------------------------------------------------------
+		# 5. Weighted total
+		# -----------------------------------------------------------------
 		warmup_ratio = getattr(self.cfg, 'encoder_consistency_warmup_ratio', 0.0)
 		warmup_steps = int(warmup_ratio * self.cfg.steps)
-		enc_consistency_warmup_scale = 0.0 if self._step < warmup_steps else 1.0
+		enc_warmup = 0.0 if self._step < warmup_steps else 1.0
 
 		wm_total = (
 			self.cfg.consistency_coef * consistency_loss
-			+ self.cfg.encoder_consistency_coef * enc_consistency_warmup_scale * encoder_consistency_loss
+			+ self.cfg.encoder_consistency_coef * enc_warmup * encoder_consistency_loss
 			+ self.cfg.reward_coef * reward_loss
 			+ self.cfg.termination_coef * termination_loss
 		)
 
+		# -----------------------------------------------------------------
+		# 6. Logging
+		# -----------------------------------------------------------------
 		info = TensorDict({
 			'consistency_losses': consistency_losses,
 			'consistency_loss': consistency_loss,
@@ -1448,38 +1311,28 @@ class TDMPC2(torch.nn.Module):
 			info.update({
 				f'consistency_loss/step{t}': consistency_losses[t],
 				f'encoder_consistency_loss/step{t}': encoder_consistency_losses[t],
-				f'reward_loss/step{t}': rew_ce_mean[t],
+				f'reward_loss/step{t}': rew_ce_per_t[t],
 			}, non_blocking=True)
-   
+
 		if self.log_detailed:
-			for idx, branch in enumerate(branches):
-				weight_mode = branch['weight_mode']
+			reward_pred_all_for_log = reward_pred_all.mean(dim=2)  # float32[R, T, B, 1]
+			for i in range(T):
+				rp_step = reward_pred_all_for_log[:, i, :, 0]  # float32[R, B]
 				info.update({
-					f'reward_loss_{weight_mode}': branch_reward_losses[idx],
-					f'reward_loss_{weight_mode}_weighted': branch_reward_losses[idx] * self.cfg.reward_coef * R,
-					f'termination_loss_{weight_mode}': branch_term_losses[idx],
-					f'termination_loss_{weight_mode}_weighted': branch_term_losses[idx] * self.cfg.termination_coef,
+					f'reward_error_abs_mean/step{i}': reward_error[i].abs().mean(),
+					f'reward_error_std/step{i}': reward_error[i].std(),
+					f'reward_error_max/step{i}': reward_error[i].abs().max(),
+					f'reward_pred_mean/step{i}': rp_step.mean(),
+					f'reward_pred_head_std/step{i}': rp_step.std(dim=0).mean(),
 				}, non_blocking=True)
-				reward_error = branch_reward_error[idx]
-				reward_pred_all = branch_reward_pred_all[idx]  # [R, T, B, 1]
-				for i in range(T):
-					# Reward prediction stats: mean and std across reward heads
-					reward_pred_step = reward_pred_all[:, i, :, 0]  # [R, B]
-					reward_pred_mean = reward_pred_step.mean()  # scalar: mean over all heads and batch
-					reward_pred_head_std = reward_pred_step.std(dim=0).mean()  # scalar: std across heads, averaged over batch
-					info.update({
-						f"reward_error_abs_mean/step{i}": reward_error[i].abs().mean(),
-						f"reward_error_std/step{i}": reward_error[i].std(),
-						f"reward_error_max/step{i}": reward_error[i].abs().max(),
-						f"reward_pred_mean/step{i}": reward_pred_mean,
-						f"reward_pred_head_std/step{i}": reward_pred_head_std,
-					}, non_blocking=True)
 
 		if self.cfg.episodic and self.log_detailed:
-			last_logits = torch.stack([logits[-1] for logits in termination_logits_cache]).mean(dim=0)
+			last_logits = term_logits[:, -1].mean(dim=0)  # float32[B, 1]
 			info.update(math.termination_statistics(torch.sigmoid(last_logits), terminated[-1]), non_blocking=True)
 
-		return wm_total, info, z_rollout, lat_all
+		# Permute z_rollout to [T+1, H, B, L] for downstream callers
+		z_rollout = z_rollout.permute(2, 0, 1, 3).contiguous()  # float32[T+1, H, B, L]
+		return wm_total, info, z_rollout
 
 	# rollout_dynamics removed; world_model.rollout_latents handles vectorized rollouts
 
@@ -1609,7 +1462,8 @@ class TDMPC2(torch.nn.Module):
 		
 		Args:
 			z_true (Tensor[S, B, L]): True encoded states from encoder.
-			z_rollout (Tensor[S, B, L] | None): WM rollout states (None if WM not updated).
+			z_rollout (Tensor[S, H, B, L] | None): Dynamics rollout from all H heads.
+				None when WM is not updated.
 			full_detach (bool): Whether to detach latents from graph.
 			update_world_model (bool): Whether WM is being updated (affects gradient flow).
 			task: Task index for multitask.
@@ -1632,17 +1486,38 @@ class TDMPC2(torch.nn.Module):
 			rho_pows = rho_pows / rho_pows.sum()
 
 		# -------------------------------------------------------------------------
+		# 0. Apply rollout_head_strategy to collapse H dim
+		# -------------------------------------------------------------------------
+		def _apply_head_strategy(z_hb):
+			"""Collapse H dim from [S, H, B, L] → [S, B_v, L] per rollout_head_strategy."""
+			strategy = self.cfg.rollout_head_strategy
+			S_in, H_in, B_in, L_in = z_hb.shape
+			if strategy == 'single':
+				return z_hb[:, 0]  # float32[S, B, L]
+			elif strategy == 'concat':
+				return z_hb.reshape(S_in, H_in * B_in, L_in)  # float32[S, H*B, L]
+			elif strategy == 'split':
+				chunk = B_in // H_in
+				assert chunk * H_in == B_in, f"B={B_in} must be divisible by H={H_in} for split strategy"
+				slices = [z_hb[:, h, h * chunk:(h + 1) * chunk] for h in range(H_in)]
+				return torch.cat(slices, dim=1)  # float32[S, B, L]
+			else:
+				raise ValueError(f"Unknown rollout_head_strategy='{strategy}'")
+
+		# -------------------------------------------------------------------------
 		# 1. Determine which states V learns to predict values for (critic_source)
 		# -------------------------------------------------------------------------
 		critic_source = self.cfg.critic_source
 		if critic_source == 'replay_rollout':
 			if z_rollout is None:
 				raise ValueError("critic_source='replay_rollout' requires z_rollout (update_world_model=True)")
-			z_for_v = z_rollout.detach() if full_detach else z_rollout  # float32[S, B, L]
+			z_for_v = _apply_head_strategy(z_rollout)  # float32[S, B_v, L]
+			z_for_v = z_for_v.detach() if full_detach else z_for_v
 		elif critic_source == 'replay_true':
 			z_for_v = z_true.detach() if full_detach else z_true  # float32[S, B, L]
 		else:
 			raise ValueError(f"critic_source must be 'replay_rollout' or 'replay_true', got '{critic_source}'")
+		B_v = z_for_v.shape[1]  # may be H*B when rollout_head_strategy='concat'
 
 		# -------------------------------------------------------------------------
 		# 2. Determine starting states for TD target imagination (critic_target_source)
@@ -1651,17 +1526,24 @@ class TDMPC2(torch.nn.Module):
 		# When z_rollout is None (WM not updated), force replay_true
 		if z_rollout is None:
 			td_source = 'replay_true'
-		
+		# concat rollout + replay_rollout imagination would blow up compute (H² paths)
+		if td_source == 'replay_rollout' and B_v != B:
+			raise ValueError(
+				f"critic_target_source='replay_rollout' incompatible with "
+				f"rollout_head_strategy='{self.cfg.rollout_head_strategy}' (B_v={B_v} != B={B}). "
+				f"Use critic_target_source='replay_true' or rollout_head_strategy='single'."
+			)
 		if td_source == 'replay_true':
 			# Gradient flow: keep attached if WM is updated, else detach
 			start_z = z_true.detach() if not update_world_model else z_true
 		elif td_source == 'replay_rollout':
-			# z_rollout[0] = encoder output, z_rollout[1:] = dynamics predictions
-			# Keep z_rollout[0] attached for encoder gradients, detach dynamics
+			# Apply same head strategy for start states
+			z_rollout_flat = _apply_head_strategy(z_rollout)  # float32[S, B_v, L]
 			if not update_world_model:
-				start_z = z_rollout.detach()
+				start_z = z_rollout_flat.detach()
 			else:
-				start_z = torch.cat([z_rollout[:1], z_rollout[1:].detach()], dim=0).contiguous()
+				# z_rollout_flat[0] = encoder output, z_rollout_flat[1:] = dynamics predictions
+				start_z = torch.cat([z_rollout_flat[:1], z_rollout_flat[1:].detach()], dim=0).contiguous()
 		else:
 			raise ValueError(f"critic_target_source must be 'replay_true' or 'replay_rollout', got '{td_source}'")
 
@@ -1693,14 +1575,15 @@ class TDMPC2(torch.nn.Module):
 		# 4. V predictions on critic_source states
 		# -------------------------------------------------------------------------
 		BN = B * N
-		# z_for_v: [S, B, L] -> expand to [T_imag, S, B, N, L] for compatibility with TD structure
-		z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B, N, L)  # float32[T_imag, S, B, N, L]
-		z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN, L)  # float32[T_imag, S, BN, L]
-		z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN, L)  # flatten for V call
+		BN_v = B_v * N  # may differ from BN when rollout_head_strategy='concat'
+		# z_for_v: [S, B_v, L] -> expand to [T_imag, S, B_v, N, L]
+		z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)  # float32[T_imag, S, B_v, N, L]
+		z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN_v, L)  # float32[T_imag, S, BN_v, L]
+		z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN_v, L)  # flatten for V call
 		
-		vs_flat = self.model.V(z_for_v_flat, task, return_type='all')  # float32[Ve, T_imag*S*BN, K]
+		vs_flat = self.model.V(z_for_v_flat, task, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
 		Ve = vs_flat.shape[0]
-		vs = vs_flat.view(Ve, T_imag, S, BN, K)  # float32[Ve, T_imag, S, BN, K]
+		vs = vs_flat.view(Ve, T_imag, S, BN_v, K)  # float32[Ve, T_imag, S, BN_v, K]
 
 		# -------------------------------------------------------------------------
 		# 5. TD targets from imagined next states
@@ -1719,15 +1602,23 @@ class TDMPC2(torch.nn.Module):
 				td_mean = td_mean_flat.view(T_imag, S, BN, 1)  # float32[T_imag, S, BN, 1]
 				td_std = td_std_flat.view(T_imag, S, BN, 1)    # float32[T_imag, S, BN, 1]
 
+				# When B_v > B (concat strategy), tile TD targets to match V predictions
+				if BN_v != BN:
+					H_mult = BN_v // BN  # e.g. H for concat
+					# [Ve, T_imag, S, BN, 1] -> [Ve, T_imag, S, H_mult*BN, 1]
+					td_targets = td_targets.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)
+					td_mean = td_mean.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
+					td_std = td_std.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
+
 		# -------------------------------------------------------------------------
 		# 6. Compute cross-entropy loss
 		# -------------------------------------------------------------------------
 		with maybe_range('Value/ce', self.cfg):
-			vs_flat_ce = vs.contiguous().view(Ve * T_imag * S * BN, K)
-			td_flat_ce = td_targets.contiguous().view(Ve * T_imag * S * BN, 1)
+			vs_flat_ce = vs.contiguous().view(Ve * T_imag * S * BN_v, K)
+			td_flat_ce = td_targets.contiguous().view(Ve * T_imag * S * BN_v, 1)
 			
-			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat_ce, self.cfg)  # float32[Ve*T_imag*S*BN]
-			val_ce = val_ce_flat.view(Ve, T_imag, S, BN)  # float32[Ve, T_imag, S, BN]
+			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat_ce, self.cfg)  # float32[Ve*T_imag*S*BN_v]
+			val_ce = val_ce_flat.view(Ve, T_imag, S, BN_v)  # float32[Ve, T_imag, S, BN_v]
 
 		# Average over Ve, T_imag, BN; keep S for rho weighting
 		val_ce_per_s = val_ce.mean(dim=(0, 1, 3))  # float32[S]
@@ -1746,7 +1637,7 @@ class TDMPC2(torch.nn.Module):
 		for s in range(S):
 			info.update({f'value_loss/replay_step{s}': val_ce_per_s[s]}, non_blocking=True)
 		
-		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN, 1]
+		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN_v, 1]
 		
 		info.update({
 			'td_target_mean': td_mean.mean(),
@@ -1765,7 +1656,7 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
 			
-			td_targets_with_n = td_targets.view(Ve, T_imag, S, B, N, 1)
+			td_targets_with_n = td_targets.view(Ve, T_imag, S, B_v, N, 1)
 			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()
 			info.update({'td_target_std_across_rollouts': td_std_across_rollouts}, non_blocking=True)
    
@@ -1954,13 +1845,13 @@ class TDMPC2(torch.nn.Module):
 		
 		# Compute WM losses if updating world model, otherwise zero loss and skip rollout
 		if update_world_model:
-			wm_loss, wm_info, z_rollout, lat_all = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
+			wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated, task)
+			# z_rollout: float32[T+1, H, B, L]
 		else:
 			# Skip WM losses: no rollout available, empty info (don't log zeros)
 			wm_loss = torch.zeros((), device=device)
-			wm_info = TensorDict({}, device=device)  # Empty - don't log anything for WM
-			z_rollout = None  # No rollout available
-			lat_all = None  # No multi-head rollout available
+			wm_info = TensorDict({}, device=device)
+			z_rollout = None
 
 		# Only compute value losses if update_value is True
 		if update_value:
@@ -2060,12 +1951,12 @@ class TDMPC2(torch.nn.Module):
 			pi_grad_norm = torch.zeros((), device=self.device)
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
-				# Policy trains on dynamics rollout states (z_rollout): [T+1, B, L]
-				# These are latents from: z[0] = encoder output, z[1:] = dynamics predictions.
-				# Using rollout states exposes policy to dynamics model predictions,
-				# which is important for planning coherence during inference.
-				# Fallback to z_true if z_rollout unavailable (update_world_model=False).
-				z_for_pi = z_rollout.detach() if z_rollout is not None else z_true.detach()  # float32[T+1, B, L]
+				# z_rollout: [T+1, H, B, L] — pass directly; calc_pi_losses handles H
+				# Fallback to z_true [T+1, B, L] → unsqueeze to [T+1, 1, B, L]
+				if z_rollout is not None:
+					z_for_pi = z_rollout.detach()  # float32[T+1, H, B, L]
+				else:
+					z_for_pi = z_true.detach().unsqueeze(1)  # float32[T+1, 1, B, L]
     
 				pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
 				pi_total = pi_loss * self.cfg.policy_coef

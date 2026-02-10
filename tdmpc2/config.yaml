@@ -34,6 +34,11 @@ encoder_dropout: 0.0  # When > 0, encodes twice (train + eval mode for stable ta
 
 # --- Ensemble sizes & per-head architecture ---
 planner_num_dynamics_heads: 4
+# How z_rollout uses dynamics heads for value/policy training:
+#   single: head-0 only (legacy, B unchanged)
+#   concat: all H heads concatenated into batch (B_eff = H*B, more data)
+#   split:  batch divided among heads (B_eff = B, each chunk from different head)
+rollout_head_strategy: single
 num_q: 8
 num_reward_heads: 1
 dynamics_num_layers: 2
@@ -168,7 +173,6 @@ planner_policy_elites_first_iter_only: false
 #  9. Exploration & Rollouts
 # ===========================================================================
 num_rollouts: 4
-pred_from: rollout  # rollout | true_state
 buffer_update_interval: 1
 train_act_std_coeff: 0
 policy_seed_noise_std: 0.05
@@ -265,9 +269,6 @@ davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/t
 # 17. Deprecated / Legacy (no effect)
 # ===========================================================================
 sac_style_td: false
-hinge_power: 4
-hinge_tau: 2.5
-hinge_coef: 0
 
 # ===========================================================================
 # Computed at parse time (do not set manually)
