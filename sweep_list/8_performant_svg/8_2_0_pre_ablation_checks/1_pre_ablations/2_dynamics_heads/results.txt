@@ -1,0 +1,15 @@
+Pre-ablation 2: Dynamics Heads
+===============================
+Sweep ID: pio4fts4
+Config:  planner_num_dynamics_heads=2 (baseline=4)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- No very negative effect from reducing to 2 heads.
+- Maybe a slight performance dip, but it also speeds things up.
+- Seems reasonable to use 2 dynamics heads instead of 4.
+
+Conclusion:
+  Promising — 2 heads may be sufficient. Speeds up training.
+  Follow-up needed: run ablation with 1 vs 2 dynamics heads, more seeds,
+  to confirm whether 2 is the sweet spot or if 1 also works.

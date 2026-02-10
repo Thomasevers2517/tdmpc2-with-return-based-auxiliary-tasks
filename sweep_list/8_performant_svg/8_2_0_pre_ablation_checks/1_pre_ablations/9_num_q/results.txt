@@ -1,0 +1,15 @@
+Pre-ablation 9: Number of Q Values
+====================================
+Sweep ID: p9roraps
+Config:  num_q in {5, 16} (baseline=8)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- num_q=16:  Hurts performance on most tasks. Does help dog-run somewhat,
+             but at the cost of significantly more compute. Not worth it.
+- num_q=5:   Seems fine. Comparable performance while being faster.
+
+Conclusion:
+  Set num_q=5. Fewer Q heads, less compute, performance maintained.
+  16 is overkill and actively hurts most tasks.
+  Aligns with the original TD-MPC2 default (which used 5).

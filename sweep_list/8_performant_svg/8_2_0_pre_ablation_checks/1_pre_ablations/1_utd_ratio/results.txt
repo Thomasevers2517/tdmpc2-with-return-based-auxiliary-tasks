@@ -1,0 +1,14 @@
+Pre-ablation 1: UTD Ratio
+=========================
+Sweep ID: 2y0g3dgg
+Config:  utd_ratio=2 (baseline=4)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Hopper-hop:      Significant negative effect. Performs notably worse with UTD=2.
+- Quadruped-walk:  No significant negative effect.
+- Dog-run:         No significant negative effect.
+
+Conclusion:
+  UTD ratio needs to be at least 4. Reducing to 2 clearly hurts hopper-hop.
+  Keep utd_ratio=4 (no change from baseline).

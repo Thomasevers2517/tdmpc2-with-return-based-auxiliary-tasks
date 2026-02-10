@@ -1,0 +1,13 @@
+Pre-ablation 4: Consistency Coefficient
+========================================
+Sweep ID: orzoode7
+Config:  consistency_coef=20 (baseline=10)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Slightly negative consequences from doubling to 20, but nothing notable.
+- Performance largely comparable to baseline.
+
+Conclusion:
+  Can set consistency_coef=20 to stay in line with the original TD-MPC2 baseline.
+  The difference is minor. Keep at 20 for simplicity / alignment with prior work.

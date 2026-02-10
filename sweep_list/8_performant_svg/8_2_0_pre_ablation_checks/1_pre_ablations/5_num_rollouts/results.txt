@@ -1,0 +1,13 @@
+Pre-ablation 5: Number of Rollouts
+====================================
+Sweep ID: 6ukbnim9
+Config:  num_rollouts=1 (baseline=4)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- No significant negative effect from reducing to 1 rollout.
+- Almost slightly better with 1 rollout in some cases.
+- Saves compute (fewer imagined rollouts per update).
+
+Conclusion:
+  Set num_rollouts=1. Performance is maintained and it saves compute.

@@ -1,0 +1,12 @@
+Pre-ablation 3: Exploration Optimism
+=====================================
+Sweep ID: cicnzqoy
+Config:  planner_value_std_coef_train in {0.6, 1.0} (baseline=0.3)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Performance about the same across all tested values (0.3, 0.6, 1.0).
+- No significant effect from increasing the optimism coefficient.
+
+Conclusion:
+  Not a sensitive hyperparameter. Keep at baseline 0.3 (no change needed).
