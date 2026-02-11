@@ -109,6 +109,84 @@ def two_hot_inv(x, cfg):
 	return symexp(x)
 
 
+def shift_scale_distribution(
+	logits: torch.Tensor,
+	cfg,
+	shift: torch.Tensor = None,
+	scale: torch.Tensor = None,
+) -> torch.Tensor:
+	"""Shift and/or scale a categorical distribution over discrete regression bins.
+
+	Given logits over K bins with centers c_i in symlog space, produces new logits
+	representing the distribution of (scale * x + shift) where x ~ P(logits).
+
+	Each source bin center c_i with probability p_i maps to a new value
+	v_i = scale * c_i + shift. The probability mass p_i is then redistributed
+	to the two neighboring target bins via linear interpolation (same scheme
+	as two-hot encoding), preserving proper probability semantics.
+
+	Operates entirely in symlog space (bin-center space). Values that fall
+	outside [vmin, vmax] after transformation are clamped to the boundary bins.
+
+	Args:
+		logits (Tensor[..., K]): Input logits over K bins.
+		cfg: Config with num_bins, vmin, vmax, bin_size.
+		shift (Tensor[..., 1] or None): Additive shift in symlog space.
+			Broadcast-compatible with logits' leading dims. None = no shift.
+		scale (Tensor[..., 1] or None): Multiplicative scale in symlog space.
+			Broadcast-compatible with logits' leading dims. None = no scale.
+
+	Returns:
+		Tensor[..., K]: Transformed logits (log-probabilities, unnormalized).
+	"""
+	K = cfg.num_bins
+	assert logits.shape[-1] == K, f"Expected last dim {K}, got {logits.shape[-1]}"
+
+	# No-op fast path
+	if shift is None and scale is None:
+		return logits
+
+	device = logits.device
+	dtype = logits.dtype
+
+	# Bin centers in symlog space: float32[K]
+	bins = torch.linspace(cfg.vmin, cfg.vmax, K, device=device, dtype=dtype)
+
+	# Transform bin centers: float32[..., K] after broadcast
+	# Start with [K], then apply scale and shift with broadcasting
+	transformed = bins  # float32[K]
+	if scale is not None:
+		transformed = scale * transformed  # float32[..., K]
+	if shift is not None:
+		transformed = transformed + shift  # float32[..., K]
+
+	# Clamp to valid bin range
+	transformed = transformed.clamp(cfg.vmin, cfg.vmax)  # float32[..., K]
+
+	# Continuous index into bin grid: which bins does each transformed value fall between?
+	bin_size = float(cfg.bin_size)
+	idx = (transformed - cfg.vmin) / bin_size  # float32[..., K], values in [0, K-1]
+	lo = idx.floor().long().clamp(0, K - 2)  # int64[..., K]
+	hi = lo + 1  # int64[..., K]
+	frac = (idx - lo.float()).clamp(0.0, 1.0)  # float32[..., K], interpolation weight for hi
+
+	# Convert input logits to probabilities
+	probs = F.softmax(logits, dim=-1)  # float32[..., K]
+
+	# Redistribute: for each source bin i with prob p_i, assign
+	#   (1 - frac_i) * p_i  to  lo_i
+	#   frac_i * p_i        to  hi_i
+	# Using scatter_add for proper accumulation
+	new_probs = torch.zeros_like(probs)  # float32[..., K]
+	new_probs.scatter_add_(-1, lo, probs * (1.0 - frac))
+	new_probs.scatter_add_(-1, hi, probs * frac)
+
+	# Convert back to logits; add epsilon to avoid log(0)
+	new_logits = torch.log(new_probs + 1e-8)  # float32[..., K]
+
+	return new_logits
+
+
 def gumbel_softmax_sample(p, temperature=1.0, dim=0):
 	"""Sample from the Gumbel-Softmax distribution."""
 	logits = p.log()

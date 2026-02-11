@@ -49,9 +49,9 @@ num_value_layers: 2
 reward_dropout_enabled: false
 
 # --- Prior networks (frozen random priors for ensemble diversity) ---
-prior_hidden_div: 16   # prior_hidden_dim = network_hidden_dim // div
-prior_scale: 0.1       # Per-dimension perturbation magnitude. 0 = no prior.
-prior_logit_scale: 1.0 # Multiplier for prior two-hot logits
+prior_hidden_div: 16          # prior_hidden_dim = network_hidden_dim // div
+dynamics_prior_scale: 0.1     # Prior perturbation for dynamics heads. 0 = no prior.
+value_prior_scale: 0.1        # Prior perturbation for reward & value heads (distributional shift). 0 = no prior.
 
 # ===========================================================================
 #  3. Optimizer & Learning Rates

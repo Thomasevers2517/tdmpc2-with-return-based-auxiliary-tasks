@@ -34,7 +34,8 @@ class WorldModel(nn.Module):
 		# Multi-head dynamics ensemble (vmap + functional_call)
 		h_total = int(cfg.planner_num_dynamics_heads)
 		prior_hidden_div = int(cfg.prior_hidden_div)
-		prior_scale = float(cfg.prior_scale)
+		dynamics_prior_scale = float(cfg.dynamics_prior_scale)
+		value_prior_scale = float(cfg.value_prior_scale)
 		dynamics_num_layers = int(cfg.dynamics_num_layers)
 		dynamics_dropout = float(cfg.dynamics_dropout)
 		dyn_heads = [
@@ -44,7 +45,7 @@ class WorldModel(nn.Module):
 				out_dim=cfg.latent_dim,
 				cfg=cfg,
 				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
+				prior_scale=dynamics_prior_scale,
 				dropout=dynamics_dropout,
 			)
 			for _ in range(h_total)
@@ -59,15 +60,13 @@ class WorldModel(nn.Module):
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = cfg.num_reward_layers
 		reward_dropout = cfg.dropout if cfg.reward_dropout_enabled else 0.0
-		prior_logit_scale = cfg.prior_logit_scale
 		reward_mlps = [
 			layers.MLPWithPrior(
 				in_dim=cfg.latent_dim + cfg.action_dim,
 				hidden_dims=num_reward_layers * [reward_hidden_dim],
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
-				prior_logit_scale=prior_logit_scale,
+				prior_scale=value_prior_scale,
 				dropout=reward_dropout,
 				distributional=True,
 				cfg=cfg,
@@ -98,8 +97,7 @@ class WorldModel(nn.Module):
 				hidden_dims=num_value_layers * [v_mlp_dim],
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
-				prior_logit_scale=prior_logit_scale,
+				prior_scale=value_prior_scale,
 				dropout=cfg.dropout,
 				distributional=True,
 				cfg=cfg,

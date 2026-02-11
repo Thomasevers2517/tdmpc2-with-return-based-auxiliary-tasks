@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import from_modules
 from copy import deepcopy
-from common.math import two_hot
+from common.math import shift_scale_distribution
 
 
 class MLPWithPrior(nn.Module):
@@ -30,9 +30,6 @@ class MLPWithPrior(nn.Module):
 		out_dim (int): Output dimension.
 		prior_hidden_div (int): Divisor for prior hidden dim (prior_hidden = hidden_dim // div).
 		prior_scale (float): Scale factor for prior scalar value. 0 = no prior.
-		prior_logit_scale (float): Multiplier for prior two-hot logits (distributional mode only).
-			Main MLP outputs logits typically in [-5, +5], while two_hot outputs [0, 1].
-			This parameter scales the two-hot output to match main MLP magnitude.
 		act: Optional activation for output layer (e.g., SimNorm for dynamics).
 		dropout (float): Dropout probability for main MLP.
 		distributional (bool): If True, prior outputs a scalar that gets two-hot encoded.
@@ -47,7 +44,6 @@ class MLPWithPrior(nn.Module):
 		out_dim: int,
 		prior_hidden_div: int = 4,
 		prior_scale: float = 1.0,
-		prior_logit_scale: float = 5.0,
 		act=None,
 		dropout: float = 0.,
 		distributional: bool = False,
@@ -55,7 +51,6 @@ class MLPWithPrior(nn.Module):
 	):
 		super().__init__()
 		self.prior_scale = prior_scale
-		self.prior_logit_scale = prior_logit_scale
 		self.out_dim = out_dim
 		self.distributional = distributional
 		self.cfg = cfg
@@ -94,42 +89,38 @@ class MLPWithPrior(nn.Module):
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""
 		Forward pass: main_mlp(x) + detach(prior_mlp(x)) * prior_scale.
-		
-		For distributional mode:
-			main_mlp(x) + two_hot(detach(prior_mlp(x)) * prior_scale)
-		
+
+		For distributional mode the prior outputs a scalar shift that is applied
+		via shift_scale_distribution, which properly redistributes probability
+		mass across bins rather than adding logits (which lacks proper
+		probabilistic semantics).
+
 		Args:
 			x (Tensor[..., in_dim]): Input tensor.
-		
+
 		Returns:
 			Tensor[..., out_dim]: Output with prior perturbation.
 		"""
 		out = self.main_mlp(x)  # float32[..., out_dim]
-		
+
 		# Note: prior_mlp is None when prior_scale=0, so this branch is static
 		# and should be optimized away by torch.compile
 		if self.prior_mlp is not None:
 			# Compute prior output and detach to prevent gradient flow.
-			# This is the key: detach() blocks gradients so prior params won't be updated,
-			# but keeps requires_grad=True which plays nicely with torch.compile + vmap.
+			# detach() blocks gradients so prior params stay fixed,
+			# but keeps requires_grad=True for torch.compile + vmap compat.
 			prior_out = self.prior_mlp(x).detach()  # float32[..., 1] if distributional else [..., out_dim]
-			
+
 			if self.distributional:
-				# Prior outputs scalar, scale it, then convert to two-hot distribution
-				# This ensures prior stays within symlog bounds [-10, 10] -> symexp ~[-22k, +22k]
-				prior_scalar = prior_out * self.prior_scale  # float32[..., 1]
-				# two_hot expects [B, 1], so flatten leading dims, apply, then reshape back
-				leading_shape = prior_scalar.shape[:-1]  # e.g., (B, T) or (B,)
-				prior_scalar_flat = prior_scalar.view(-1, 1)  # float32[N, 1]
-				prior_logits_flat = two_hot(prior_scalar_flat, self.cfg)  # float32[N, num_bins]
-				prior_logits = prior_logits_flat.view(*leading_shape, -1)  # float32[..., num_bins]
-				# Scale two_hot output to match main MLP logit magnitude
-				# two_hot outputs [0, 1], main MLP outputs ~[-5, +5], so we scale up
-				out = out + prior_logits * self.prior_logit_scale
+				# Prior outputs a scalar shift in symlog space.
+				# shift_scale_distribution redistributes the main MLP's bin
+				# probabilities so the distribution is properly shifted.
+				prior_shift = prior_out * self.prior_scale  # float32[..., 1]
+				out = shift_scale_distribution(out, self.cfg, shift=prior_shift)
 			else:
-				# Original mode: directly add scaled prior output
+				# Scalar mode: directly add scaled prior output
 				out = out + prior_out * self.prior_scale
-		
+
 		return out
 	
 	def __repr__(self):
