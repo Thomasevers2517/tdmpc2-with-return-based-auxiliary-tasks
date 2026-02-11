@@ -34,11 +34,19 @@ encoder_dropout: 0.0  # When > 0, encodes twice (train + eval mode for stable ta
 
 # --- Ensemble sizes & per-head architecture ---
 planner_num_dynamics_heads: 4
-# How z_rollout uses dynamics heads for value/policy training:
-#   single: head-0 only (legacy, B unchanged)
-#   concat: all H heads concatenated into batch (B_eff = H*B, more data)
-#   split:  batch divided among heads (B_eff = B, each chunk from different head)
-rollout_head_strategy: single
+# Model groups: bind dynamics, reward, value, and policy heads into G groups.
+# Group g owns H/G dynamics, R/G reward, Ve/G value heads.
+#   -1: G=H (one group per dynamics head, fully grouped)
+#    1: single group (all heads are peers, legacy behavior)
+# Constraints: H%G==0, R%G==0, Ve%G==0, num_pi_trajs%G==0
+num_groups: 1
+# Number of policies (P). Each policy serves G/P groups and is trained to
+# maximize the average value across all groups it serves.
+#   null: P=G (one policy per group, default)
+#    1: single policy for all groups
+#    2: two policies, each serving G/2 groups
+# Constraint: G%P==0
+num_policies: null
 num_q: 8
 num_reward_heads: 1
 dynamics_num_layers: 2
@@ -96,7 +104,7 @@ critic_target_source: replay_true   # replay_true | replay_rollout
 # --- TD targets ---
 local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
 td_target_std_coef: 0     # TD = mu + std_coef * sigma. Also accepts "opt"/"pess" strings.
-td_target_dynamics_reduction: mean  # "from_std_coef" | "min" | "max" | "mean"
+td_target_dynamics_reduction: mean  # Used only by _td_target_aux. _td_target always uses mean.
 td_target_use_ema_policy: false
 value_std_coef_default: 1.0  # Default magnitude for "opt"/"pess" string values of std_coef.
 n_mc_samples_target: 1

@@ -11,6 +11,9 @@ from common.nvtx_utils import maybe_range
 from tensordict import TensorDict
 from tensordict.nn import TensorDictParams
 
+from common.logger import get_logger
+log = get_logger(__name__)
+
 
 class WorldModel(nn.Module):
 	"""
@@ -48,10 +51,57 @@ class WorldModel(nn.Module):
 			for i in range(len(cfg.tasks)):
 				self._action_masks[i, :cfg.action_dims[i]] = 1.
 		self._encoder = layers.enc(cfg)
+
+		# -----------------------------------------------------------------
+		# Model groups: resolve num_groups and validate divisibility
+		# -----------------------------------------------------------------
+		h_total = int(cfg.planner_num_dynamics_heads)
+		num_reward_heads = int(cfg.num_reward_heads)
+		num_value_heads = int(cfg.num_q)
+		G = int(cfg.num_groups)
+		if G == -1:
+			G = h_total  # fully grouped: one group per dynamics head
+		assert G >= 1, f"num_groups must be >= 1 or -1, got {G}"
+		assert h_total % G == 0, (
+			f"planner_num_dynamics_heads={h_total} must be divisible by num_groups={G}")
+		assert num_reward_heads % G == 0, (
+			f"num_reward_heads={num_reward_heads} must be divisible by num_groups={G}")
+		assert num_value_heads % G == 0, (
+			f"num_q={num_value_heads} must be divisible by num_groups={G}")
+		# Store resolved group dimensions on cfg for downstream access
+		cfg.num_groups = G
+		cfg.heads_per_group = h_total // G      # H_g
+		cfg.reward_heads_per_group = num_reward_heads // G  # R_g
+		cfg.value_heads_per_group = num_value_heads // G    # Ve_g
+		self.G = G
+		self.H_g = cfg.heads_per_group
+		self.R_g = cfg.reward_heads_per_group
+		self.Ve_g = cfg.value_heads_per_group
+
+		# -----------------------------------------------------------------
+		# Number of policies: P policies serve G groups (P <= G, G % P == 0)
+		# -----------------------------------------------------------------
+		num_policies_raw = cfg.get('num_policies', None)
+		if num_policies_raw is None or num_policies_raw == 'None':
+			P = G  # Default: one policy per group
+		else:
+			P = int(num_policies_raw)
+		assert P >= 1, f"num_policies must be >= 1, got {P}"
+		assert G % P == 0, (
+			f"num_groups={G} must be divisible by num_policies={P}")
+		cfg.num_policies = P
+		cfg.groups_per_policy = G // P
+		self.P = P
+		self.groups_per_policy = cfg.groups_per_policy
+
+		log.info(
+			'Model groups: G=%d, H_g=%d (H=%d), R_g=%d (R=%d), Ve_g=%d (Ve=%d), P=%d (groups_per_policy=%d)',
+			G, self.H_g, h_total, self.R_g, num_reward_heads, self.Ve_g, num_value_heads, P, self.groups_per_policy,
+		)
+
 		# Multi-head dynamics ensemble: vectorized via Ensemble (vmap + functional_call).
 		# NOTE: We apply weight_init to each head before wrapping in Ensemble because
 		# Ensemble stores params in TensorDictParams which self.apply() does not traverse.
-		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
 		# Unified prior config for ensemble diversity
 		prior_hidden_div = int(cfg.prior_hidden_div)
 		prior_scale = float(cfg.prior_scale)
@@ -109,9 +159,31 @@ class WorldModel(nn.Module):
 			num_reward_layers * [reward_hidden_dim],
 			1
 		) if cfg.episodic else None
-		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
-		# Optimistic policy for dual-policy architecture (same architecture as _pi)
-		self._pi_optimistic = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim) if cfg.dual_policy_enabled else None
+		# -----------------------------------------------------------------
+		# Per-policy policy networks: Ensemble(P) so each policy serves G/P groups.
+		# When P=G this is one policy per group (current behavior).
+		# When P<G, multiple groups share each policy network. The policy
+		# is trained to maximize the average value across all groups it serves.
+		# -----------------------------------------------------------------
+		pi_in_dim = cfg.latent_dim + cfg.task_dim
+		pi_out_dim = 2 * cfg.action_dim
+		pi_mlps = [layers.mlp(pi_in_dim, 2 * [cfg.mlp_dim], pi_out_dim) for _ in range(P)]
+		for pi_mlp in pi_mlps:
+			pi_mlp.apply(init.weight_init)
+		self._pi_groups = layers.Ensemble(pi_mlps)
+		# Backward-compat alias used in optimizer param groups and __repr__
+		self._pi = self._pi_groups
+
+		# Optimistic per-policy policy for dual-policy architecture
+		if cfg.dual_policy_enabled:
+			pi_opti_mlps = [layers.mlp(pi_in_dim, 2 * [cfg.mlp_dim], pi_out_dim) for _ in range(P)]
+			for pi_mlp in pi_opti_mlps:
+				pi_mlp.apply(init.weight_init)
+			self._pi_optimistic_groups = layers.Ensemble(pi_opti_mlps)
+		else:
+			self._pi_optimistic_groups = None
+		# Backward-compat alias
+		self._pi_optimistic = self._pi_optimistic_groups
 		# V-function ensemble: input is latent only (no action)
 		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
 		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
@@ -256,26 +328,33 @@ class WorldModel(nn.Module):
 
 		# Target policy for trust region regularization OR for TD target imagination
 		# Create if trust region is enabled (coef > 0) or EMA policy is used for TD targets
+		# Now targets are Ensemble(P) clones to match _pi_groups / _pi_optimistic_groups.
 		need_target_pi = (
 			getattr(self.cfg, 'policy_trust_region_coef', 0.0) > 0 or
 			getattr(self.cfg, 'td_target_use_ema_policy', False)
 		)
 		if need_target_pi:
-			# Create frozen target clone (only once)
-			if not hasattr(self, '_target_pi') or self._target_pi is None:
-				self._target_pi = deepcopy(self._pi)
-				for p in self._target_pi.parameters():
+			# Create frozen target clone of per-group policy ensemble (only once)
+			if not hasattr(self, '_target_pi_groups') or self._target_pi_groups is None:
+				self._target_pi_groups = deepcopy(self._pi_groups)
+				for p in self._target_pi_groups.parameters():
 					p.requires_grad_(False)
+			# Keep backward-compat alias
+			self._target_pi = self._target_pi_groups
 			# Optimistic policy target (if dual policy enabled)
-			if self.cfg.dual_policy_enabled and self._pi_optimistic is not None:
-				if not hasattr(self, '_target_pi_optimistic') or self._target_pi_optimistic is None:
-					self._target_pi_optimistic = deepcopy(self._pi_optimistic)
-					for p in self._target_pi_optimistic.parameters():
+			if self.cfg.dual_policy_enabled and self._pi_optimistic_groups is not None:
+				if not hasattr(self, '_target_pi_optimistic_groups') or self._target_pi_optimistic_groups is None:
+					self._target_pi_optimistic_groups = deepcopy(self._pi_optimistic_groups)
+					for p in self._target_pi_optimistic_groups.parameters():
 						p.requires_grad_(False)
+				self._target_pi_optimistic = self._target_pi_optimistic_groups
 			else:
+				self._target_pi_optimistic_groups = None
 				self._target_pi_optimistic = None
 		else:
+			self._target_pi_groups = None
 			self._target_pi = None
+			self._target_pi_optimistic_groups = None
 			self._target_pi_optimistic = None
 
 
@@ -433,16 +512,19 @@ class WorldModel(nn.Module):
 				out = self._dynamics_heads(za, split_data=split_data)  # float32[H, B, L]
 			return out.float()
 
-	def reward(self, z, a, task, head_mode='single'):
+	def reward(self, z, a, task, head_mode='single', split_data=False):
 		"""
 		Predicts instantaneous (single-step) reward logits.
 
 		Args:
-			z (Tensor[..., L]): Latent states.
-			a (Tensor[..., A]): Actions.
+			z (Tensor[..., L]): Latent states. When split_data=True, leading dim
+				must equal num_reward_heads (R) so each head gets its own slice.
+			a (Tensor[..., A]): Actions. Shape must match z.
 			task: Task index for multitask setup.
 			head_mode (str): 'single' returns logits from head 0 [1, ..., K],
 				'all' returns logits from all heads [R, ..., K].
+			split_data (bool): If True, z[i] and a[i] are fed only to head i
+				via Ensemble split_data. Requires z.shape[0] == R.
 
 		Returns:
 			Tensor[R, ..., K] where R=1 if head_mode='single', R=num_heads if 'all'.
@@ -453,7 +535,7 @@ class WorldModel(nn.Module):
 			za = torch.cat([z, a], dim=-1)
 			with self._autocast_context():
 				# Ensemble forward returns [num_heads, ..., K] via vmap
-				out = self._Rs(za)
+				out = self._Rs(za, split_data=split_data)
 			out = out.float()
 			if head_mode == 'single':
 				return out[:1]  # Keep leading dim, take first head only
@@ -478,37 +560,68 @@ class WorldModel(nn.Module):
 		
 
 	def pi(self, z, task, search_noise=False, optimistic=False, target=False):
-		"""
-		Samples an action from the policy prior.
-		The policy prior is a Gaussian distribution with
-		mean and (log) std predicted by a neural network.
-		
+		"""Sample actions from per-policy policy ensemble.
+
+		P policy networks serve G groups. When P < G, multiple groups share
+		a policy network. Input z has shape [G, batch, L]; internally this is
+		reshaped to [P, batch*groups_per_policy, L] for the Ensemble(P) call,
+		then the output is reshaped back to [G, batch, A].
+
+		All post-MLP operations (chunk, squash, entropy) are element-wise and
+		work transparently on the [G, batch, A] output layout.
+
 		Args:
-			z: Latent state tensor.
+			z (Tensor[G, batch, L]): Latent states with leading group dim.
 			task: Task identifier for multitask setup.
 			search_noise: Unused (legacy parameter).
 			optimistic: If True and dual_policy_enabled, use optimistic policy.
-			target: If True, use EMA target policy (for trust region regularization).
+			target: If True, use EMA target policy.
+
+		Returns:
+			Tuple[Tensor[G, batch, A], TensorDict[G, batch, ...]]: Actions and info.
 		"""
 		with maybe_range('WM/pi', self.cfg):
-			# Select module based on optimistic and target flags
+			# Select Ensemble(P) module based on optimistic and target flags
 			if target:
 				if optimistic and self.cfg.dual_policy_enabled:
-					module = self._target_pi_optimistic
+					module = self._target_pi_optimistic_groups
 				else:
-					module = self._target_pi
+					module = self._target_pi_groups
 				# Fall back to online if target not available
 				if module is None:
-					module = self._pi_optimistic if (optimistic and self.cfg.dual_policy_enabled) else self._pi
+					module = self._pi_optimistic_groups if (optimistic and self.cfg.dual_policy_enabled) else self._pi_groups
 			else:
 				if optimistic and self.cfg.dual_policy_enabled:
-					module = self._pi_optimistic
+					module = self._pi_optimistic_groups
 				else:
-					module = self._pi
+					module = self._pi_groups
+
+			G = self.G
+			P = self.P
+			groups_per_policy = self.groups_per_policy
+			assert z.shape[0] == G, (
+				f"pi() expects z with leading dim G={G}, got {z.shape[0]}")
+			batch_per_group = z.shape[1]  # Assuming z is 3D: [G, batch, L]
+
 			if self.cfg.multitask:
 				z = self.task_emb(z, task)
+
+			# Reshape [G, batch, L] → [P, batch*groups_per_policy, L] for Ensemble(P)
+			if P < G:
+				z_for_ensemble = z.view(P, groups_per_policy, batch_per_group, -1)  # [P, g_p, batch, L+task]
+				z_for_ensemble = z_for_ensemble.view(P, groups_per_policy * batch_per_group, -1)  # [P, batch_per_policy, L+task]
+			else:
+				z_for_ensemble = z  # P == G, no reshape needed
+
 			with self._autocast_context():
-				raw = module(z)
+				# Ensemble(P) with split_data=True: each policy p gets z_for_ensemble[p]
+				raw = module(z_for_ensemble, split_data=True)  # float32[P, batch_per_policy, 2*A]
+
+			# Reshape back to [G, batch_per_group, 2*A]
+			if P < G:
+				raw = raw.view(P, groups_per_policy, batch_per_group, -1)  # [P, g_p, batch, 2*A]
+				raw = raw.view(G, batch_per_group, -1)  # [G, batch, 2*A]
+
 			mean, log_std = raw.float().chunk(2, dim=-1)
 			log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 			eps = torch.randn_like(mean, device=mean.device)
@@ -629,17 +742,19 @@ class WorldModel(nn.Module):
 			vals = math.two_hot_inv(out, self.cfg)  # (G_aux,T,B,1) 
 			return vals  # 'min'/'avg' identical with single head
 
-	def V(self, z, task, return_type='min', target=False, detach=False):
+	def V(self, z, task, return_type='min', target=False, detach=False, split_data=False):
 		"""
 		Compute state-value predictions.
 		
 		Args:
-			z (Tensor[..., L]): Latent state embeddings.
+			z (Tensor[..., L]): Latent state embeddings. When split_data=True,
+				leading dim must equal num_q (Ve) so each head gets its own slice.
 			task: Task identifier for multitask setup.
 			return_type (str): 'all' returns logits, 'all_values' returns scalar values per head,
 			                   'min'/'max'/'avg'/'mean' return scalar values reduced over heads.
 			target (bool): Use target network.
 			detach (bool): Use detached (non-gradient) network.
+			split_data (bool): If True, z[i] is fed only to head i via Ensemble split_data.
 			
 		Returns:
 			Tensor[num_q, ..., K] if return_type='all' (logits).
@@ -660,7 +775,7 @@ class WorldModel(nn.Module):
 			else:
 				vnet = self._Vs
 			with self._autocast_context():
-				out = vnet(z)
+				out = vnet(z, split_data=split_data)
 			out = out.float()  # float32[num_q, ..., K]
 
 			if return_type == 'all':
@@ -685,11 +800,15 @@ class WorldModel(nn.Module):
 		At each timestep each head advances its own latent independently via
 		a single batched ``next(..., split_data=True)`` call.
 
+		When ``use_policy=True``, per-group policies sample actions from the
+		first dynamics head of each group.  Within a group all H_g heads
+		share the same action; different groups may produce different actions.
+
 		Args:
 			z0 (Tensor[L] or Tensor[B,L]): Initial latent(s).
 			actions (Tensor[B,N,T,A], optional): Action sequences when ``use_policy=False``.
-			use_policy (bool): If True, ignore ``actions`` and sample from the policy
-				using head-0 latents.
+			use_policy (bool): If True, ignore ``actions`` and sample from per-group
+				policies using each group's first-head latents.
 			horizon (int, optional): Number of steps T when ``use_policy=True``.
 			num_rollouts (int, optional): Number of sequences N when ``use_policy=True``.
 			task: Optional task id for multitask.
@@ -700,8 +819,13 @@ class WorldModel(nn.Module):
 			use_target_policy (bool): If True, use EMA target policy.
 
 		Returns:
-			Tuple[Tensor[H,B,N,T+1,L], Tensor[B,N,T,A]]:
-				Latent trajectories (all H heads) and actions used.
+			When use_policy=True:
+				Tuple[Tensor[H,B,N,T+1,L], Tensor[H,B,N,T,A]]:
+					Latent trajectories and per-head actions (within-group heads
+					share actions; different groups may differ).
+			When use_policy=False:
+				Tuple[Tensor[H,B,N,T+1,L], Tensor[B,N,T,A]]:
+					Latent trajectories and the input actions (unchanged).
 		"""
 		if use_policy:
 			if actions is not None:
@@ -726,6 +850,8 @@ class WorldModel(nn.Module):
 		L = z0.shape[-1]
 
 		H = len(self._dynamics_heads)
+		G = self.G
+		H_g = self.H_g
 
 		# Determine action dim
 		if not use_policy:
@@ -737,7 +863,7 @@ class WorldModel(nn.Module):
 		z0_bn = z0.unsqueeze(1).expand(B, N, L)         # float32[B, N, L]
 		z0_hbn = z0_bn.unsqueeze(0).expand(H, B, N, L)  # float32[H, B, N, L]
 		latents_steps = [z0_hbn]
-		actions_steps = []  # each entry: float32[B, N, A]
+		actions_steps = []  # each entry shape depends on use_policy
 
 		with maybe_range('WM/rollout_latents', self.cfg):
 			for t in range(T):
@@ -745,22 +871,33 @@ class WorldModel(nn.Module):
 					# --- Action selection ---
 					if use_policy:
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
-							# Use head-0 latents for policy sampling
-							z_for_pi = latents_steps[t][0].reshape(B * N, L)  # float32[B*N, L]
-							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy, target=use_target_policy)
-							a_t = a_flat.reshape(B, N, A).detach()  # float32[B, N, A]
+							# Per-group policy: use first head of each group's latents
+							# latents_steps[t]: float32[H, B, N, L]
+							z_grouped = latents_steps[t].view(G, H_g, B, N, L)  # float32[G, H_g, B, N, L]
+							z_for_pi = z_grouped[:, 0].reshape(G, B * N, L)     # float32[G, B*N, L]
+							a_group, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy, target=use_target_policy)
+							# a_group: float32[G, B*N, A]
+							a_group = a_group.detach()
 							if policy_action_noise_std > 0.0:
-								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
-								a_t = (a_t + noise).clamp(-1.0, 1.0)
+								noise = torch.randn_like(a_group) * float(policy_action_noise_std)
+								a_group = (a_group + noise).clamp(-1.0, 1.0)
+							# Expand to per-head: [G, B*N, A] → [H, B*N, A]
+							a_all = a_group.repeat_interleave(H_g, dim=0)  # float32[H, B*N, A]
+							a_t_hbn = a_all.view(H, B, N, A)        # float32[H, B, N, A]
+							actions_steps.append(a_t_hbn)
 					else:
 						a_t = actions[:, :, t, :]  # float32[B, N, A]
-					actions_steps.append(a_t)
+						actions_steps.append(a_t)
 
 					# --- Advance all H dynamics heads in one batched call ---
 					with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
 						z_all = latents_steps[t].reshape(H, B * N, L)    # float32[H, B*N, L]
-						a_all = a_t.contiguous().reshape(B * N, A)       # float32[B*N, A]
-						a_all = a_all.unsqueeze(0).expand(H, -1, -1)    # float32[H, B*N, A]
+						if use_policy:
+							# a_all already [H, B*N, A] from above
+							pass
+						else:
+							a_all = a_t.contiguous().reshape(B * N, A)       # float32[B*N, A]
+							a_all = a_all.unsqueeze(0).expand(H, -1, -1)    # float32[H, B*N, A]
 						# next() with split_data=True: each head gets its own z,a slice
 						next_all = self.next(z_all, a_all, task, split_data=True)  # float32[H, B*N, L]
 						next_hbn = next_all.reshape(H, B, N, L)          # float32[H, B, N, L]
@@ -769,8 +906,99 @@ class WorldModel(nn.Module):
 		# Stack over time to produce final outputs
 		with maybe_range('WM/rollout_latents/finalize', self.cfg):
 			latents = torch.stack(latents_steps, dim=3).contiguous()      # float32[H, B, N, T+1, L]
-			actions_out = torch.stack(actions_steps, dim=2).contiguous()   # float32[B, N, T, A]
+			if use_policy:
+				# Per-head actions (within-group heads share actions)
+				actions_out = torch.stack(actions_steps, dim=3).contiguous()  # float32[H, B, N, T, A]
+			else:
+				actions_out = torch.stack(actions_steps, dim=2).contiguous()  # float32[B, N, T, A]
 
 		assert latents.is_contiguous(), "latents expected contiguous"
 		assert actions_out.is_contiguous(), "actions_out expected contiguous"
 		return latents, actions_out
+
+	def generate_grouped_policy_seeds(
+		self,
+		z0: torch.Tensor,
+		total_seeds: int,
+		horizon: int,
+		task=None,
+		policy_action_noise_std: float = 0.0,
+		use_optimistic_policy: bool = False,
+	) -> torch.Tensor:
+		"""Generate policy-seeded action sequences from per-group policies.
+
+		Each of the G groups produces ``total_seeds // G`` action sequences
+		of length ``horizon`` by auto-regressively sampling from its own
+		policy.  The sequences are concatenated so the caller can feed them
+		to ``rollout_latents(actions=..., use_policy=False)`` for full H-head
+		evaluation.
+
+		The auto-regressive rollout uses the *first* dynamics head of each
+		group (head index ``g * H_g``) to advance latents across the horizon.
+
+		Args:
+			z0 (Tensor[B, L]): Initial encoded latent(s).
+			total_seeds (int): Total number of policy-seeded sequences S.
+				Must be divisible by G.
+			horizon (int): Number of time steps T per sequence.
+			task: Optional task indices for multitask.
+			policy_action_noise_std (float): Std of Gaussian noise on actions.
+			use_optimistic_policy (bool): Use optimistic per-group policy.
+
+		Returns:
+			Tensor[B, S, T, A]: Concatenated action sequences ready for
+				``rollout_latents(actions=..., use_policy=False)``.
+		"""
+		G = self.G
+		H_g = self.H_g
+		assert total_seeds % G == 0, (
+			f"total_seeds={total_seeds} must be divisible by num_groups={G}")
+		S_g = total_seeds // G  # seeds per group
+		if z0.ndim == 1:
+			z0 = z0.unsqueeze(0)
+		B = z0.shape[0]
+		L = z0.shape[-1]
+		A = self.cfg.action_dim
+
+		# Each group uses its first dynamics head to advance latents.
+		# Dynamics head indices for group-first-head: [0, H_g, 2*H_g, ...]
+		# We collect per-group latents of shape [G, B*S_g, L] at each step
+		# and sample actions from the per-group Ensemble(G) policy.
+
+		# Initial latents: broadcast z0 to [G, B*S_g, L]
+		z_cur = z0.unsqueeze(1).expand(B, S_g, L).reshape(B * S_g, L)  # float32[B*S_g, L]
+		z_cur = z_cur.unsqueeze(0).expand(G, -1, -1).contiguous()      # float32[G, B*S_g, L]
+
+		action_steps = []  # each entry: float32[G, B*S_g, A]
+
+		with maybe_range('WM/generate_grouped_policy_seeds', self.cfg):
+			for t in range(horizon):
+				# Sample actions from per-group policies
+				a_group, _ = self.pi(z_cur, task, optimistic=use_optimistic_policy)
+				# a_group: float32[G, B*S_g, A]
+				a_group = a_group.detach()
+				if policy_action_noise_std > 0.0:
+					noise = torch.randn_like(a_group) * float(policy_action_noise_std)
+					a_group = (a_group + noise).clamp(-1.0, 1.0)
+				action_steps.append(a_group)
+
+				# Advance latents using each group's first dynamics head.
+				# We need split_data=True with the G-member dynamics subset.
+				# Instead, use the full H-head dynamics with split_data=True
+				# and extract only the first head per group from the output.
+				# Expand z_cur and a_group to [H, B*S_g, ?] with repeat_interleave
+				z_for_dyn = z_cur.repeat_interleave(H_g, dim=0)  # float32[H, B*S_g, L]
+				a_for_dyn = a_group.repeat_interleave(H_g, dim=0)  # float32[H, B*S_g, A]
+				next_z_all = self.next(z_for_dyn, a_for_dyn, task, split_data=True)  # float32[H, B*S_g, L]
+				# Take first head per group: view [G, H_g, B*S_g, L] → [:, 0]
+				z_cur = next_z_all.view(G, H_g, B * S_g, L)[:, 0].contiguous()  # float32[G, B*S_g, L]
+
+		# Stack: [T, G, B*S_g, A] → rearrange to [B, S, T, A] where S = G*S_g
+		actions_stacked = torch.stack(action_steps, dim=0)  # float32[T, G, B*S_g, A]
+		# Reshape to [T, G, B, S_g, A]
+		actions_stacked = actions_stacked.view(horizon, G, B, S_g, A)
+		# Permute to [B, G, S_g, T, A] → [B, G*S_g, T, A] = [B, S, T, A]
+		actions_out = actions_stacked.permute(2, 1, 3, 0, 4).contiguous()  # float32[B, G, S_g, T, A]
+		actions_out = actions_out.reshape(B, total_seeds, horizon, A)       # float32[B, S, T, A]
+
+		return actions_out

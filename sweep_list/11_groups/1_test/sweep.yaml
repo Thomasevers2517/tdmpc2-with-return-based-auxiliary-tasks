@@ -1,0 +1,54 @@
+# Sweep 11.1: Model groups basic functionality test
+# Tests num_groups={1, 2, -1} with H=4 dynamics heads, Ve=8 value heads, R=4 reward heads.
+# R=4 so all G values are valid: 4%1=0, 4%2=0, 4%4=0 (G=-1 resolves to G=H=4).
+# G=1: legacy baseline (no grouping)
+# G=2: 2 groups × (2 dyn, 4 val, 2 rew, 1 policy) per group
+# G=-1→4: fully grouped, 4 groups × (1 dyn, 2 val, 1 rew, 1 policy) per group
+#
+# 3 group configs × 3 tasks × 2 seeds = 18 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - quadruped-walk
+      - hopper-hop
+      - dog-run
+
+  seed:
+    values: [1, 2]
+
+  num_groups:
+    values: [1, 2, -1]
+
+  # R=4 so all G values divide evenly
+  num_reward_heads:
+    value: 4
+
+  planner_num_dynamics_heads:
+    value: 4
+
+  num_q:
+    value: 8
+
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

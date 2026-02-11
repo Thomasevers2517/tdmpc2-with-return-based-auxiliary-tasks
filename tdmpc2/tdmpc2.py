@@ -391,9 +391,14 @@ class TDMPC2(torch.nn.Module):
 				return chosen_action.squeeze(0), planner_info
 			# Policy-prior action (non-MPC path)
 			z = self.model.encode(obs, task_tensor)
-			action_pi, info_pi = self.model.pi(z, task_tensor)
+			# pi() expects leading G dim: [G, B, L]
+			G = self.model.G
+			z_grouped = z.unsqueeze(0).expand(G, -1, -1)  # float32[G, B, L]
+			action_pi, info_pi = self.model.pi(z_grouped, task_tensor)
+			# action_pi: [G, B, A] → use first group
+			action_pi = action_pi[0]  # float32[B, A]
 			if eval_mode:
-				action_pi = info_pi['mean']
+				action_pi = info_pi['mean'][0]
 			return action_pi[0], None
 
 	@torch.no_grad()
@@ -525,26 +530,16 @@ class TDMPC2(torch.nn.Module):
 		return torch.sqrt(accum)
 
 	def calc_pi_losses(self, z, task, optimistic=False):
-		"""Compute policy loss using state-value function V(s) with per-head dynamics.
+		"""Compute per-group policy loss with within-group Q estimates.
 
-		For V-learning, we maximize: r(z, a) + γ * V(z') + entropy_bonus
-		where z' is reached by taking action a from policy pi(z) and rolling
-		through dynamics. The dynamics, reward, and value function are frozen
-		during policy optimization (SAC-style backprop through frozen model).
-
-		Each dynamics head h processes only its own latents z[:, h] via
-		``split_data=True``, ensuring head-specific rollout states are
-		propagated by the correct dynamics head.
-
-		Reward ensemble (R heads) and value ensemble (Ve heads) provide
-		uncertainty within each (h, t, b, n) sample. If ``value_std_coef != 0``,
-		the per-sample Q is shifted by reward+value ensemble std.
+		Each group g's policy generates actions for its H_g dynamics heads.
+		Q_g = R_mean(g) + γ * V_mean(g), with optional within-group σ shift.
+		Gradients flow through each group's policy via the computation graph.
 
 		Args:
-			z (Tensor[T+1, H, B, L]): Per-head latent states from dynamics rollout.
+			z (Tensor[T+1, H, B, L]): Per-head latent states.
 			task: Task identifier for multitask setup.
-			optimistic: If True, use optimistic policy with +1.0 std_coef and
-				scaled entropy. If False, use pessimistic policy with -1.0 std_coef.
+			optimistic: Use optimistic policy and std_coef.
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
@@ -553,11 +548,17 @@ class TDMPC2(torch.nn.Module):
 		T_plus_1, H, B, L = z.shape
 		T = T_plus_1 - 1
 		N = int(self.cfg.num_rollouts) if self.cfg.pi_multi_rollout else 1
-		B_eff = H * B  # effective batch with all heads flattened
+		B_eff = H * B
+
+		G = self.model.G
+		H_g = self.model.H_g
+		R_g = self.model.R_g
+		Ve_g = self.model.Ve_g
+		R = G * R_g     # Total reward heads
+		Ve = G * Ve_g   # Total value heads
 
 		z = z[:-1].contiguous()  # float32[T, H, B, L]
 
-		# Select std_coef based on optimistic flag
 		if optimistic:
 			value_std_coef = self.cfg.optimistic_policy_value_std_coef
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
@@ -566,15 +567,36 @@ class TDMPC2(torch.nn.Module):
 			entropy_coeff = self.dynamic_entropy_coeff
 
 		with maybe_range('Agent/update_pi', self.cfg):
-			# Flatten H into batch for policy: [T, H*B, L]
+			# ---- Flatten H into batch, expand with N ----
 			z_for_pi = z.reshape(T, B_eff, L)  # float32[T, H*B, L]
-
-			# Expand with N rollouts: [T, H*B*N, L]
 			z_expanded = z_for_pi.unsqueeze(2).expand(T, B_eff, N, L).reshape(T, B_eff * N, L)
+			# float32[T, H*B*N, L]
 
-			# Sample action from policy (policy has gradients)
-			action, info = self.model.pi(z_expanded, task, optimistic=optimistic)  # float32[T, H*B*N, A]
-			A = action.shape[-1]
+			# ---- Per-group policy call ----
+			BN = B * N
+			z_pi_grouped = (
+				z_expanded
+				.view(T, G, H_g * BN, L)
+				.permute(1, 0, 2, 3)
+				.reshape(G, T * H_g * BN, L)
+			)  # float32[G, T*H_g*B*N, L]
+
+			action_grouped, info = self.model.pi(z_pi_grouped, task, optimistic=optimistic)
+			# action_grouped: float32[G, T*H_g*B*N, A]
+			A = action_grouped.shape[-1]
+
+			# Reshape back to [T, H*B*N, A] (groups → H ordering)
+			action = (
+				action_grouped
+				.view(G, T, H_g * BN, A)
+				.permute(1, 0, 2, 3)
+				.reshape(T, B_eff * N, A)
+			)  # float32[T, H*B*N, A]
+
+			def _reorder_info(val):
+				"""Reshape [G, T*H_g*B*N, D] → [T, H*B*N, D]."""
+				D = val.shape[-1]
+				return val.view(G, T, H_g * BN, D).permute(1, 0, 2, 3).reshape(T, B_eff * N, D)
 
 			# ---- Task handling ----
 			if self.cfg.multitask:
@@ -589,12 +611,55 @@ class TDMPC2(torch.nn.Module):
 				gamma = self.discount  # scalar tensor
 				gamma_scalar = float(self.discount)
 
-			# ---- Reward r(z, a) from ALL R reward heads ----
-			z_rew_flat = z_expanded.view(T * B_eff * N, L)   # float32[T*H*B*N, L]
-			a_rew_flat = action.view(T * B_eff * N, A)        # float32[T*H*B*N, A]
-			reward_logits_all = self.model.reward(z_rew_flat, a_rew_flat, task_flat, head_mode='all')  # float32[R, T*H*B*N, K]
-			R = reward_logits_all.shape[0]
-			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H*B*N, 1]
+			# ---- Reward r(z, a) from ALL R reward heads (efficient per-group) ----
+			# Each reward head r in group g sees only latents from group g's H_g dynamics heads.
+			# z_expanded: [T, H*BN, L] = [T, G*H_g*BN, L]
+			# Reshape to [T, G, H_g*BN, L] → expand to [T, G, R_g, H_g*BN, L] → [T, R, H_g*BN, L]
+			z_rew_grouped = z_expanded.view(T, G, H_g * BN, L)  # float32[T, G, H_g*BN, L]
+			z_rew_for_R = (
+				z_rew_grouped
+				.unsqueeze(2)
+				.expand(T, G, R_g, H_g * BN, L)
+				.reshape(T, R, H_g * BN, L)
+				.permute(1, 0, 2, 3)
+				.reshape(R, T * H_g * BN, L)
+			)  # float32[R, T*H_g*BN, L]
+
+			a_rew_grouped = action.view(T, G, H_g * BN, A)  # float32[T, G, H_g*BN, A]
+			a_rew_for_R = (
+				a_rew_grouped
+				.unsqueeze(2)
+				.expand(T, G, R_g, H_g * BN, A)
+				.reshape(T, R, H_g * BN, A)
+				.permute(1, 0, 2, 3)
+				.reshape(R, T * H_g * BN, A)
+			)  # float32[R, T*H_g*BN, A]
+
+			# Task for split_data: [T*H_g*BN] per head (same across R heads in group)
+			if self.cfg.multitask:
+				task_hb_grouped = task_hb.view(G, H_g).repeat(1, BN).view(G, H_g * BN)  # [G, H_g*BN]
+				task_rew = (
+					task_hb_grouped
+					.unsqueeze(0)
+					.expand(T, G, H_g * BN)
+					.unsqueeze(2)
+					.expand(T, G, R_g, H_g * BN)
+					.reshape(T, R, H_g * BN)
+					.permute(1, 0, 2)
+					.reshape(R, T * H_g * BN)
+				)  # float32[R, T*H_g*BN]
+			else:
+				task_rew = None
+
+			reward_logits_all = self.model.reward(
+				z_rew_for_R, a_rew_for_R, task_rew, head_mode='all', split_data=True,
+			)  # float32[R, T*H_g*BN, K]
+
+			# Reshape to per-group format: [G, R_g, T, H_g*BN, K]
+			reward_logits_grouped = reward_logits_all.view(R, T, H_g * BN, -1)  # [R, T, H_g*BN, K]
+			K = reward_logits_grouped.shape[-1]
+			reward_grouped = math.two_hot_inv(reward_logits_grouped, self.cfg)  # float32[R, T, H_g*BN, 1]
+			reward_grouped = reward_grouped.view(G, R_g, T, H_g * BN, 1)  # float32[G, R_g, T, H_g*BN, 1]
 
 			# ---- Dynamics with split_data=True ----
 			# Reshape so head dim is leading: [H, T*B*N, L] and [H, T*B*N, A]
@@ -604,31 +669,56 @@ class TDMPC2(torch.nn.Module):
 			task_dyn = task_hb[:B].repeat(T * N) if self.cfg.multitask else None  # float32[T*B*N]  (base B per head)
 			next_z_all = self.model.next(z_for_dyn, a_for_dyn, task_dyn, split_data=True)  # float32[H, T*B*N, L]
 
-			# ---- V(z') for all Ve value heads ----
-			next_z_flat = next_z_all.reshape(H * T * B * N, L)  # float32[H*T*B*N, L]
-			task_flat_v = task_flat if task_flat is not None else None
-			# Reorder task to match [H, T*B*N] → [H*T*B*N] layout
+			# ---- V(z') for all Ve value heads (efficient per-group) ----
+			# Each V head ve in group g sees only next latents from group g's H_g dynamics heads.
+			# next_z_all: [H, T*B*N, L] = [G*H_g, T*B*N, L]
+			# Reshape to [G, H_g, T, B*N, L] → [G, T, H_g, B*N, L] → [G, T*H_g*BN, L]
+			# Expand to [G, Ve_g, T*H_g*BN, L] → [Ve, T*H_g*BN, L]
+			next_z_grouped = next_z_all.view(G, H_g, T, B * N, L)  # float32[G, H_g, T, B*N, L]
+			next_z_grouped = next_z_grouped.permute(0, 2, 1, 3, 4).reshape(G, T * H_g * BN, L)  # float32[G, T*H_g*BN, L]
+			next_z_for_Ve = (
+				next_z_grouped
+				.unsqueeze(1)
+				.expand(G, Ve_g, T * H_g * BN, L)
+				.reshape(Ve, T * H_g * BN, L)
+			)  # float32[Ve, T*H_g*BN, L]
+
+			# Task for V split_data: [T*H_g*BN] per head
 			if self.cfg.multitask:
-				task_flat_v = task_dyn.unsqueeze(0).expand(H, T * B * N).reshape(H * T * B * N)
-			v_next_flat = self.model.V(next_z_flat, task_flat_v, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-			Ve = v_next_flat.shape[0]
-			# Reshape to [Ve, H, T*B*N, 1] then reorder to match reward layout [Ve, T*H*B*N, 1]
-			v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)  # float32[Ve, H, T*B*N, 1]
-			# Permute to align with reward: [Ve, T, H, B*N, 1] → [Ve, T*H*B*N, 1]
-			v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+				task_dyn_grouped = task_dyn.view(T, B * N).unsqueeze(1).expand(T, H_g, B * N)  # [T, H_g, BN]
+				task_v = (
+					task_dyn_grouped
+					.reshape(T * H_g * BN)
+					.unsqueeze(0)
+					.expand(Ve, T * H_g * BN)
+				)  # float32[Ve, T*H_g*BN]
+			else:
+				task_v = None
 
-			# ---- Q estimate per sample ----
-			# reward_all: [R, T*H*B*N, 1], v_next: [Ve, T*H*B*N, 1]
-			reward_mean = reward_all.mean(dim=0)                         # float32[T*H*B*N, 1]
-			reward_std = reward_all.std(dim=0, unbiased=(R > 1))         # float32[T*H*B*N, 1]
-			v_mean = v_next_reord.mean(dim=0)                            # float32[T*H*B*N, 1]
-			v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))           # float32[T*H*B*N, 1]
+			v_next_all = self.model.V(
+				next_z_for_Ve, task_v, return_type='all_values', detach=True, split_data=True,
+			)  # float32[Ve, T*H_g*BN, 1]
 
-			q_mean = reward_mean + gamma * v_mean                        # float32[T*H*B*N, 1]
-			q_std = reward_std + gamma_scalar * v_std                    # float32[T*H*B*N, 1]
-			q_estimate_flat = q_mean + value_std_coef * q_std            # float32[T*H*B*N, 1]
+			# Reshape to per-group format: [G, Ve_g, T, H_g*BN, 1]
+			v_grouped = v_next_all.view(G, Ve_g, T, H_g * BN, 1)  # float32[G, Ve_g, T, H_g*BN, 1]
 
-			q_estimate = q_estimate_flat.view(T, B_eff * N, 1)          # float32[T, H*B*N, 1]
+			# ---- Per-group Q estimates (already in grouped format) ----
+			r_mean_g = reward_grouped.mean(dim=1)                        # float32[G, T, H_g*BN, 1]
+			r_std_g = reward_grouped.std(dim=1, unbiased=(R_g > 1))
+
+			v_mean_g = v_grouped.mean(dim=1)                             # float32[G, T, H_g*BN, 1]
+			v_std_g = v_grouped.std(dim=1, unbiased=(Ve_g > 1))
+
+			q_mean_g = r_mean_g + gamma * v_mean_g                      # float32[G, T, H_g*BN, 1]
+			q_std_g = r_std_g + gamma_scalar * v_std_g
+			q_estimate_g = q_mean_g + value_std_coef * q_std_g
+
+			# Flatten per-group Q back to [T, H*B*N, 1]
+			q_estimate = (
+				q_estimate_g
+				.permute(1, 0, 2, 3)
+				.reshape(T, B_eff * N, 1)
+			)  # float32[T, H*B*N, 1]
 
 			# ---- Scale and loss ----
 			if not optimistic:
@@ -639,19 +729,22 @@ class TDMPC2(torch.nn.Module):
 			if self.cfg.normalize_rho_weights:
 				rho_pows = rho_pows / rho_pows.sum()
 
-			entropy_term = info["scaled_entropy"]  # float32[T, H*B*N, 1]
+			entropy_term = _reorder_info(info["scaled_entropy"])  # float32[T, H*B*N, 1]
 			objective = q_scaled + entropy_coeff * entropy_term
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
 			# ---- Logging (average over H and N) ----
-			info_entropy = info["entropy"].view(T, B_eff, N, 1).mean(dim=2)                 # float32[T, H*B, 1]
-			info_scaled_entropy = info["scaled_entropy"].view(T, B_eff, N, 1).mean(dim=2)
-			info_true_entropy = info["true_entropy"].view(T, B_eff, N, 1).mean(dim=2)
-			info_true_scaled_entropy = info["true_scaled_entropy"].view(T, B_eff, N, 1).mean(dim=2)
-			info_mean = info["mean"].view(T, B_eff, N, -1).mean(dim=2)                      # float32[T, H*B, A]
-			info_log_std = info["log_std"].view(T, B_eff, N, -1).mean(dim=2)
-			info_presquash_mean = info["presquash_mean"].view(T, B_eff, N, -1).mean(dim=2)
+			info_entropy = _reorder_info(info["entropy"]).view(T, B_eff, N, 1).mean(dim=2)
+			info_scaled_entropy = _reorder_info(info["scaled_entropy"]).view(T, B_eff, N, 1).mean(dim=2)
+			info_true_entropy = _reorder_info(info["true_entropy"]).view(T, B_eff, N, 1).mean(dim=2)
+			info_true_scaled_entropy = _reorder_info(info["true_scaled_entropy"]).view(T, B_eff, N, 1).mean(dim=2)
+			info_mean = _reorder_info(info["mean"]).view(T, B_eff, N, -1).mean(dim=2)
+			info_log_std = _reorder_info(info["log_std"]).view(T, B_eff, N, -1).mean(dim=2)
+			info_presquash_mean = _reorder_info(info["presquash_mean"]).view(T, B_eff, N, -1).mean(dim=2)
 			q_estimate_avg = q_estimate.view(T, B_eff, N, 1).mean(dim=2)                    # float32[T, H*B, 1]
+
+			# Per-group Q std (mean across groups for scalar logging)
+			q_std_scalar = q_std_g.mean()
 
 			info = TensorDict({
 				"pi_loss": pi_loss,
@@ -674,9 +767,9 @@ class TDMPC2(torch.nn.Module):
 				"entropy_coeff": self.dynamic_entropy_coeff,
 				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate_avg.mean(),
-				"pi_reward_mean": reward_all.mean(),
-				"pi_v_next_mean": v_next_flat.mean(),
-				"pi_q_std": q_std.mean(),
+				"pi_reward_mean": reward_grouped.mean(),
+				"pi_v_next_mean": v_next_all.mean(),
+				"pi_q_std": q_std_scalar,
 				"pi_num_rollouts": float(N),
 			}, device=self.device)
 
@@ -713,18 +806,26 @@ class TDMPC2(torch.nn.Module):
 		# Use z[:-1] for policy (aligns with expert_action_dist timesteps)
 		z_for_pi = z[:-1]  # float32[T, B, L]
 		
+		# Broadcast to all G groups: [T, B, L] → [G, T*B, L] for per-group pi()
+		G = self.model.G
+		z_grouped = z_for_pi.unsqueeze(0).expand(G, -1, -1, -1).reshape(G, T * B, L)
+		
 		# Get policy distribution (optimistic or pessimistic based on flag)
 		with maybe_range('Agent/pi_distillation', self.cfg):
-			_, info = self.model.pi(z_for_pi, task, optimistic=optimistic)
+			_, info = self.model.pi(z_grouped, task, optimistic=optimistic)
 		
-		# Extract policy mean/std
-		# Note: policy mean is already squashed (tanh applied), in [-1, 1]
-		policy_mean = info["mean"]           # float32[T, B, A]
-		policy_std = info["log_std"].exp()   # float32[T, B, A]
+		# Extract per-group mean/std: [G, T*B, A] → [G, T, B, A], then average over groups
+		# Each group independently tries to match the (shared) expert targets.
+		policy_mean_g = info["mean"].view(G, T, B, -1)        # float32[G, T, B, A]
+		policy_std_g = info["log_std"].exp().view(G, T, B, -1) # float32[G, T, B, A]
+		
+		# For logging/validation, use group-averaged mean
+		policy_mean = policy_mean_g.mean(dim=0)  # float32[T, B, A]
+		policy_std = policy_std_g.mean(dim=0)    # float32[T, B, A]
+		A = policy_mean.shape[-1]
 		
 		# Validate policy output shapes
 		assert policy_mean.shape == (T, B, A), f"policy_mean shape {policy_mean.shape} != expected ({T}, {B}, {A})"
-		assert policy_std.shape == (T, B, A), f"policy_std shape {policy_std.shape} != expected ({T}, {B}, {A})"
 		
 		# Extract expert mean/std
 		# Expert targets are from planner's final distribution, also in [-1, 1]
@@ -741,14 +842,18 @@ class TDMPC2(torch.nn.Module):
 		assert not torch.isnan(expert_std).any(), "expert_std contains NaN"
 		assert (expert_std > 0).all(), f"expert_std has non-positive values: min={expert_std.min()}"
 		
-		# Compute KL divergence per dimension
-		# If fix_kl_order=True: KL(expert || policy) - minimizing makes policy match expert
-		# If fix_kl_order=False: KL(policy || expert) - legacy behavior
+		# Compute KL divergence per dimension per group
+		# Expert targets are broadcast to [G, T, B, A] for each group.
+		expert_mean_g = expert_mean.unsqueeze(0).expand(G, -1, -1, -1)  # float32[G, T, B, A]
+		expert_std_g = expert_std.unsqueeze(0).expand(G, -1, -1, -1)
 		if self.cfg.fix_kl_order:
-			kl_per_dim = math.kl_div_gaussian(expert_mean, expert_std, policy_mean, policy_std)  # KL(expert || policy)
+			kl_per_dim_g = math.kl_div_gaussian(expert_mean_g, expert_std_g, policy_mean_g, policy_std_g)
 		else:
-			kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)  # KL(policy || expert)
-		kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, B, 1] - mean over A
+			kl_per_dim_g = math.kl_div_gaussian(policy_mean_g, policy_std_g, expert_mean_g, expert_std_g)
+		kl_loss_g = kl_per_dim_g.mean(dim=-1, keepdim=True)  # float32[G, T, B, 1]
+		# Average over groups for scalar loss
+		kl_loss = kl_loss_g.mean(dim=0)  # float32[T, B, 1]
+		kl_per_dim = kl_per_dim_g.mean(dim=0)  # float32[T, B, A]
 		
 		# Scale with running scale (uses kl_scale with configurable min_scale)
 		self.kl_scale.update(kl_loss[0])
@@ -759,7 +864,7 @@ class TDMPC2(torch.nn.Module):
 			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
 		else:
 			entropy_coeff = self.dynamic_entropy_coeff
-		entropy_term = info["scaled_entropy"]  # float32[T, B, 1]
+		entropy_term = info["scaled_entropy"].view(G, T, B, 1).mean(dim=0)  # float32[T, B, 1]
 		
 		# Temporal weighting with rho (exponential decay)
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
@@ -771,7 +876,7 @@ class TDMPC2(torch.nn.Module):
 		objective = kl_scaled - entropy_coeff * entropy_term  # float32[T, B, 1]
 		pi_loss = (objective.mean(dim=(1, 2)) * rho_pows).mean()
 		
-		# Build info dict
+		# Build info dict (group-averaged for scalar logging)
 		info_out = TensorDict({
 			"pi_loss": pi_loss,
 			"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
@@ -785,7 +890,7 @@ class TDMPC2(torch.nn.Module):
 			"pi_std": info["log_std"].mean(),
 			"pi_mean": info["mean"].mean(),
 			"pi_abs_mean": info["mean"].abs().mean(),
-			"entropy_coeff": torch.tensor(entropy_coeff, device=self.device),
+			"entropy_coeff": torch.tensor(float(entropy_coeff), device=self.device),
 			"expert_mean_abs": expert_mean.abs().mean(),
 			"expert_std_mean": expert_std.mean(),
 		}, device=self.device)
@@ -815,21 +920,26 @@ class TDMPC2(torch.nn.Module):
 		
 		# Use z[:-1] for policy (same convention as distillation)
 		z_for_pi = z[:-1]  # float32[T, B, L]
+		T, B, L = z_for_pi.shape
+		G = self.model.G
+
+		# Broadcast to all G groups: [T, B, L] → [G, T*B, L]
+		z_grouped = z_for_pi.unsqueeze(0).expand(G, -1, -1, -1).reshape(G, T * B, L)
 		
-		# Get current policy distribution
-		_, curr_info = self.model.pi(z_for_pi, task, optimistic=optimistic, target=False)
-		curr_mean = curr_info["mean"]          # float32[T, B, A]
-		curr_std = curr_info["log_std"].exp()  # float32[T, B, A]
+		# Get current policy distribution per group
+		_, curr_info = self.model.pi(z_grouped, task, optimistic=optimistic, target=False)
+		curr_mean = curr_info["mean"].view(G, T, B, -1)          # float32[G, T, B, A]
+		curr_std = curr_info["log_std"].exp().view(G, T, B, -1)  # float32[G, T, B, A]
 		
-		# Get EMA target policy distribution
-		_, ema_info = self.model.pi(z_for_pi, task, optimistic=optimistic, target=True)
-		ema_mean = ema_info["mean"]          # float32[T, B, A]
-		ema_std = ema_info["log_std"].exp()  # float32[T, B, A]
+		# Get EMA target policy distribution per group
+		_, ema_info = self.model.pi(z_grouped, task, optimistic=optimistic, target=True)
+		ema_mean = ema_info["mean"].view(G, T, B, -1)          # float32[G, T, B, A]
+		ema_std = ema_info["log_std"].exp().view(G, T, B, -1)  # float32[G, T, B, A]
 		
-		# KL(EMA || current) - penalize deviation from EMA
-		tr_kl_per_dim = math.kl_div_gaussian(ema_mean, ema_std, curr_mean, curr_std)  # float32[T, B, A]
-		tr_kl_per_sample = tr_kl_per_dim.sum(dim=-1)  # float32[T, B] - sum over action dims
-		tr_kl_loss = tr_kl_per_sample.mean()  # scalar
+		# Per-group KL(EMA || current), then average over groups
+		tr_kl_per_dim = math.kl_div_gaussian(ema_mean, ema_std, curr_mean, curr_std)  # float32[G, T, B, A]
+		tr_kl_per_sample = tr_kl_per_dim.sum(dim=-1)  # float32[G, T, B]
+		tr_kl_loss = tr_kl_per_sample.mean()  # scalar (mean over G, T, B)
 		
 		# Update scale with pessimistic policy only; both use same scale
 		if not optimistic:
@@ -947,141 +1057,105 @@ class TDMPC2(torch.nn.Module):
 		return pi_loss, info
 
 	@torch.no_grad()
-	def _td_target(self, next_z, reward, terminated, task):
-		"""
-		Compute TD-target from a reward and the observation at the following time step.
-		
-		With V-function, the TD target is: r + γ * (1 - terminated) * V(next_z)
-		
-		CORRECT OPTIMISM: For each dynamics head h, compute:
-		  σ_h = σ^r_h + γ * σ^v_h  (reward std + discounted value std, if global)
-		  TD_h = μ_h + td_target_std_coef × σ_h
-		Then reduce over dynamics heads:
-		  std_coef > 0: max over H (optimistic)
-		  std_coef < 0: min over H (pessimistic)
-		  std_coef = 0: mean over H (neutral)
-		
-		Local bootstrapping: each Ve head bootstraps itself, no value std (σ^v=0).
-		Global bootstrapping: all Ve heads get same target, value std computed across Ve.
+	def _td_target(self, next_z, reward_grouped, terminated, task):
+		"""Compute per-group TD-targets with within-group reward/value pairing.
+
+		Each group g has H_g dynamics, R_g reward, Ve_g value heads.
+		V is evaluated per-group via split_data: each Ve head only sees its
+		group's dynamics latents (no wasted cross-group compute).
+		Dynamics heads within a group are collapsed via mean.
+
+		Local bootstrapping: each Ve head bootstraps itself, no value std.
+		Global bootstrapping: all Ve_g heads in a group get the same target.
 
 		Args:
-			next_z (Tensor[T, H, B, L]): Latent states at following time steps with H dynamics heads.
-			reward (Tensor[T, R, H, B, 1]): Rewards with R reward heads, H dynamics heads.
-			terminated (Tensor[T, H, B, 1]): Termination signals (no R dimension).
-			task (torch.Tensor): Task index (only used for multi-task experiments).
+			next_z (Tensor[T, H, B, L]): Latent states from dynamics heads.
+			reward_grouped (Tensor[T, G, R_g, H_g, B, 1]): Per-group rewards.
+			terminated (Tensor[T, H, B, 1]): Termination signals.
+			task: Task index for multitask.
 
 		Returns:
-			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1], Tensor[T, B, 1]]: 
-				(TD-targets per Ve head, td_mean_log, td_std_log).
+			Tuple[Tensor[Ve, T, B, 1], Tensor[T, B, 1], Tensor[T, B, 1]]:
+				(TD targets per Ve head, td_mean_log, td_std_log).
 		"""
 		T, H, B, L = next_z.shape  # next_z: float32[T, H, B, L]
-		R = reward.shape[1]  # reward: float32[T, R, H, B, 1]
-		
-		# Merge H and B for V evaluation: [T, H, B, L] -> [T, H*B, L]
-		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
-		
-		# Get V predictions for all ensemble heads: [Ve, T, H*B, K]
-		v_logits_flat = self.model.V(next_z_flat, task, return_type='all', target=True)  # float32[Ve, T, H*B, K]
-		Ve = v_logits_flat.shape[0]
-		
-		# Convert to scalar values: [Ve, T, H*B, 1]
-		v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
-		
-		# Reshape back to [Ve, T, H, B, 1]
-		v_values = v_values_flat.view(Ve, T, H, B, 1)  # float32[Ve, T, H, B, 1]
-		
+		G = self.model.G
+		H_g = self.model.H_g
+		R_g = self.model.R_g
+		Ve_g = self.model.Ve_g
+		Ve = G * Ve_g
 
-		# WARNING: See discount initialization comment — .item()/float() cause graph breaks
-		# but keeping discount as a tensor is required for learning (see note at __init__).
+		# ---- Per-group V evaluation via split_data ----
+		# Reshape next_z to group structure: [T, G, H_g, B, L]
+		next_z_grouped = next_z.view(T, G, H_g, B, L)  # float32[T, G, H_g, B, L]
+		# Build V input: repeat each group's latents for its Ve_g heads
+		# [T, G, H_g, B, L] -> [T, G, 1, H_g, B, L] -> [T, G, Ve_g, H_g, B, L]
+		v_input = next_z_grouped.unsqueeze(2).expand(T, G, Ve_g, H_g, B, L)
+		# Reshape to [Ve, T, H_g*B, L] for split_data call
+		v_input = v_input.permute(1, 2, 0, 3, 4, 5).reshape(Ve, T, H_g * B, L)  # float32[Ve, T, H_g*B, L]
+		v_logits = self.model.V(v_input, task, return_type='all', target=True, split_data=True)
+		# v_logits: float32[Ve, T, H_g*B, K]
+		v_values = math.two_hot_inv(v_logits, self.cfg)  # float32[Ve, T, H_g*B, 1]
+		v_values_grouped = v_values.view(G, Ve_g, T, H_g, B, 1)  # float32[G, Ve_g, T, H_g, B, 1]
+
+		# ---- Per-group reward already in correct format: [T, G, R_g, H_g, B, 1] → [G, T, R_g, H_g, B, 1] ----
+		reward_grouped = reward_grouped.permute(1, 0, 2, 3, 4, 5)  # float32[G, T, R_g, H_g, B, 1]
+
+		# ---- Per-group terminated: [T, H, B, 1] → [G, T, H_g, B, 1] ----
+		terminated_grouped = terminated.view(T, G, H_g, B, 1).permute(1, 0, 2, 3, 4)
+		# float32[G, T, H_g, B, 1]
+
+		# ---- Discount ----
 		discount = self.discount[task].unsqueeze(-1) if self.cfg.multitask else self.discount
 		discount_scalar = self.discount.mean().item() if self.cfg.multitask else float(self.discount)
-		
 		std_coef = float(self.cfg.td_target_std_coef)
-		
+
+		# ---- Per-group reward stats (across R_g) ----
+		r_mean_per_h = reward_grouped.mean(dim=2)  # float32[G, T, H_g, B, 1]
+		r_std_per_h = reward_grouped.std(dim=2, unbiased=(R_g > 1))  # float32[G, T, H_g, B, 1]
+
 		if self.cfg.local_td_bootstrap:
-			# LOCAL: Each Ve head bootstraps itself
-			# No value std (each head sees only itself), only reward std across R
-			
-			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
-			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
-			
-			# v_values: [Ve, T, H, B, 1] - use directly (each Ve head bootstraps itself)
-			# TD_h = r_mean_h + γ * (1-term) * v_ve_h  for each (Ve, H)
-			# We need to broadcast: terminated [T, H, B, 1]
-			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-			r_mean_exp = r_mean_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			
-			# TD mean per (Ve, H): μ_{ve,h} = r_mean_h + γ * (1-term) * v_{ve,h}
-			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
-			
-			# TD std per H: σ_h = r_std_h (no value std in local mode)
-			td_std_per_h = r_std_per_h  # float32[T, H, B, 1]
-			
-			# TD_h = μ_h + std_coef * σ_h per dynamics head
-			# For local, we compute this per (Ve, H), then reduce over H
-			# td_std_per_h needs to broadcast to [Ve, T, H, B, 1]
-			td_std_exp = td_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp  # float32[Ve, T, H, B, 1]
-			
-			# Determine dynamics reduction method
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-			
-			# Reduce over dynamics heads H
-			if dyn_reduction == "max":
-				td_targets, _ = td_per_ve_h.max(dim=2)  # float32[Ve, T, B, 1]
-			elif dyn_reduction == "min":
-				td_targets, _ = td_per_ve_h.min(dim=2)  # float32[Ve, T, B, 1]
-			else:  # "mean"
-				td_targets = td_per_ve_h.mean(dim=2)  # float32[Ve, T, B, 1]
-			
-			# For logging
-			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
-			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
-			
+			# LOCAL: each Ve_g head bootstraps itself, no cross-head value std
+			r_mean_exp = r_mean_per_h.unsqueeze(1)        # float32[G, 1, T, H_g, B, 1]
+			term_exp = terminated_grouped.unsqueeze(1)     # float32[G, 1, T, H_g, B, 1]
+
+			td_mean_per_ve_h = (
+				r_mean_exp + discount * (1 - term_exp) * v_values_grouped
+			)  # float32[G, Ve_g, T, H_g, B, 1]
+
+			td_std_exp = r_std_per_h.unsqueeze(1)  # float32[G, 1, T, H_g, B, 1]
+			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp  # float32[G, Ve_g, T, H_g, B, 1]
+
+			# Mean over H_g dynamics heads within each group
+			td_per_ve = td_per_ve_h.mean(dim=3)  # float32[G, Ve_g, T, B, 1]
+			td_targets = td_per_ve.reshape(Ve, T, B, 1)  # float32[Ve, T, B, 1]
+
+			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 1, 3))  # float32[T, B, 1]
+			td_std_log = r_std_per_h.mean(dim=(0, 2))             # float32[T, B, 1]
+
 		else:
-			# GLOBAL: All Ve heads get same target
-			# Compute reward std across R, value std across Ve, per dynamics head H
-			
-			# reward: [T, R, H, B, 1] - mean and std across R per (H, T, B)
-			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))  # float32[T, H, B, 1]
-			
-			# v_values: [Ve, T, H, B, 1] - mean and std across Ve per (H, T, B)
-			v_mean_per_h = v_values.mean(dim=0)  # float32[T, H, B, 1]
-			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))  # float32[T, H, B, 1]
-			
-			# TD mean per H: μ_h = r_mean_h + γ * (1-term) * v_mean_h
-			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h  # float32[T, H, B, 1]
-			
-			# TD std per H: σ_h = r_std_h + γ * v_std_h
-			td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h  # float32[T, H, B, 1]
-			
-			# TD_h = μ_h + std_coef * σ_h per dynamics head
-			td_per_h = td_mean_per_h + std_coef * td_std_per_h  # float32[T, H, B, 1]
-			
-			# Determine dynamics reduction method
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-			
-			# Reduce over dynamics heads H
-			if dyn_reduction == "max":
-				td_reduced, _ = td_per_h.max(dim=1)  # float32[T, B, 1]
-			elif dyn_reduction == "min":
-				td_reduced, _ = td_per_h.min(dim=1)  # float32[T, B, 1]
-			else:  # "mean"
-				td_reduced = td_per_h.mean(dim=1)  # float32[T, B, 1]
-			
-			# All Ve heads get same target
-			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)  # float32[Ve, T, B, 1]
-			
-			# For logging
-			td_mean_log = td_mean_per_h.mean(dim=1)  # float32[T, B, 1]
-			td_std_log = td_std_per_h.mean(dim=1)  # float32[T, B, 1]
-		
+			# GLOBAL: all Ve_g heads in a group get the same target
+			v_mean_per_h = v_values_grouped.mean(dim=1)  # float32[G, T, H_g, B, 1]
+			v_std_per_h = v_values_grouped.std(dim=1, unbiased=(Ve_g > 1))  # float32[G, T, H_g, B, 1]
+
+			td_mean_per_h = (
+				r_mean_per_h + discount * (1 - terminated_grouped) * v_mean_per_h
+			)  # float32[G, T, H_g, B, 1]
+
+			td_std_per_h_g = r_std_per_h + discount_scalar * v_std_per_h  # float32[G, T, H_g, B, 1]
+			td_per_h = td_mean_per_h + std_coef * td_std_per_h_g  # float32[G, T, H_g, B, 1]
+
+			# Mean over H_g dynamics heads within each group
+			td_reduced = td_per_h.mean(dim=2)  # float32[G, T, B, 1]
+
+			# Broadcast to Ve_g heads per group → flatten to [Ve, T, B, 1]
+			td_targets = (
+				td_reduced.unsqueeze(1).expand(G, Ve_g, T, B, 1).reshape(Ve, T, B, 1)
+			)  # float32[Ve, T, B, 1]
+
+			td_mean_log = td_mean_per_h.mean(dim=(0, 2))    # float32[T, B, 1]
+			td_std_log = td_std_per_h_g.mean(dim=(0, 2))    # float32[T, B, 1]
+
 		return td_targets, td_mean_log, td_std_log
   
 
@@ -1235,32 +1309,64 @@ class TDMPC2(torch.nn.Module):
 		encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
 		# -----------------------------------------------------------------
-		# 3. Reward loss  (all R reward heads × H dynamics heads)
+		# 3. Reward loss  (per-group: R_g reward heads × H_g dynamics heads)
 		# -----------------------------------------------------------------
+		G = self.model.G
+		R_g = self.model.R_g
+		H_g = self.model.H_g
+		R = G * R_g
+		K = self.cfg.num_bins
+
 		with maybe_range('WM/reward_term', self.cfg):
-			# Flatten H into batch for a single reward-ensemble forward pass
-			z_flat = z_curr.permute(1, 0, 2, 3).reshape(T, H * B, L)              # float32[T, H*B, L]
-			a_flat = action.unsqueeze(1).expand(T, H, B, A).reshape(T, H * B, A)   # float32[T, H*B, A]
+			# Efficient per-group reward: each reward head r sees only its group's latents.
+			# Reshape z_curr: [H, T, B, L] → [G, H_g, T, B, L] → [G, T, H_g*B, L]
+			z_grouped = z_curr.view(G, H_g, T, B, L).permute(0, 2, 1, 3, 4)  # float32[G, T, H_g, B, L]
+			z_grouped = z_grouped.reshape(G, T, H_g * B, L)  # float32[G, T, H_g*B, L]
+			# Expand: [G, T, H_g*B, L] → [G, R_g, T, H_g*B, L] → [R, T, H_g*B, L]
+			z_for_R = z_grouped.unsqueeze(1).expand(G, R_g, T, H_g * B, L)  # float32[G, R_g, T, H_g*B, L]
+			z_for_R = z_for_R.reshape(R, T, H_g * B, L)  # float32[R, T, H_g*B, L]
 
-			reward_logits_all = self.model.reward(z_flat, a_flat, task, head_mode='all')  # float32[R, T, H*B, K]
-			R = reward_logits_all.shape[0]
-			K = self.cfg.num_bins
+			# Actions: [T, B, A] → repeat for each of H_g dynamics heads → [R, T, H_g*B, A]
+			a_expanded = action.unsqueeze(1).expand(T, H_g, B, A)  # float32[T, H_g, B, A]
+			a_expanded = a_expanded.permute(0, 1, 2, 3).reshape(T, H_g * B, A)  # float32[T, H_g*B, A]
+			a_for_R = a_expanded.unsqueeze(0).expand(R, T, H_g * B, A)  # float32[R, T, H_g*B, A]
 
-			# Cross-entropy per (R, T, H, B)
-			reward_target_exp = reward.unsqueeze(0).unsqueeze(2).expand(R, T, H, B, 1)  # float32[R, T, H, B, 1]
+			# Each reward head processes only its group's latents (no waste)
+			reward_logits_all = self.model.reward(
+				z_for_R, a_for_R, task, head_mode='all', split_data=True,
+			)  # float32[R, T, H_g*B, K]
+
+			# Reshape to per-group format
+			reward_logits_grouped = reward_logits_all.view(G, R_g, T, H_g * B, K)  # float32[G, R_g, T, H_g*B, K]
+
+			# Cross-entropy target: broadcast reward [T, B, 1] to [G, R_g, T, H_g*B, 1]
+			reward_target_grouped = (
+				reward.unsqueeze(0).unsqueeze(0).unsqueeze(3)   # float32[1, 1, T, 1, B, 1]
+				.expand(G, R_g, T, H_g, B, 1)
+				.reshape(G, R_g, T, H_g * B, 1)
+			)  # float32[G, R_g, T, H_g*B, 1]
+
+			total_grouped_elems = G * R_g * T * H_g * B
 			rew_ce = math.soft_ce(
-				reward_logits_all.reshape(R * T * H * B, K),
-				reward_target_exp.reshape(R * T * H * B, 1),
+				reward_logits_grouped.reshape(total_grouped_elems, K),
+				reward_target_grouped.reshape(total_grouped_elems, 1),
 				self.cfg,
-			).view(R, T, H, B)  # float32[R, T, H, B]
+			).view(G, R_g, T, H_g * B)  # float32[G, R_g, T, H_g*B]
 
-			rew_ce_per_t = rew_ce.mean(dim=(0, 2, 3))  # float32[T]
+			rew_ce_per_t = rew_ce.mean(dim=(0, 1, 3))  # float32[T]
 			reward_loss = (rho_pows * rew_ce_per_t).mean()
 
-			# Reward predictions for logging
-			reward_pred_all = math.two_hot_inv(reward_logits_all, self.cfg).view(R, T, H, B, 1)  # float32[R, T, H, B, 1]
-			reward_pred = reward_pred_all.mean(dim=(0, 2))  # float32[T, B, 1]
-			reward_error = (reward_pred.detach() - reward)   # float32[T, B, 1]
+			# Reward predictions for logging (grouped)
+			reward_pred_grouped = math.two_hot_inv(
+				reward_logits_grouped.view(G * R_g, T, H_g * B, K), self.cfg,
+			).view(G, R_g, T, H_g, B, 1)  # float32[G, R_g, T, H_g, B, 1]
+			reward_pred = reward_pred_grouped.mean(dim=(0, 1, 3))  # float32[T, B, 1]
+			reward_error = (reward_pred.detach() - reward)          # float32[T, B, 1]
+			# Keep [R, T, H, B, 1] view for detailed per-head logging
+			reward_pred_all = reward_pred_grouped.view(R, T, H_g, B, 1) if G == 1 else (
+				reward_pred_grouped.permute(0, 1, 3, 2, 4, 5)  # [G, R_g, H_g, T, B, 1]
+				.reshape(R, H_g, T, B, 1).permute(0, 2, 1, 3, 4)  # [R, T, H_g, B, 1]
+			)  # float32[R, T, H_g, B, 1] — note H_g not H, one group's view
 
 		# -----------------------------------------------------------------
 		# 4. Termination loss  (averaged over H dynamics heads)
@@ -1315,7 +1421,7 @@ class TDMPC2(torch.nn.Module):
 			}, non_blocking=True)
 
 		if self.log_detailed:
-			reward_pred_all_for_log = reward_pred_all.mean(dim=2)  # float32[R, T, B, 1]
+			reward_pred_all_for_log = reward_pred_all.mean(dim=2)  # float32[R, T, B, 1] (avg over H_g)
 			for i in range(T):
 				rp_step = reward_pred_all_for_log[:, i, :, 0]  # float32[R, B]
 				info.update({
@@ -1337,50 +1443,41 @@ class TDMPC2(torch.nn.Module):
 	# rollout_dynamics removed; world_model.rollout_latents handles vectorized rollouts
 
 	def imagined_rollout(self, start_z, task=None, rollout_len=None, use_target_policy=False):
-		"""Roll out imagined trajectories from latent start states using world_model.rollout_latents.
+		"""Roll out imagined trajectories using per-group policies and all dynamics heads.
 
-		Uses all dynamics heads for multi-head pessimism.
-		When rollout_len=1, all heads share the same action since the policy samples
-		from the initial state before any dynamics step.
+		Each group g's policy generates actions for its H_g dynamics heads.
+		``rollout_latents(use_policy=True)`` returns per-head actions
+		``[H, B, N, T, A]`` where within-group heads share the same action.
+
+		Reward evaluation is the full cross-product (all R heads on all H
+		latents); downstream callers (``_td_target``) extract per-group pairings.
 
 		Args:
-			start_z (Tensor[S, B_orig, L]): Starting latents where S is number of starting states
-				(typically T+1 from replay buffer horizon). Each of the S states becomes a
-				separate starting point for imagination.
-			task: Optional task index for multitask.
-			rollout_len (int): Number of imagination steps (must be 1 when H > 1).
-			use_target_policy (bool): If True, use EMA target policy instead of online policy.
+			start_z (Tensor[S, B_orig, L]): Starting latents.
+			task: Optional task index.
+			rollout_len (int): Imagination steps (must be 1 when H > 1).
+			use_target_policy (bool): Use EMA target policy.
 
 		Returns:
-			Dict with tensors:
-			- z_seq: float32[T_imag+1, H, B_expanded, L] - latent trajectory
-			- actions: float32[T_imag, 1, B_expanded, A] - actions (shared across H)
-			- rewards: float32[T_imag, R, H, B_expanded, 1] - rewards per reward/dynamics head
-			- terminated: float32[T_imag, H, B_expanded, 1] - termination signals
-
-			Where:
-			- T_imag = rollout_len (imagination horizon, e.g., 1)
-			- H = planner_num_dynamics_heads
-			- R = num_reward_heads
-			- B_expanded = S * B_orig * num_rollouts
-
-			Note: Due to num_rollouts, z_seq[0] contains each starting state duplicated
-			num_rollouts times. The z[0] states are identical within each N-group.
+			Dict with:
+			- z_seq: float32[T_imag+1, H, B_expanded, L]
+			- actions: float32[T_imag, H, B_expanded, A] (per-head, within-group shared)
+			- rewards: float32[T_imag, R, H, B_expanded, 1]
+			- terminated: float32[T_imag, H, B_expanded, 1]
+			Where B_expanded = S * B_orig * num_rollouts.
 		"""
 		S, B_orig, L = start_z.shape  # start_z: float32[S, B_orig, L]
 		A = self.cfg.action_dim
 		n_rollouts = int(self.cfg.num_rollouts)
-		
+
 		H = int(self.cfg.planner_num_dynamics_heads)
-		# Multi-head imagination requires rollout_len=1 so all heads share the same action
-		# (policy samples at z[0] before dynamics step)
 		if H > 1:
 			assert rollout_len == 1, (
-				f"Multi-head imagination (H={H}) requires rollout_len=1 so all heads share "
-				f"the same action (sampled before dynamics). Got rollout_len={rollout_len}."
+				f"Multi-head imagination (H={H}) requires rollout_len=1. "
+				f"Got rollout_len={rollout_len}."
 			)
 
-		B_total = S * B_orig  # flattened starting batch
+		B_total = S * B_orig
 		start_flat = start_z.view(B_total, L)  # float32[B_total, L]
 
 		with maybe_range('Agent/imagined_rollout', self.cfg):
@@ -1392,85 +1489,108 @@ class TDMPC2(torch.nn.Module):
 				task=task,
 				use_target_policy=use_target_policy,
 			)
-		# latents: float32[H, B_total, N, T+1, L]; actions: float32[B_total, N, T, A]
+		# latents: float32[H, B_total, N, T+1, L]
+		# actions: float32[H, B_total, N, T, A]  (per-head, within-group shared)
 		assert latents.shape[0] == H, f"Expected {H} heads, got {latents.shape[0]}"
+		assert actions.shape[0] == H, f"Expected per-head actions [H,...], got {actions.shape}"
+
+		B = B_total * n_rollouts  # final batch dimension
 
 		with maybe_range('Imagined/permute_view', self.cfg):
-			# Reshape to [T+1, H, B, L] where B = B_total * n_rollouts
-			# latents: [H, B_total, N, T+1, L] -> [T+1, H, B_total*N, L]
-			B = B_total * n_rollouts  # final batch dimension
-			# permute: [H, B_total, N, rollout_len+1, L] -> [rollout_len+1, H, B_total, N, L]
-			lat_perm = latents.permute(3, 0, 1, 2, 4).contiguous()  # float32[rollout_len+1, H, B_total, N, L]
-			z_seq = lat_perm.view(rollout_len + 1, H, B, L)  # float32[rollout_len+1, H, B, L]
+			# latents: [H, B_total, N, T+1, L] → [T+1, H, B, L]
+			lat_perm = latents.permute(3, 0, 1, 2, 4).contiguous()  # float32[T+1, H, B_total, N, L]
+			z_seq = lat_perm.view(rollout_len + 1, H, B, L)
 
 		with maybe_range('Imagined/act_seq', self.cfg):
-			# actions: [B_total, N, rollout_len, A] -> [rollout_len, B_total*N, A] -> [rollout_len, 1, B, A]
-			actions_perm = actions.permute(2, 0, 1, 3).contiguous()  # float32[rollout_len, B_total, N, A]
-			actions_flat = actions_perm.view(rollout_len, B, A)  # float32[rollout_len, B, A]
-			# Add H=1 dim since actions are shared across heads
-			actions_seq = actions_flat.unsqueeze(1)  # float32[rollout_len, 1, B, A]
+			# actions: [H, B_total, N, T, A] → [T, H, B, A]
+			act_perm = actions.permute(3, 0, 1, 2, 4).contiguous()  # float32[T, H, B_total, N, A]
+			actions_seq = act_perm.view(rollout_len, H, B, A)  # float32[T, H, B, A]
 
-		# Compute rewards and termination logits along imagined trajectories per head
-		# Need to process each head's latents through reward/termination predictors
 		with maybe_range('Imagined/rewards_term', self.cfg):
-			# z_seq[:-1]: [rollout_len, H, B, L], actions for reward: need [rollout_len, H, B, A]
-			# Expand actions to match heads: [rollout_len, 1, B, A] -> [rollout_len, H, B, A]
-			actions_expanded = actions_seq.expand(rollout_len, H, B, A)  # float32[rollout_len, H, B, A]
+			# Efficient per-group reward: each R head only sees its group's H_g latents
+			G = self.model.G
+			H_g = self.model.H_g
+			R_g = self.model.R_g
+			R = G * R_g
+			L = z_seq.shape[-1]
 
-			# Flatten H*B for reward/termination calls
-			z_for_reward = z_seq[:-1].view(rollout_len, H * B, L)  # float32[rollout_len, H*B, L]
-			actions_for_reward = actions_expanded.reshape(rollout_len, H * B, A)  # float32[rollout_len, H*B, A]
+			# z_seq[:-1]: [T, H, B, L] = [T, G*H_g, B, L]
+			# Reshape to [T, G, H_g, B, L] → [T, G, H_g*B, L] → expand to [T, R, H_g*B, L]
+			z_grouped = z_seq[:-1].view(rollout_len, G, H_g, B, L)
+			z_grouped = z_grouped.reshape(rollout_len, G, H_g * B, L)  # float32[T, G, H_g*B, L]
+			z_for_R = (
+				z_grouped
+				.unsqueeze(2)
+				.expand(rollout_len, G, R_g, H_g * B, L)
+				.reshape(rollout_len, R, H_g * B, L)
+				.permute(1, 0, 2, 3)
+				.reshape(R, rollout_len * H_g * B, L)
+			)  # float32[R, T*H_g*B, L]
 
-			# Get reward logits from all reward heads: [R, rollout_len, H*B, K]
-			reward_logits_all = self.model.reward(z_for_reward, actions_for_reward, task, head_mode='all')
-			R = reward_logits_all.shape[0]  # number of reward heads
-			# Convert to scalar rewards: [R, rollout_len, H*B, 1]
-			rewards_flat = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, rollout_len, H*B, 1]
-			# Reshape to [rollout_len, R, H, B, 1]
-			rewards = rewards_flat.permute(1, 0, 2, 3).view(rollout_len, R, H, B, 1)  # float32[rollout_len, R, H, B, 1]
+			a_grouped = actions_seq.view(rollout_len, G, H_g, B, A)
+			a_grouped = a_grouped.reshape(rollout_len, G, H_g * B, A)  # float32[T, G, H_g*B, A]
+			a_for_R = (
+				a_grouped
+				.unsqueeze(2)
+				.expand(rollout_len, G, R_g, H_g * B, A)
+				.reshape(rollout_len, R, H_g * B, A)
+				.permute(1, 0, 2, 3)
+				.reshape(R, rollout_len * H_g * B, A)
+			)  # float32[R, T*H_g*B, A]
 
+			# Each reward head processes only its group's latents (no waste)
+			reward_logits_all = self.model.reward(
+				z_for_R, a_for_R, task, head_mode='all', split_data=True,
+			)  # float32[R, T*H_g*B, K]
+
+			rewards_flat = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H_g*B, 1]
+			# Reshape to [G, R_g, T, H_g, B, 1] → permute to [T, G, R_g, H_g, B, 1]
+			rewards_grouped = rewards_flat.view(G, R_g, rollout_len, H_g, B, 1)
+			rewards = rewards_grouped.permute(2, 0, 1, 3, 4, 5).contiguous()  # float32[T, G, R_g, H_g, B, 1]
+
+			# Termination uses all H latents
+			z_for_term = z_seq[:-1].view(rollout_len, H * B, L)  # float32[T, H*B, L]
 			if self.cfg.episodic:
-				term_logits_flat = self.model.termination(z_for_reward, task, unnormalized=True)
-				term_logits = term_logits_flat.view(rollout_len, H, B, 1)  # float32[rollout_len, H, B, 1]
+				term_logits_flat = self.model.termination(z_for_term, task, unnormalized=True)
+				term_logits = term_logits_flat.view(rollout_len, H, B, 1)
 				terminated = (torch.sigmoid(term_logits) > 0.5).float()
 			else:
 				term_logits = torch.zeros(rollout_len, H, B, 1, device=z_seq.device, dtype=z_seq.dtype)
 				terminated = torch.zeros(rollout_len, H, B, 1, device=z_seq.device, dtype=z_seq.dtype)
 
-		# Avoid in-place detach on a view; build a fresh contiguous tensor
 		with maybe_range('Imagined/final_pack', self.cfg):
-			z_seq_out = torch.cat([z_seq[:1], z_seq[1:].detach()], dim=0).clone()  # float32[T+1, H, B, L]
+			z_seq_out = torch.cat([z_seq[:1], z_seq[1:].detach()], dim=0).clone()
 
 		return {
-			'z_seq': z_seq_out,  # float32[T+1, H, B, L]
-			'actions': actions_seq.detach(),  # float32[T, 1, B, A] (shared across heads)
-			'rewards': rewards.detach(),  # float32[T, R, H, B, 1]
-			'terminated': terminated.detach(),  # float32[T, H, B, 1]
-			'termination_logits': term_logits.detach(),  # float32[T, H, B, 1]
+			'z_seq': z_seq_out,                    # float32[T+1, H, B, L]
+			'actions': actions_seq.detach(),        # float32[T, H, B, A]
+			'rewards': rewards.detach(),            # float32[T, G, R_g, H_g, B, 1] — grouped format
+			'terminated': terminated.detach(),      # float32[T, H, B, 1]
+			'termination_logits': term_logits.detach(),
 		}
 
 
 
 	def calculate_value_loss(self, z_true, z_rollout, full_detach, update_world_model, task=None):
-		"""Compute primary critic loss with proper rho weighting.
-		
-		This function handles both:
-		1. V predictions: which states the V network learns to predict values for (critic_source)
-		2. TD targets: which states are used as starting point for imagination (critic_target_source)
-		
-		Internally calls imagined_rollout to create TD targets via 1-step imagination.
-		
+		"""Compute primary critic loss with per-group V training.
+
+		Groups subsume the old ``rollout_head_strategy``:
+		* critic_source='replay_true'   → V trains on encoder latents, no H dim.
+		* critic_source='replay_rollout' → V trains on all H dynamics latents,
+		  with per-group extraction (Ve_g on H_g only).
+
+		TD targets come from ``imagined_rollout`` → ``_td_target`` which already
+		performs within-group reward/V pairing internally.
+
 		Args:
 			z_true (Tensor[S, B, L]): True encoded states from encoder.
-			z_rollout (Tensor[S, H, B, L] | None): Dynamics rollout from all H heads.
-				None when WM is not updated.
+			z_rollout (Tensor[S, H, B, L] | None): Dynamics rollout (all heads).
 			full_detach (bool): Whether to detach latents from graph.
-			update_world_model (bool): Whether WM is being updated (affects gradient flow).
+			update_world_model (bool): Whether WM is being updated.
 			task: Task index for multitask.
 
 		Returns:
-			Tuple[Tensor, TensorDict, dict]: (loss, info, imagined_data) where imagined_data
-				contains z_seq, rewards, terminated for potential reuse by aux losses.
+			Tuple[Tensor, TensorDict, dict]: (loss, info, imagined_data).
 		"""
 		S, B, L = z_true.shape
 		device = z_true.device
@@ -1479,6 +1599,10 @@ class TDMPC2(torch.nn.Module):
 		N = int(self.cfg.num_rollouts)
 		R = int(self.cfg.num_reward_heads)
 		T_imag = int(self.cfg.imagination_horizon)
+		G = self.model.G
+		H_g = self.model.H_g
+		R_g = self.model.R_g
+		Ve_g = self.model.Ve_g
 
 		# Rho weighting on S (replay buffer time steps)
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))  # float32[S]
@@ -1486,64 +1610,39 @@ class TDMPC2(torch.nn.Module):
 			rho_pows = rho_pows / rho_pows.sum()
 
 		# -------------------------------------------------------------------------
-		# 0. Apply rollout_head_strategy to collapse H dim
+		# 1. V training states (critic_source)
 		# -------------------------------------------------------------------------
-		def _apply_head_strategy(z_hb):
-			"""Collapse H dim from [S, H, B, L] → [S, B_v, L] per rollout_head_strategy."""
-			strategy = self.cfg.rollout_head_strategy
-			S_in, H_in, B_in, L_in = z_hb.shape
-			if strategy == 'single':
-				return z_hb[:, 0]  # float32[S, B, L]
-			elif strategy == 'concat':
-				return z_hb.reshape(S_in, H_in * B_in, L_in)  # float32[S, H*B, L]
-			elif strategy == 'split':
-				chunk = B_in // H_in
-				assert chunk * H_in == B_in, f"B={B_in} must be divisible by H={H_in} for split strategy"
-				slices = [z_hb[:, h, h * chunk:(h + 1) * chunk] for h in range(H_in)]
-				return torch.cat(slices, dim=1)  # float32[S, B, L]
-			else:
-				raise ValueError(f"Unknown rollout_head_strategy='{strategy}'")
-
-		# -------------------------------------------------------------------------
-		# 1. Determine which states V learns to predict values for (critic_source)
-		# -------------------------------------------------------------------------
+		H = z_rollout.shape[1] if z_rollout is not None else 1
 		critic_source = self.cfg.critic_source
 		if critic_source == 'replay_rollout':
 			if z_rollout is None:
-				raise ValueError("critic_source='replay_rollout' requires z_rollout (update_world_model=True)")
-			z_for_v = _apply_head_strategy(z_rollout)  # float32[S, B_v, L]
+				raise ValueError("critic_source='replay_rollout' requires z_rollout")
+			# Flatten H into batch: [S, H, B, L] → [S, H*B, L]
+			z_for_v = z_rollout.view(S, H * B, L)
 			z_for_v = z_for_v.detach() if full_detach else z_for_v
+			use_grouped_v = True
 		elif critic_source == 'replay_true':
 			z_for_v = z_true.detach() if full_detach else z_true  # float32[S, B, L]
+			use_grouped_v = False
 		else:
 			raise ValueError(f"critic_source must be 'replay_rollout' or 'replay_true', got '{critic_source}'")
-		B_v = z_for_v.shape[1]  # may be H*B when rollout_head_strategy='concat'
+		B_v = z_for_v.shape[1]  # B or H*B
 
 		# -------------------------------------------------------------------------
-		# 2. Determine starting states for TD target imagination (critic_target_source)
+		# 2. Starting states for TD target imagination
 		# -------------------------------------------------------------------------
 		td_source = self.cfg.critic_target_source
-		# When z_rollout is None (WM not updated), force replay_true
 		if z_rollout is None:
 			td_source = 'replay_true'
-		# concat rollout + replay_rollout imagination would blow up compute (H² paths)
-		if td_source == 'replay_rollout' and B_v != B:
-			raise ValueError(
-				f"critic_target_source='replay_rollout' incompatible with "
-				f"rollout_head_strategy='{self.cfg.rollout_head_strategy}' (B_v={B_v} != B={B}). "
-				f"Use critic_target_source='replay_true' or rollout_head_strategy='single'."
-			)
 		if td_source == 'replay_true':
-			# Gradient flow: keep attached if WM is updated, else detach
 			start_z = z_true.detach() if not update_world_model else z_true
 		elif td_source == 'replay_rollout':
-			# Apply same head strategy for start states
-			z_rollout_flat = _apply_head_strategy(z_rollout)  # float32[S, B_v, L]
+			# Use first dynamics head's latents (no head-strategy needed with groups)
+			z_first_head = z_rollout[:, 0]  # float32[S, B, L]
 			if not update_world_model:
-				start_z = z_rollout_flat.detach()
+				start_z = z_first_head.detach()
 			else:
-				# z_rollout_flat[0] = encoder output, z_rollout_flat[1:] = dynamics predictions
-				start_z = torch.cat([z_rollout_flat[:1], z_rollout_flat[1:].detach()], dim=0).contiguous()
+				start_z = torch.cat([z_first_head[:1], z_first_head[1:].detach()], dim=0).contiguous()
 		else:
 			raise ValueError(f"critic_target_source must be 'replay_true' or 'replay_rollout', got '{td_source}'")
 
@@ -1556,75 +1655,144 @@ class TDMPC2(torch.nn.Module):
 			rollout_len=T_imag,
 			use_target_policy=self.cfg.td_target_use_ema_policy,
 		)
-		
-		# Get dimensions from imagined output
-		H = imagined['z_seq'].shape[1]  # num dynamics heads (may be 1)
-		
-		# Reshape outputs: [*, S*B*N, *] -> [*, S, B, N, *]
-		z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B, N, L)  # float32[T+1, H, S, B, N, L]
-		rewards = imagined['rewards'].view(T_imag, R, H, S, B, N, 1)  # float32[T, R, H, S, B, N, 1]
-		terminated = imagined['terminated'].view(T_imag, H, S, B, N, 1)  # float32[T, H, S, B, N, 1]
-		
-		# Detach imagined trajectory if needed
+
+		H_imag = imagined['z_seq'].shape[1]
+
+		z_seq = imagined['z_seq'].view(T_imag + 1, H_imag, S, B, N, L)
+		# rewards: [T, G, R_g, H_g, B_expanded, 1] where B_expanded = S*B*N
+		rewards_grouped = imagined['rewards'].view(T_imag, G, R_g, H_g, S, B, N, 1)
+		terminated = imagined['terminated'].view(T_imag, H_imag, S, B, N, 1)
+
 		if full_detach:
 			z_seq = z_seq.detach()
-		rewards = rewards.detach()
+		rewards_grouped = rewards_grouped.detach()
 		terminated = terminated.detach()
 
 		# -------------------------------------------------------------------------
-		# 4. V predictions on critic_source states
+		# 4. V predictions on critic_source states (efficient per-group when grouped_v)
 		# -------------------------------------------------------------------------
 		BN = B * N
-		BN_v = B_v * N  # may differ from BN when rollout_head_strategy='concat'
-		# z_for_v: [S, B_v, L] -> expand to [T_imag, S, B_v, N, L]
-		z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)  # float32[T_imag, S, B_v, N, L]
-		z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN_v, L)  # float32[T_imag, S, BN_v, L]
-		z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN_v, L)  # flatten for V call
-		
-		vs_flat = self.model.V(z_for_v_flat, task, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
-		Ve = vs_flat.shape[0]
-		vs = vs_flat.view(Ve, T_imag, S, BN_v, K)  # float32[Ve, T_imag, S, BN_v, K]
+		BN_v = B_v * N
+		Ve = G * Ve_g
+
+		if use_grouped_v:
+			# Efficient per-group V: each V head ve in group g sees only group g's H_g latents.
+			# z_for_v: [S, H*B, L] = [S, G*H_g*B, L]
+			# Reshape: [S, G, H_g*B, L] → expand for T_imag, N, Ve_g → [Ve, T_imag*S*H_g*BN, L]
+			z_grouped_for_v = z_for_v.view(S, G, H_g * B, L)  # float32[S, G, H_g*B, L]
+			# Expand for T_imag and N: [T_imag, S, G, H_g*BN, L]
+			z_exp = (
+				z_grouped_for_v
+				.unsqueeze(0)
+				.unsqueeze(4)
+				.expand(T_imag, S, G, H_g * B, N, L)
+				.reshape(T_imag, S, G, H_g * BN, L)
+			)  # float32[T_imag, S, G, H_g*BN, L]
+			# Expand for Ve_g heads: [T_imag, S, G, Ve_g, H_g*BN, L] → [Ve, T_imag*S*H_g*BN, L]
+			z_for_ve = (
+				z_exp
+				.unsqueeze(3)
+				.expand(T_imag, S, G, Ve_g, H_g * BN, L)
+				.permute(2, 3, 0, 1, 4, 5)  # [G, Ve_g, T_imag, S, H_g*BN, L]
+				.reshape(Ve, T_imag * S * H_g * BN, L)
+			)  # float32[Ve, T_imag*S*H_g*BN, L]
+
+			# Task for split_data: need per-head task tensor
+			# task: [B] → [S, G, H_g*B] → expand → [Ve, T_imag*S*H_g*BN]
+			if self.cfg.multitask and task is not None:
+				task_exp = (
+					task
+					.unsqueeze(0).unsqueeze(0)
+					.expand(S, G, B)
+					.unsqueeze(2)
+					.expand(S, G, H_g, B)
+					.reshape(S, G, H_g * B)
+				)  # [S, G, H_g*B]
+				task_for_ve = (
+					task_exp
+					.unsqueeze(0).unsqueeze(4)
+					.expand(T_imag, S, G, H_g * B, N)
+					.reshape(T_imag, S, G, H_g * BN)
+					.unsqueeze(3)
+					.expand(T_imag, S, G, Ve_g, H_g * BN)
+					.permute(2, 3, 0, 1, 4)
+					.reshape(Ve, T_imag * S * H_g * BN)
+				)  # float32[Ve, T_imag*S*H_g*BN]
+			else:
+				task_for_ve = None
+
+			vs_flat = self.model.V(
+				z_for_ve, task_for_ve, return_type='all', split_data=True,
+			)  # float32[Ve, T_imag*S*H_g*BN, K]
+			vs_grouped = vs_flat.view(G, Ve_g, T_imag, S, H_g * BN, K)  # float32[G, Ve_g, T_imag, S, H_g*BN, K]
+			# For non-grouped loss path, vs not needed
+			vs = None
+		else:
+			# Standard: all Ve heads see all latents (no H dimension)
+			z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
+			z_for_v_flat = z_for_v_expanded.reshape(T_imag * S * BN_v, L)
+
+			vs_flat = self.model.V(z_for_v_flat, task, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
+			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)  # float32[Ve, T_imag, S, BN_v, K]
+			vs_grouped = None  # Not used in non-grouped path
 
 		# -------------------------------------------------------------------------
 		# 5. TD targets from imagined next states
 		# -------------------------------------------------------------------------
 		with maybe_range('Value/td_target', self.cfg):
 			with torch.no_grad():
-				next_z = z_seq[1:]  # [T_imag, H, S, B, N, L]
-				next_z_flat = next_z.view(T_imag, H, S * BN, L)  # [T_imag, H, S*BN, L]
-				rewards_flat = rewards.view(T_imag, R, H, S * BN, 1)  # [T_imag, R, H, S*BN, 1]
-				terminated_flat = terminated.view(T_imag, H, S * BN, 1)  # [T_imag, H, S*BN, 1]
-				
-				td_targets_flat, td_mean_flat, td_std_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat, task)
-				
-				# Split back: [Ve, T_imag, S*BN, 1] -> [Ve, T_imag, S, BN, 1]
-				td_targets = td_targets_flat.view(Ve, T_imag, S, BN, 1)
-				td_mean = td_mean_flat.view(T_imag, S, BN, 1)  # float32[T_imag, S, BN, 1]
-				td_std = td_std_flat.view(T_imag, S, BN, 1)    # float32[T_imag, S, BN, 1]
+				next_z = z_seq[1:]  # float32[T_imag, H_imag, S, B, N, L]
+				next_z_flat = next_z.view(T_imag, H_imag, S * BN, L)
+				# rewards_grouped: [T_imag, G, R_g, H_g, S, B, N, 1] → [T_imag, G, R_g, H_g, S*BN, 1]
+				rewards_flat = rewards_grouped.view(T_imag, G, R_g, H_g, S * BN, 1)
+				terminated_flat = terminated.view(T_imag, H_imag, S * BN, 1)
 
-				# When B_v > B (concat strategy), tile TD targets to match V predictions
-				if BN_v != BN:
-					H_mult = BN_v // BN  # e.g. H for concat
-					# [Ve, T_imag, S, BN, 1] -> [Ve, T_imag, S, H_mult*BN, 1]
-					td_targets = td_targets.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)
-					td_mean = td_mean.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
-					td_std = td_std.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
+				td_targets_raw, td_mean_flat, td_std_flat = self._td_target(
+					next_z_flat, rewards_flat, terminated_flat, task,
+				)
+				# td_targets_raw: [Ve, T_imag, S*BN, 1]
+				td_targets = td_targets_raw.view(Ve, T_imag, S, BN, 1)
+				td_mean = td_mean_flat.view(T_imag, S, BN, 1)
+				td_std = td_std_flat.view(T_imag, S, BN, 1)
 
 		# -------------------------------------------------------------------------
-		# 6. Compute cross-entropy loss
+		# 6. Per-group V loss (or standard when replay_true)
 		# -------------------------------------------------------------------------
 		with maybe_range('Value/ce', self.cfg):
-			vs_flat_ce = vs.contiguous().view(Ve * T_imag * S * BN_v, K)
-			td_flat_ce = td_targets.contiguous().view(Ve * T_imag * S * BN_v, 1)
-			
-			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat_ce, self.cfg)  # float32[Ve*T_imag*S*BN_v]
-			val_ce = val_ce_flat.view(Ve, T_imag, S, BN_v)  # float32[Ve, T_imag, S, BN_v]
+			if use_grouped_v:
+				# vs_grouped already computed efficiently: [G, Ve_g, T_imag, S, H_g*BN, K]
 
-		# Average over Ve, T_imag, BN; keep S for rho weighting
-		val_ce_per_s = val_ce.mean(dim=(0, 1, 3))  # float32[S]
-		
-		# Apply rho weighting on S dimension
-		weighted = val_ce_per_s * rho_pows  # float32[S]
+				# TD targets: [Ve, T_imag, S, BN, 1] → [G, Ve_g, T_imag, S, BN, 1]
+				# Tile H_g times to match V preds
+				td_grouped = td_targets.view(G, Ve_g, T_imag, S, BN, 1)
+				td_grouped = (
+					td_grouped.unsqueeze(4)
+					.expand(G, Ve_g, T_imag, S, H_g, BN, 1)
+					.reshape(G, Ve_g, T_imag, S, H_g * BN, 1)
+				)  # float32[G, Ve_g, T_imag, S, H_g*BN, 1]
+
+				n_flat = G * Ve_g * T_imag * S * H_g * BN
+				val_ce_flat = math.soft_ce(
+					vs_grouped.reshape(n_flat, K),
+					td_grouped.reshape(n_flat, 1),
+					self.cfg,
+				)  # float32[n_flat]
+				val_ce = val_ce_flat.view(G, Ve_g, T_imag, S, H_g * BN)
+
+				# Average over G, Ve_g, T_imag, H_g*BN; keep S for rho
+				val_ce_per_s = val_ce.mean(dim=(0, 1, 2, 4))  # float32[S]
+			else:
+				# Standard: V preds [Ve, T_imag, S, BN, K] vs TD [Ve, T_imag, S, BN, 1]
+				n_flat = Ve * T_imag * S * BN
+				val_ce_flat = math.soft_ce(
+					vs.contiguous().view(n_flat, K),
+					td_targets.contiguous().view(n_flat, 1),
+					self.cfg,
+				)
+				val_ce = val_ce_flat.view(Ve, T_imag, S, BN)
+				val_ce_per_s = val_ce.mean(dim=(0, 1, 3))  # float32[S]
+
+		weighted = val_ce_per_s * rho_pows
 		loss = weighted.mean()
 
 		# -------------------------------------------------------------------------
@@ -1636,47 +1804,74 @@ class TDMPC2(torch.nn.Module):
 
 		for s in range(S):
 			info.update({f'value_loss/replay_step{s}': val_ce_per_s[s]}, non_blocking=True)
-		
-		value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN_v, 1]
-		
+
+		# Value predictions for logging
+		if use_grouped_v:
+			# vs_grouped: [G, Ve_g, T_imag, S, H_g*BN, K] → value pred
+			value_pred_grouped = math.two_hot_inv(vs_grouped, self.cfg)  # [G, Ve_g, T_imag, S, H_g*BN, 1]
+			# Aggregate for logging: mean over G, Ve_g, H_g
+			value_pred_mean_scalar = value_pred_grouped.mean()
+			value_pred_std_scalar = value_pred_grouped.std()
+			value_pred_min_scalar = value_pred_grouped.min()
+			value_pred_max_scalar = value_pred_grouped.max()
+		else:
+			value_pred = math.two_hot_inv(vs, self.cfg)  # float32[Ve, T_imag, S, BN_v, 1]
+			value_pred_mean_scalar = value_pred.mean()
+			value_pred_std_scalar = value_pred.std()
+			value_pred_min_scalar = value_pred.min()
+			value_pred_max_scalar = value_pred.max()
+
 		info.update({
 			'td_target_mean': td_mean.mean(),
 			'td_target_std': td_std.mean(),
 		}, non_blocking=True)
-		
+
 		if self.log_detailed:
 			info.update({
 				'td_target_reduced_mean': td_targets.mean(),
 				'td_target_reduced_std': td_targets.std(),
 				'td_target_reduced_min': td_targets.min(),
 				'td_target_reduced_max': td_targets.max(),
-				'value_pred_mean': value_pred.mean(),
-				'value_pred_std': value_pred.std(),
-				'value_pred_min': value_pred.min(),
-				'value_pred_max': value_pred.max(),
+				'value_pred_mean': value_pred_mean_scalar,
+				'value_pred_std': value_pred_std_scalar,
+				'value_pred_min': value_pred_min_scalar,
+				'value_pred_max': value_pred_max_scalar,
 			}, non_blocking=True)
-			
-			td_targets_with_n = td_targets.view(Ve, T_imag, S, B_v, N, 1)
+
+			td_targets_with_n = td_targets.view(Ve, T_imag, S, B, N, 1)
 			td_std_across_rollouts = td_targets_with_n.std(dim=4).mean()
 			info.update({'td_target_std_across_rollouts': td_std_across_rollouts}, non_blocking=True)
-   
-		value_error = value_pred - td_targets
-		for s in range(S):
-			info.update({
-				f'value_error_abs_mean/replay_step{s}': value_error[:, :, s].abs().mean(),
-				f'value_error_std/replay_step{s}': value_error[:, :, s].std(),
-				f'value_error_max/replay_step{s}': value_error[:, :, s].abs().max(),
-			}, non_blocking=True)
+
+		# Value error: compute per replay step (skip detailed per-batch error when grouped)
+		if use_grouped_v:
+			# For grouped, aggregate error is: mean(value_pred_grouped) - mean(td_targets) per S
+			value_pred_per_s = value_pred_grouped.mean(dim=(0, 1, 2, 4))  # [S, 1]
+			td_per_s = td_targets.mean(dim=(0, 1, 3))  # [S, 1]
+			for s in range(S):
+				value_error_s = value_pred_per_s[s] - td_per_s[s]
+				info.update({
+					f'value_error_abs_mean/replay_step{s}': value_error_s.abs().mean(),
+					f'value_error_std/replay_step{s}': torch.tensor(0.0, device=device),  # N/A for grouped
+					f'value_error_max/replay_step{s}': value_error_s.abs().max(),
+				}, non_blocking=True)
+		else:
+			value_error = value_pred.mean(dim=3, keepdim=True) - td_targets.mean(dim=3, keepdim=True)
+			for s in range(S):
+				info.update({
+					f'value_error_abs_mean/replay_step{s}': value_error[:, :, s].abs().mean(),
+					f'value_error_std/replay_step{s}': value_error[:, :, s].std(),
+					f'value_error_max/replay_step{s}': value_error[:, :, s].abs().max(),
+				}, non_blocking=True)
 
 		# Return imagined data for potential reuse by calculate_aux_value_loss
 		imagined_data = {
 			'z_seq': z_seq,  # float32[T+1, H, S, B, N, L]
-			'rewards': rewards,  # float32[T, R, H, S, B, N, 1]
+			'rewards_grouped': rewards_grouped,  # float32[T, G, R_g, H_g, S, B, N, 1]
 			'terminated': terminated,  # float32[T, H, S, B, N, 1]
 		}
 		return loss, info, imagined_data
 
-	def calculate_aux_value_loss(self, z_seq, actions, rewards, terminated, full_detach, task=None):
+	def calculate_aux_value_loss(self, z_seq, actions, rewards_grouped, terminated, full_detach, task=None):
 		"""Compute auxiliary multi-gamma critic losses with proper rho weighting on S dimension.
 		
 		With V-function, we predict V_aux(z) for each state and auxiliary gamma.
@@ -1694,7 +1889,7 @@ class TDMPC2(torch.nn.Module):
 				- N = num_rollouts per starting state
 				- L = latent dimension
 			actions (Tensor[T_imag, 1, S, B, N, A]): Actions (shared across heads).
-			rewards (Tensor[T_imag, R, H, S, B, N, 1]): Rewards with R reward heads, H dynamics heads.
+			rewards_grouped (Tensor[T_imag, G, R_g, H_g, S, B, N, 1]): Per-group rewards.
 			terminated (Tensor[T_imag, H, S, B, N, 1]): Termination signals (no R dimension).
 			full_detach (bool): Whether to detach z_seq from graph.
 			task: Task index for multitask.
@@ -1711,6 +1906,10 @@ class TDMPC2(torch.nn.Module):
 		K = self.cfg.num_bins
 		device = z_seq.device
 		dtype = z_seq.dtype
+		G = self.model.G
+		R_g = self.model.R_g
+		H_g = self.model.H_g
+		R = G * R_g
 
 		# Rho weighting on S (replay buffer time steps), NOT T_imag
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))  # float32[S]
@@ -1718,8 +1917,36 @@ class TDMPC2(torch.nn.Module):
 			rho_pows = rho_pows / rho_pows.sum()
 
 		z_seq = z_seq.detach() if full_detach else z_seq  # float32[T_imag+1, H, S, B, N, L]
-		rewards = rewards.detach()  # float32[T_imag, R, H, S, B, N, 1]
+		rewards_grouped = rewards_grouped.detach()  # float32[T_imag, G, R_g, H_g, S, B, N, 1]
 		terminated = terminated.detach()  # float32[T_imag, H, S, B, N, 1]
+
+		# Reshape grouped rewards to [T, R, H, S, B, N, 1] for _td_target_aux compatibility
+		# [T, G, R_g, H_g, S, B, N, 1] → [T, G, R_g, G, H_g, S, B, N, 1] with zeros off-diagonal
+		# For aux, we just reshape naively since aux uses global mean anyway
+		rewards = (
+			rewards_grouped
+			.permute(0, 1, 2, 3, 4, 5, 6, 7)  # keep same: [T, G, R_g, H_g, S, B, N, 1]
+			.reshape(T_imag, G * R_g, H_g, S, B, N, 1)  # [T, R, H_g, S, B, N, 1] - wrong! need H not H_g
+		)
+		# Actually this is wrong - H = G*H_g, not H_g. The issue is we have rewards from H_g per group
+		# but _td_target_aux expects all R heads evaluated on all H heads.
+		# For backward compat, expand rewards to [T, R, H, S, B, N, 1] by broadcasting
+		# Each R_g head in group g gets paired with all H_g heads in group g only.
+		rewards = (
+			rewards_grouped  # [T, G, R_g, H_g, S, B, N, 1]
+			.permute(0, 1, 3, 2, 4, 5, 6, 7)  # [T, G, H_g, R_g, S, B, N, 1]
+			.reshape(T_imag, H, R_g, S, B, N, 1)  # [T, H, R_g, S, B, N, 1]
+			.permute(0, 2, 1, 3, 4, 5, 6)  # [T, R_g, H, S, B, N, 1]
+		)
+		# This still has R_g not R=G*R_g. The correct approach is complex.
+		# For simplicity, just repeat rewards across groups for a naive all-R-all-H format.
+		# rewards_grouped: [T, G, R_g, H_g, S, B, N, 1]
+		# We need [T, R, H, S, B, N, 1] = [T, G*R_g, G*H_g, S, B, N, 1]
+		# For backward compat: just mean over R_g per group, expand to all H
+		r_mean_per_group = rewards_grouped.mean(dim=2)  # [T, G, H_g, S, B, N, 1]
+		rewards_for_aux = r_mean_per_group.view(T_imag, H, S, B, N, 1)  # [T, H, S, B, N, 1]
+		# Expand to [T, 1, H, S, B, N, 1] for _td_target_aux (which takes mean over R anyway)
+		rewards_for_aux = rewards_for_aux.unsqueeze(1)  # [T, 1, H, S, B, N, 1]
 
 		# Merge B*N for V_aux prediction, keep S separate for rho weighting
 		BN = B * N
@@ -1741,7 +1968,8 @@ class TDMPC2(torch.nn.Module):
 				# Merge S*B*N into batch for _td_target_aux, then split back
 				next_z = z_seq[1:]  # [T_imag, H, S, B, N, L]
 				next_z_flat = next_z.view(T_imag, H, S * BN, L)  # [T_imag, H, S*BN, L]
-				rewards_flat = rewards.view(T_imag, -1, H, S * BN, 1)  # [T_imag, R, H, S*BN, 1]
+				# rewards_for_aux: [T, 1, H, S, B, N, 1] → [T, 1, H, S*BN, 1]
+				rewards_flat = rewards_for_aux.view(T_imag, 1, H, S * BN, 1)  # [T_imag, 1, H, S*BN, 1]
 				terminated_flat = terminated.view(T_imag, H, S * BN, 1)  # [T_imag, H, S*BN, 1]
 				
 				aux_td_targets_flat = self._td_target_aux(next_z_flat, rewards_flat, terminated_flat, task)
@@ -1867,7 +2095,7 @@ class TDMPC2(torch.nn.Module):
 				aux_loss, aux_info = self.calculate_aux_value_loss(
 					imagined_data['z_seq'],
 					None,  # actions not used in aux loss
-					imagined_data['rewards'],
+					imagined_data['rewards_grouped'],
 					imagined_data['terminated'],
 					full_detach,
 					task=task,
@@ -1952,11 +2180,12 @@ class TDMPC2(torch.nn.Module):
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
 				# z_rollout: [T+1, H, B, L] — pass directly; calc_pi_losses handles H
-				# Fallback to z_true [T+1, B, L] → unsqueeze to [T+1, 1, B, L]
+				# Fallback to z_true [T+1, B, L] → expand to [T+1, H, B, L] (broadcast, no alloc)
 				if z_rollout is not None:
 					z_for_pi = z_rollout.detach()  # float32[T+1, H, B, L]
 				else:
-					z_for_pi = z_true.detach().unsqueeze(1)  # float32[T+1, 1, B, L]
+					H = self.cfg.planner_num_dynamics_heads
+					z_for_pi = z_true.detach().unsqueeze(1).expand(-1, H, -1, -1)  # float32[T+1, H, B, L]
     
 				pi_loss, pi_info = self.update_pi(z_for_pi, task, expert_action_dist=expert_action_dist)
 				pi_total = pi_loss * self.cfg.policy_coef
@@ -2322,3 +2551,75 @@ class TDMPC2(torch.nn.Module):
 				ratio = lin_step / duration_dynamic
 				coeff = self.cfg.start_entropy_coeff * ( (self.cfg.end_entropy_coeff / self.cfg.start_entropy_coeff) ** ratio )
 		return float(coeff)
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def extract_group_diagonal(
+	x: torch.Tensor,
+	G: int,
+	n_per_group: int,
+	h_per_group: int,
+	hb_dim: int,
+) -> torch.Tensor:
+	"""Extract per-group block-diagonal from a cross-product tensor.
+
+	When an ensemble of ``n_total = G * n_per_group`` heads (reward or value)
+	is evaluated on latents from ``H_total = G * h_per_group`` dynamics heads
+	(with H flattened into the batch dim), the result is a full cross-product.
+	Only within-group pairings are meaningful: group g's ``n_per_group`` heads
+	on group g's ``h_per_group`` dynamics latents.
+
+	Uses ``torch.diagonal`` (no Python loops) for ``torch.compile`` friendliness.
+
+	Args:
+		x: Cross-product output. dim-0 must be ``n_total = G * n_per_group``.
+			One other dimension (specified by ``hb_dim``) must have size
+			``H_total * B_inner`` for some B_inner.
+		G (int): Number of groups.
+		n_per_group (int): Ensemble members per group (R_g or Ve_g).
+		h_per_group (int): Dynamics heads per group (H_g).
+		hb_dim (int): Which dimension contains ``H_total * B_inner``.
+			Negative indexing supported.
+
+	Returns:
+		Tensor[G, n_per_group, ..., h_per_group * B_inner, ...]:
+			Per-group entries with explicit leading G dim.
+
+	Example:
+		>>> x = torch.randn(2, 3, 12, 101)  # [R=2, T=3, H*B=4*3, K=101]
+		>>> out = extract_group_diagonal(x, G=2, n_per_group=1, h_per_group=2, hb_dim=2)
+		>>> out.shape  # [2, 1, 3, 6, 101]  = [G, R_g, T, H_g*B, K]
+	"""
+	n_total = G * n_per_group
+	H_total = G * h_per_group
+	assert x.shape[0] == n_total, (
+		f"dim-0: expected n_total={n_total}, got {x.shape[0]}")
+
+	hb_abs = hb_dim % x.ndim
+	HB = x.shape[hb_abs]
+	assert HB % H_total == 0, (
+		f"hb_dim={hb_dim} size {HB} not divisible by H_total={H_total}")
+	B_inner = HB // H_total
+
+	# Step 1: reshape dim-0 [n_total] -> [G, n_per_group]
+	shape1 = list(x.shape)
+	shape1[0:1] = [G, n_per_group]
+	x = x.view(shape1)  # [G, n_g, ..., H_total*B_inner, ...]
+
+	# Step 2: reshape hb dim [H_total*B_inner] -> [G, h_per_group*B_inner]
+	# Insertion of G in step 1 shifted all subsequent axes by +1
+	hb_abs2 = hb_abs + 1
+	shape2 = list(x.shape)
+	shape2[hb_abs2:hb_abs2 + 1] = [G, h_per_group * B_inner]
+	x = x.view(shape2)  # [G, n_g, ..., G, h_g*B_inner, ...]
+
+	# Step 3: diagonal on the two G dims (0 and hb_abs2)
+	# torch.diagonal removes both G dims and appends diagonal values as last dim
+	x_diag = torch.diagonal(x, offset=0, dim1=0, dim2=hb_abs2)
+	# shape: [n_g, ..., h_g*B_inner, ..., G]
+
+	# Move G from last to first position
+	return x_diag.movedim(-1, 0).contiguous()  # [G, n_g, ..., h_g*B_inner, ...]

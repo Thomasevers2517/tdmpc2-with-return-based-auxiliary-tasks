@@ -18,7 +18,7 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         task=task,
     )  # [H,1,1,T+1,L]
     # compute_values expects latents_all [H,B,N,T+1,L] and actions [B,N,T,A]; here B=1, N=1
-    vals_unscaled, vals_scaled, vals_std, val_dis = compute_values(
+    vals_unscaled, vals_scaled, vals_std, val_dis, _ = compute_values(
         lat_all,
         noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         world_model,
@@ -79,6 +79,10 @@ class PlannerBasicInfo:
     scores_all: torch.Tensor  # (E,)
     values_scaled_all: torch.Tensor  # (E,)
     weighted_latent_disagreements_all: Optional[torch.Tensor]  # (E,)
+    # Between-group disagreement metrics (None when G=1 or log_detailed=False)
+    group_q_disagreement_chosen: Optional[torch.Tensor]           # 0-dim: std of per-group Q for chosen candidate
+    group_v_disagreement_chosen: Optional[torch.Tensor]           # 0-dim: std of per-group V for chosen candidate
+    group_latent_disagreement_chosen: Optional[torch.Tensor]      # 0-dim: between-group latent disagreement for chosen
 
 
 @dataclass
@@ -120,6 +124,10 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     value_std_coef: float
     T: int
     use_ema_value: bool = False  # Whether to use EMA target network for V in planning
+    # Between-group disagreement per-candidate tensors (None when G=1 or not computed)
+    group_q_disagreement_all: Optional[torch.Tensor] = None       # float32[I, E]: per-iteration Q disagreement
+    group_v_disagreement_all: Optional[torch.Tensor] = None       # float32[I, E]: per-iteration V disagreement
+    group_latent_disagreement_all: Optional[torch.Tensor] = None  # float32[I, E]: per-iteration latent disagreement
 
     # Outputs of post-noise analysis (set by compute_post_noise_effects)
     value_chosen_post_noise: Optional[torch.Tensor] = None

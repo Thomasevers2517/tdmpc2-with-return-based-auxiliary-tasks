@@ -11,7 +11,8 @@ def compute_values(
     value_std_coef: float = 0.0,
     use_ema_value: bool = False,
     aggregate_horizon: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_group_detail: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[dict]]:
     """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
@@ -50,16 +51,25 @@ def compute_values(
             >0 = optimistic (max over dynamics), <0 = pessimistic (min over dynamics), 0 = neutral (mean).
         use_ema_value: If True, use EMA target network for V; otherwise use online network.
         aggregate_horizon: If True, compute λ-style compound return averaging over all horizons.
+        return_group_detail: If True and G > 1, return per-group Q/V detail for disagreement.
 
     Returns:
-        Tuple[Tensor[B, N], Tensor[B, N], Tensor[B, N], Tensor[B, N]]: 
-            (values_unscaled, values_scaled, values_std, value_disagreement).
+        Tuple[Tensor[B, N], ..., Optional[dict]]:
+            (values_unscaled, values_scaled, values_std, value_disagreement, group_detail).
             values_std is the aggregated std per candidate after dynamics reduction.
+            group_detail is None unless return_group_detail=True and G > 1, containing:
+                q_per_group (Tensor[G, B, N]): Mean Q per group (over H_g within-group heads).
+                v_mean_per_group (Tensor[G, B, N]): Mean V per group (over H_g within-group heads).
     """
     H, B, N, Tp1, L = latents_all.shape  # H=dynamics heads, B=batch, N=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
     cfg = world_model.cfg
     Ve = cfg.num_q  # number of V ensemble heads
+    R = cfg.num_reward_heads  # number of reward heads
+    G = cfg.num_groups
+    H_g = cfg.heads_per_group        # H // G
+    R_g = cfg.reward_heads_per_group  # R // G
+    Ve_g = cfg.value_heads_per_group  # Ve // G
     device = latents_all.device
     dtype = latents_all.dtype
 
@@ -92,47 +102,79 @@ def compute_values(
         # Non-episodic: always alive
         alive_probs = torch.ones(H, B, N, T + 1, device=device, dtype=dtype)
 
-    # Get reward logits from all reward heads: [R, H*B*N, T, K]
-    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode='all')
-    R = rew_logits_all.shape[0]  # number of reward heads
-    
-    # Convert to scalar rewards: [R, H*B*N, T, K] -> [R, H*B*N, T, 1] -> [R, H, B, N, T]
-    r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H*B*N, T]
-    r_all = r_all.view(R, H, B, N, T)  # float32[R, H, B, N, T]
-    
-    # Per dynamics head h, compute reward mean and std across R reward heads at each timestep
-    # r_all: [R, H, B, N, T]
-    r_mean_per_h = r_all.mean(dim=0)  # float32[H, B, N, T] - mean over R
-    r_std_per_h = r_all.std(dim=0, unbiased=(R > 1))  # float32[H, B, N, T] - std over R
+    # =========== Efficient per-group reward (split_data=True) ===========
+    # Each reward head r in group g sees only latents from group g's H_g dynamics heads.
+    # z_t: [H, B, N, T, L] = [G*H_g, B, N, T, L]
+    # Reshape to [G, H_g, B, N, T, L] → [G, H_g*B*N, T, L] → expand to [R, H_g*B*N, T, L]
+    z_grouped = z_t.view(G, H_g, B, N, T, L).permute(0, 1, 2, 3, 4, 5)  # [G, H_g, B, N, T, L]
+    z_grouped = z_grouped.reshape(G, H_g * B * N, T, L)  # float32[G, H_g*B*N, T, L]
+    z_for_R = (
+        z_grouped
+        .unsqueeze(1)
+        .expand(G, R_g, H_g * B * N, T, L)
+        .reshape(R, H_g * B * N, T, L)
+    )  # float32[R, H_g*B*N, T, L]
 
-    # =========== STEP 2: Get V values ===========
+    a_grouped = a_t.view(G, H_g, B, N, T, -1).reshape(G, H_g * B * N, T, -1)  # float32[G, H_g*B*N, T, A]
+    a_for_R = (
+        a_grouped
+        .unsqueeze(1)
+        .expand(G, R_g, H_g * B * N, T, -1)
+        .reshape(R, H_g * B * N, T, -1)
+    )  # float32[R, H_g*B*N, T, A]
+
+    # Each reward head processes only its group's latents (no waste)
+    rew_logits_all = world_model.reward(z_for_R, a_for_R, task, head_mode='all', split_data=True)
+    # float32[R, H_g*B*N, T, K]
+    
+    # Convert to scalar rewards and reshape to per-group format
+    r_all = math.two_hot_inv(rew_logits_all, cfg).squeeze(-1)  # float32[R, H_g*B*N, T]
+    r_within = r_all.view(G, R_g, H_g, B, N, T)  # float32[G, R_g, H_g, B, N, T]
+
+    # Per dynamics head h, compute reward mean and std across R_g (within-group) reward heads
+    r_mean_per_h = r_within.mean(dim=1).reshape(H, B, N, T)     # float32[H, B, N, T]
+    r_std_per_h = r_within.std(dim=1, unbiased=(R_g > 1)).reshape(H, B, N, T)  # float32[H, B, N, T]
+
+    # =========== STEP 2: Get V values (efficient per-group) ===========
     if aggregate_horizon:
         # Aggregate horizon: V at ALL intermediate states z_1, ..., z_T (single batched call)
         # z_inter contains states after each action: z_1=next(z_0,a_0), z_2=next(z_1,a_1), etc.
         z_inter = latents_all[:, :, :, 1:, :]                   # float32[H, B, N, T, L]
-        z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
         
-        # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
-        v_logits_all = world_model.V(z_inter_flat, task, return_type='all', target=use_ema_value)
-        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
-        v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
+        # Efficient per-group V: reshape to [Ve, H_g*B*N*T, L] for split_data call
+        z_inter_grouped = z_inter.view(G, H_g, B, N, T, L).reshape(G, H_g * B * N * T, L)
+        z_for_Ve = (
+            z_inter_grouped
+            .unsqueeze(1)
+            .expand(G, Ve_g, H_g * B * N * T, L)
+            .reshape(Ve, H_g * B * N * T, L)
+        )  # float32[Ve, H_g*B*N*T, L]
         
-        # Per dynamics head h, compute value mean and std across Ve value heads at each horizon
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T] - mean over Ve
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N, T] - std over Ve
+        v_logits_all = world_model.V(z_for_Ve, task, return_type='all', target=use_ema_value, split_data=True)
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H_g*B*N*T]
+        v_within = v_all.view(G, Ve_g, H_g, B, N, T)  # float32[G, Ve_g, H_g, B, N, T]
+        
+        v_mean_per_h = v_within.mean(dim=1).reshape(H, B, N, T)  # float32[H, B, N, T]
+        v_std_per_h = v_within.std(dim=1, unbiased=(Ve_g > 1)).reshape(H, B, N, T)
     else:
         # Single horizon: V only at terminal z_T (original behavior)
         z_last = latents_all[:, :, :, -1, :]                    # float32[H, B, N, L]
-        z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
         
-        # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
-        v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)
-        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
-        v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
+        # Efficient per-group V: reshape to [Ve, H_g*B*N, L] for split_data call
+        z_last_grouped = z_last.view(G, H_g, B, N, L).reshape(G, H_g * B * N, L)
+        z_for_Ve = (
+            z_last_grouped
+            .unsqueeze(1)
+            .expand(G, Ve_g, H_g * B * N, L)
+            .reshape(Ve, H_g * B * N, L)
+        )  # float32[Ve, H_g*B*N, L]
         
-        # Per dynamics head h, compute value mean and std across Ve value heads
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
+        v_logits_all = world_model.V(z_for_Ve, task, return_type='all', target=use_ema_value, split_data=True)
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H_g*B*N]
+        v_within = v_all.view(G, Ve_g, H_g, B, N)  # float32[G, Ve_g, H_g, B, N]
+        
+        v_mean_per_h = v_within.mean(dim=1).reshape(H, B, N)     # float32[H, B, N]
+        v_std_per_h = v_within.std(dim=1, unbiased=(Ve_g > 1)).reshape(H, B, N)
 
     # =========== STEP 3: Compute returns ===========
     if aggregate_horizon:
@@ -198,7 +240,22 @@ def compute_values(
     # Return the aggregated std (mean over dynamics heads) for logging
     values_std = total_std_per_h.mean(dim=0)  # float32[B, N]
 
-    return values_unscaled, values_scaled, values_std, value_disagreement
+    # Optionally compute per-group detail for between-group disagreement metrics
+    group_detail = None
+    if return_group_detail and G > 1:
+        # q_per_group: mean Q per group, collapsing H_g dynamics heads within each group
+        q_per_group = q_per_h.view(G, H_g, B, N).mean(dim=1)  # float32[G, B, N]
+        # v_mean_per_group: mean V per group (single-horizon or averaged over T for aggregate)
+        if aggregate_horizon:
+            v_per_group = v_mean_per_h.mean(dim=3).view(G, H_g, B, N).mean(dim=1)  # float32[G, B, N]
+        else:
+            v_per_group = v_mean_per_h.view(G, H_g, B, N).mean(dim=1)  # float32[G, B, N]
+        group_detail = dict(
+            q_per_group=q_per_group,          # float32[G, B, N]
+            v_mean_per_group=v_per_group,     # float32[G, B, N]
+        )
+
+    return values_unscaled, values_scaled, values_std, value_disagreement, group_detail
 
 
 def compute_disagreement(final_latents_all: torch.Tensor) -> torch.Tensor:

@@ -1,0 +1,56 @@
+# Sweep 11.2: Single policy with 4 groups and efficient parallel reward
+# Tests num_policies=1 (single shared policy) with G=4 groups.
+# H=4 dynamics, R=4 reward, Ve=8 value → per group: H_g=1, R_g=1, Ve_g=2
+# Single policy trained to maximize average Q across all 4 groups.
+#
+# 3 tasks × 2 seeds = 6 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - quadruped-walk
+      - hopper-hop
+      - dog-run
+
+  seed:
+    values: [1, 2]
+
+  # 4 groups with 1 shared policy
+  num_groups:
+    value: 4
+
+  num_policies:
+    value: 1
+
+  # Head counts (divide evenly into G=4 groups)
+  planner_num_dynamics_heads:
+    value: 4
+
+  num_reward_heads:
+    value: 4
+
+  num_q:
+    value: 8
+
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

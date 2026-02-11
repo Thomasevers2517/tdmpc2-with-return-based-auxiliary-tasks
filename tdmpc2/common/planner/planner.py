@@ -10,6 +10,30 @@ from common.logger import get_logger
 log = get_logger(__name__)
 
 
+def _compute_between_group_latent_dis(
+    latents_all: torch.Tensor,
+    G: int,
+) -> torch.Tensor:
+    """Compute between-group latent disagreement at the final timestep.
+
+    Collapses H_g dynamics heads within each group via mean, then measures
+    variance across G group-mean latents (averaged over latent dims).
+
+    Args:
+        latents_all (Tensor[H, B, N, T+1, L]): Latent rollouts from all dynamics heads.
+        G: Number of groups (must divide H evenly).
+
+    Returns:
+        Tensor[B, N]: Between-group latent disagreement per candidate.
+    """
+    H = latents_all.shape[0]
+    H_g = H // G
+    final = latents_all[:, :, :, -1, :]                      # float32[H, B, N, L]
+    grouped = final.view(G, H_g, *final.shape[1:])           # float32[G, H_g, B, N, L]
+    group_means = grouped.mean(dim=1)                         # float32[G, B, N, L]
+    return group_means.var(dim=0, unbiased=(G > 1)).mean(dim=-1)  # float32[B, N]
+
+
 class Planner(torch.nn.Module):
     """CEM/MPPI-style planner with optional latent disagreement scoring.
 
@@ -144,20 +168,24 @@ class Planner(torch.nn.Module):
 
         # Prepare policy-seeded candidates (frozen across iterations)
         policy_cache = None
+        enable_detailed_logging = (B == 1)
+        compute_group_metrics = log_detailed and enable_detailed_logging and self.cfg.num_groups > 1
         if S > 0:
             use_optimistic = (not eval_mode) and self.cfg.dual_policy_enabled
-            # rollout_latents: z0 [B, L] -> latents [H, B, S, T+1, L], actions [B, S, T, A]
-            latents_p, actions_p = self.world_model.rollout_latents(
+            # Generate per-group policy seeds, then roll through ALL dynamics heads
+            actions_p = self.world_model.generate_grouped_policy_seeds(
                 z0,
-                use_policy=True,
+                total_seeds=S,
                 horizon=T,
-                num_rollouts=S,
                 task=task,
                 policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
                 use_optimistic_policy=use_optimistic,
+            )  # float32[B, S, T, A]
+            latents_p, actions_p = self.world_model.rollout_latents(
+                z0, actions=actions_p, use_policy=False, task=task,
             )
             # Shapes: latents_p [H, B, S, T+1, L], actions_p [B, S, T, A]
-            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p = compute_values(
+            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p, group_detail_p = compute_values(
                 latents_p,     # [H, B, S, T+1, L]
                 actions_p,     # [B, S, T, A]
                 self.world_model,
@@ -165,12 +193,22 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
+                return_group_detail=compute_group_metrics,
             )
             # vals_*: [B, S]
             latent_dis_p = None
             if not eval_mode and latents_p.shape[0] > 1:
                 final_policy = latents_p[:, :, :, -1, :]  # [H, B, S, L]
                 latent_dis_p = compute_disagreement(final_policy)  # [B, S]
+            # Between-group disagreement for policy candidates
+            group_q_dis_p = None
+            group_v_dis_p = None
+            group_latent_dis_p = None
+            if compute_group_metrics and group_detail_p is not None:
+                G = self.cfg.num_groups
+                group_q_dis_p = group_detail_p['q_per_group'].std(dim=0, unbiased=(G > 1))  # float32[B, S]
+                group_v_dis_p = group_detail_p['v_mean_per_group'].std(dim=0, unbiased=(G > 1))  # float32[B, S]
+                group_latent_dis_p = _compute_between_group_latent_dis(latents_p, G)  # float32[B, S]
             scores_p = combine_scores(vals_scaled_p, latent_dis_p, lambda_latent)  # [B, S]
             weighted_latent_dis_p = (lambda_latent * latent_dis_p) if latent_dis_p is not None else None
             policy_cache = dict(
@@ -183,10 +221,12 @@ class Planner(torch.nn.Module):
                 value_disagreement=val_dis_p,         # [B, S]
                 weighted_latent_dis=weighted_latent_dis_p,  # [B, S] or None
                 scores=scores_p,                      # [B, S]
+                group_q_dis=group_q_dis_p,            # [B, S] or None
+                group_v_dis=group_v_dis_p,            # [B, S] or None
+                group_latent_dis=group_latent_dis_p,  # [B, S] or None
             )
 
         # Containers for per-iteration histories (for advanced logging, only for B=1)
-        enable_detailed_logging = (B == 1)
         actions_hist = [] if enable_detailed_logging else None
         latents_hist = [] if enable_detailed_logging else None
         values_unscaled_hist = [] if enable_detailed_logging else None
@@ -196,6 +236,9 @@ class Planner(torch.nn.Module):
         scores_hist = [] if enable_detailed_logging else None
         mean_hist = [] if enable_detailed_logging else None
         std_hist = [] if enable_detailed_logging else None
+        group_q_dis_hist = [] if compute_group_metrics else None
+        group_v_dis_hist = [] if compute_group_metrics else None
+        group_latent_dis_hist = [] if compute_group_metrics else None
 
         # Iterative refinement
         for it in range(iterations):
@@ -211,7 +254,7 @@ class Planner(torch.nn.Module):
             # latents_s: [H, B, N, T+1, L], actions_s: [B, N, T, A]
 
             # Values for sampled trajectories
-            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s = compute_values(
+            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s, group_detail_s = compute_values(
                 latents_s,   # [H, B, N, T+1, L]
                 actions_s,   # [B, N, T, A]
                 self.world_model,
@@ -219,6 +262,7 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
+                return_group_detail=compute_group_metrics,
             )
             # vals_*: [B, N]
             
@@ -226,6 +270,15 @@ class Planner(torch.nn.Module):
             if not eval_mode and latents_s.shape[0] > 1:
                 final_s = latents_s[:, :, :, -1, :]  # [H, B, N, L]
                 latent_dis_s = compute_disagreement(final_s)  # [B, N]
+            # Between-group disagreement for sampled candidates
+            group_q_dis_s = None
+            group_v_dis_s = None
+            group_latent_dis_s = None
+            if compute_group_metrics and group_detail_s is not None:
+                G = self.cfg.num_groups
+                group_q_dis_s = group_detail_s['q_per_group'].std(dim=0, unbiased=(G > 1))  # float32[B, N]
+                group_v_dis_s = group_detail_s['v_mean_per_group'].std(dim=0, unbiased=(G > 1))  # float32[B, N]
+                group_latent_dis_s = _compute_between_group_latent_dis(latents_s, G)  # float32[B, N]
             scores_s = combine_scores(vals_scaled_s, latent_dis_s, lambda_latent)  # [B, N]
             weighted_latent_dis_s = (lambda_latent * latent_dis_s) if latent_dis_s is not None else None
 
@@ -278,6 +331,21 @@ class Planner(torch.nn.Module):
                 weighted_latent_dis_all = weighted_latent_dis_s
                 scores = scores_s            # [B, N]
 
+            # Between-group metric concatenation
+            if compute_group_metrics:
+                if include_policy:
+                    group_q_dis = torch.cat([policy_cache['group_q_dis'], group_q_dis_s], dim=1)
+                    group_v_dis = torch.cat([policy_cache['group_v_dis'], group_v_dis_s], dim=1)
+                    group_latent_dis = torch.cat([policy_cache['group_latent_dis'], group_latent_dis_s], dim=1)
+                else:
+                    group_q_dis = group_q_dis_s
+                    group_v_dis = group_v_dis_s
+                    group_latent_dis = group_latent_dis_s
+            else:
+                group_q_dis = None
+                group_v_dis = None
+                group_latent_dis = None
+
             # Elite selection per batch element: [B, E] -> [B, K]
             elite_scores, elite_indices = torch.topk(scores, K, dim=1, largest=True, sorted=True)  # [B, K]
             
@@ -313,6 +381,10 @@ class Planner(torch.nn.Module):
                     latent_disagreement_hist.append(latent_dis.detach())  # [1, E]
                 if val_dis is not None:
                     value_disagreement_hist.append(val_dis.detach())      # [1, E]
+                if compute_group_metrics and group_q_dis is not None:
+                    group_q_dis_hist.append(group_q_dis.detach())        # [1, E]
+                    group_v_dis_hist.append(group_v_dis.detach())        # [1, E]
+                    group_latent_dis_hist.append(group_latent_dis.detach())  # [1, E]
 
         # Final selection: per batch element
         # Greedy (argmax) selection: used in eval mode OR when greedy_train_action_selection is enabled
@@ -411,6 +483,9 @@ class Planner(torch.nn.Module):
                 scores_all=scores_b0,
                 values_scaled_all=vals_scaled_b0,
                 weighted_latent_disagreements_all=weighted_latent_dis_b0,
+                group_q_disagreement_chosen=(group_q_dis[0, chosen_idx[0, 0]] if group_q_dis is not None else None),
+                group_v_disagreement_chosen=(group_v_dis[0, chosen_idx[0, 0]] if group_v_dis is not None else None),
+                group_latent_disagreement_chosen=(group_latent_dis[0, chosen_idx[0, 0]] if group_latent_dis is not None else None),
             )
 
         # Detailed logging: upgrade info_basic to info_adv if requested (only for B=1)
@@ -425,6 +500,9 @@ class Planner(torch.nn.Module):
             std_all = torch.stack(std_hist, dim=0).squeeze(1)                        # [I, T, A]
             latent_disagreements_all = torch.stack(latent_disagreement_hist, dim=0).squeeze(1) if len(latent_disagreement_hist) > 0 else None
             value_disagreements_all = torch.stack(value_disagreement_hist, dim=0).squeeze(1) if len(value_disagreement_hist) > 0 else None
+            group_q_disagreement_stacked = torch.stack(group_q_dis_hist, dim=0).squeeze(1) if (group_q_dis_hist and len(group_q_dis_hist) > 0) else None
+            group_v_disagreement_stacked = torch.stack(group_v_dis_hist, dim=0).squeeze(1) if (group_v_dis_hist and len(group_v_dis_hist) > 0) else None
+            group_latent_disagreement_stacked = torch.stack(group_latent_dis_hist, dim=0).squeeze(1) if (group_latent_dis_hist and len(group_latent_dis_hist) > 0) else None
 
             info_out = PlannerAdvancedInfo(
                 **vars(info_basic),
@@ -446,6 +524,9 @@ class Planner(torch.nn.Module):
                 value_std_coef=value_std_coef,
                 T=T,
                 use_ema_value=use_ema_value,
+                group_q_disagreement_all=group_q_disagreement_stacked,
+                group_v_disagreement_all=group_v_disagreement_stacked,
+                group_latent_disagreement_all=group_latent_disagreement_stacked,
             )
             with torch.no_grad():
                 info_out.compute_post_noise_effects(self.world_model)
