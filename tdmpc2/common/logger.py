@@ -28,7 +28,6 @@ def get_logger(name: Optional[str] = None, cfg: Optional[object] = None) -> logg
 
 _log = get_logger(__name__)
 
-from common import TASK_SET
 
 
 CONSOLE_FORMAT = [
@@ -241,36 +240,6 @@ class Logger:
 			self._log_dir / "eval.csv", header=keys, index=None
 		)
 
-	def pprint_multitask(self, d, cfg):
-		"""Pretty-print evaluation metrics for multi-task training."""
-		_log.info("%s", colored(f'Evaluated agent on {len(cfg.tasks)} tasks:', 'yellow', attrs=['bold']))
-		dmcontrol_reward = []
-		metaworld_reward = []
-		metaworld_success = []
-		for k, v in d.items():
-			if '+' not in k:
-				continue
-			task = k.split('+')[1]
-			if task in TASK_SET['mt30'] and k.startswith('episode_reward'): # DMControl
-				dmcontrol_reward.append(v)
-				_log.info("%s", colored(f'  {task:<22}\tR: {v:.01f}', 'yellow'))
-			elif task in TASK_SET['mt80'] and task not in TASK_SET['mt30']: # Meta-World
-				if k.startswith('episode_reward'):
-					metaworld_reward.append(v)
-				elif k.startswith('episode_success'):
-					metaworld_success.append(v)
-					_log.info("%s", colored(f'  {task:<22}\tS: {v:.02f}', 'yellow'))
-		dmcontrol_reward = np.nanmean(dmcontrol_reward)
-		d['episode_reward+avg_dmcontrol'] = dmcontrol_reward
-		_log.info("%s", colored(f'  {"dmcontrol":<22}\tR: {dmcontrol_reward:.01f}', 'yellow', attrs=['bold']))
-		if cfg.task == 'mt80':
-			metaworld_reward = np.nanmean(metaworld_reward)
-			metaworld_success = np.nanmean(metaworld_success)
-			d['episode_reward+avg_metaworld'] = metaworld_reward
-			d['episode_success+avg_metaworld'] = metaworld_success
-			_log.info("%s", colored(f'  {"metaworld":<22}\tR: {metaworld_reward:.01f}', 'yellow', attrs=['bold']))
-			_log.info("%s", colored(f'  {"metaworld":<22}\tS: {metaworld_success:.02f}', 'yellow', attrs=['bold']))
-
 	def log(self, d, category="train"):
 		# assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
 		# Determine x-axis key
@@ -296,7 +265,7 @@ class Logger:
 			info: PlannerBasicInfo or PlannerAdvancedInfo instance.
 			step: Global step for x-axis alignment.
 			category: Log category (train/eval/etc.).
-			prefix: Metric prefix (default "planner", use "reanalyze" for reanalyze logging).
+			prefix: Metric prefix (default "planner").
 		"""
 		try:
 			from common.planner.info_types import PlannerBasicInfo, PlannerAdvancedInfo

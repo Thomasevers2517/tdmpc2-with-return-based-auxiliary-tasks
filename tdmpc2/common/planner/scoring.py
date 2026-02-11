@@ -7,7 +7,6 @@ def compute_values(
     latents_all: torch.Tensor,  # float32[H, B, N, T+1, L]
     actions: torch.Tensor,      # float32[B, N, T, A]
     world_model,
-    task=None,
     value_std_coef: float = 0.0,
     use_ema_value: bool = False,
     aggregate_horizon: bool = False,
@@ -45,7 +44,6 @@ def compute_values(
             H = dynamics heads, B = batch, N = candidates per batch, T+1 = timesteps, L = latent_dim.
         actions (Tensor[B, N, T, A]): Action sequences aligned with latents.
         world_model: WorldModel exposing reward() and V().
-        task: Optional task index for multitask setups.
         value_std_coef: Coefficient for mean + coef × std reduction.
             >0 = optimistic (max over dynamics), <0 = pessimistic (min over dynamics), 0 = neutral (mean).
         use_ema_value: If True, use EMA target network for V; otherwise use online network.
@@ -79,7 +77,7 @@ def compute_values(
     if cfg.episodic:
         # Get termination probabilities at each step
         z_for_term = z_flat.view(H * B * N * T, L)
-        term_probs_flat = world_model.termination(z_for_term, task)  # float32[H*B*N*T, 1]
+        term_probs_flat = world_model.termination(z_for_term)  # float32[H*B*N*T, 1]
         term_probs = term_probs_flat.view(H, B, N, T)  # float32[H, B, N, T]
         
         # Cumulative product of survival: cumprod(1 - term_probs)
@@ -93,7 +91,7 @@ def compute_values(
         alive_probs = torch.ones(H, B, N, T + 1, device=device, dtype=dtype)
 
     # Get reward logits from all reward heads: [R, H*B*N, T, K]
-    rew_logits_all = world_model.reward(z_flat, a_flat, task, head_mode='all')
+    rew_logits_all = world_model.reward(z_flat, a_flat, head_mode='all')
     R = rew_logits_all.shape[0]  # number of reward heads
     
     # Convert to scalar rewards: [R, H*B*N, T, K] -> [R, H*B*N, T, 1] -> [R, H, B, N, T]
@@ -113,7 +111,7 @@ def compute_values(
         z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
         
         # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
-        v_logits_all = world_model.V(z_inter_flat, task, return_type='all', target=use_ema_value)
+        v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value)
         v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
         v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
         
@@ -126,7 +124,7 @@ def compute_values(
         z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
         
         # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
-        v_logits_all = world_model.V(z_last_flat, task, return_type='all', target=use_ema_value)
+        v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value)
         v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
         v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
         

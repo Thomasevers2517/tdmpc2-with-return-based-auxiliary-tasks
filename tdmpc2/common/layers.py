@@ -356,7 +356,7 @@ class DynamicsHeadWithPrior(nn.Module):
 	This encourages diverse representations across ensemble members.
 
 	Args:
-		in_dim (int): Input dimension (latent_dim + action_dim + task_dim).
+		in_dim (int): Input dimension (latent_dim + action_dim).
 		mlp_dims (list[int]): Hidden dimensions for the main MLP.
 		out_dim (int): Output dimension (latent_dim).
 		cfg: Config object with simnorm_dim and prior settings.
@@ -438,18 +438,18 @@ def enc(cfg, out={}):
 	Returns a dictionary of encoders for each observation in the dict.
 	
 	Args:
-		cfg: Config object with obs_shape, task_dim, num_enc_layers, enc_dim, 
+	cfg: Config object with obs_shape, num_enc_layers, enc_dim, 
 		     latent_dim, encoder_dropout, num_channels, simnorm_dim.
 		out: Optional dict to populate (default empty).
 	
 	Returns:
 		nn.ModuleDict of encoders keyed by observation type ('state', 'rgb').
 	"""
-	encoder_dropout = getattr(cfg, 'encoder_dropout', 0.0)
+	encoder_dropout = cfg.encoder_dropout
 	for k in cfg.obs_shape.keys():
 		if k == 'state':
 			# Apply dropout at last hidden layer (before SimNorm) to allow encoder compute before noise
-			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
+			out[k] = mlp(cfg.obs_shape[k][0], max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
 		elif k == 'rgb':
 			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:

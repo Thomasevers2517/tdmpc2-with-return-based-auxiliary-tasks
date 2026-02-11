@@ -58,7 +58,7 @@ def train(cfg: dict):
 	set_seed(cfg.seed)
 	log.info('Work dir: %s', cfg.work_dir)
 
-	trainer_cls = OfflineTrainer if cfg.multitask else OnlineTrainer
+	trainer_cls = OnlineTrainer
 	if getattr(cfg, 'nvtx_profiler', False):
 		with emit_nvtx():
 			trainer = trainer_cls(

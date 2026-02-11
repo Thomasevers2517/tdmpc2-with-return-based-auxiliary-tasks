@@ -24,6 +24,7 @@ mlp_dim: 512
 enc_dim: 256
 num_enc_layers: 2
 num_channels: 32    # Conv channels (pixel obs only)
+task_dim: 96
 simnorm_dim: 8
 num_bins: 101
 vmin: -10
@@ -87,10 +88,10 @@ discount_max: 0.995
 rho: 0.5
 final_rho: -1  # if >0, overrides rho schedule so end-of-horizon discount = final_rho. -1 = disabled.
 
-# --- Critic type ---
+# --- Critic type & latent source ---
 critic_type: V  # Only 'V' is implemented.
-critic_source: replay_rollout       # 'replay_rollout' (dynamics-predicted z) or 'replay_true' (encoder z) for V predictions.
-critic_target_source: replay_true    # 'replay_rollout' or 'replay_true' for imagination start states (TD targets).
+critic_source: replay_rollout       # replay_rollout | replay_true
+critic_target_source: replay_true   # replay_true | replay_rollout
 
 # --- TD targets ---
 local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
@@ -102,6 +103,7 @@ n_mc_samples_target: 1
 
 # --- Imagination bootstrapping ---
 imagination_horizon: 1
+detach_imagine_value: false
 ema_value_planning: false
 
 # ===========================================================================
@@ -119,6 +121,7 @@ imagine_value_loss_coef_mult: 1
 # ===========================================================================
 #  7. Policy (SVG / Entropy)
 # ===========================================================================
+policy_optimization_method: svg  # 'svg' | 'distillation' | 'both'
 bmpc_policy_parameterization: false
 
 log_std_min: -5
@@ -140,6 +143,7 @@ pi_rollout_horizon: 1
 pi_multi_rollout: false
 
 policy_value_std_coef: 0
+policy_trust_region_coef: 0.0
 policy_ema_tau: null  # null = inherit from tau
 
 # ===========================================================================
@@ -216,11 +220,43 @@ data_dir: ???
 dual_policy_enabled: false
 optimistic_policy_value_std_coef: 0
 optimistic_entropy_mult: 100
-
-normalize_rho_weights: true
+optimistic_policy_optimization_method: same
 
 # ===========================================================================
-# 14. Environment-Specific
+# 14. Reanalyze / Distillation (mostly unused with SVG baseline)
+# ===========================================================================
+reanalyze_interval: 10
+reanalyze_batch_size: 60
+reanalyze_horizon: null
+reanalyze_iterations: null
+reanalyze_num_samples: null
+reanalyze_num_elites: null
+reanalyze_num_pi_trajs: null
+reanalyze_temperature: null
+reanalyze_value_std_coef: 0.0
+reanalyze_use_chosen_action: false
+reanalyze_slice_mode: true
+initial_expert_from_behavior: true
+expert_std_scale: 1.5
+normalize_rho_weights: true
+min_expert_std: 0.1
+policy_svg_distill_ratio: 0.5
+fix_kl_order: false
+kl_scale_min: 0.1
+
+# ===========================================================================
+# 15. Multi-Gamma Auxiliary Value Supervision (research feature)
+# ===========================================================================
+multi_gamma_gammas: [0.9, 0.95]
+joint_aux_dim_mult: 1
+multi_gamma_head: separate
+multi_gamma_loss_weight: 0       # 0 = disabled
+multi_gamma_debug_logging: true
+multi_gamma_log_num_examples: 4
+auxiliary_value_ema: true
+
+# ===========================================================================
+# 16. Environment-Specific
 # ===========================================================================
 episodic: false
 knn_entropy_k: 5
@@ -230,13 +266,23 @@ distracted_difficulty: medium
 davis_dataset_path: /users/thomasevers/users/thomas/auxilarysignalsworldmodels/tdmpc2/tdmpc2/envs/custom_envs/distracting_control/DAVIS/JPEGImages/480p
 
 # ===========================================================================
+# 17. Deprecated / Legacy (no effect)
+# ===========================================================================
+sac_style_td: false
+
+# ===========================================================================
 # Computed at parse time (do not set manually)
 # ===========================================================================
 work_dir: ???
 task_title: ???
+multitask: ???
+tasks: ???
 obs_shape: ???
 action_dim: ???
 episode_length: ???
+obs_shapes: ???
+action_dims: ???
+episode_lengths: ???
 seed_steps: ???
 bin_size: ???
 

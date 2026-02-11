@@ -53,12 +53,14 @@ class Planner(torch.nn.Module):
     def plan(
         self,
         z0: torch.Tensor,
+        task: Optional[torch.Tensor] = None,
         eval_mode: bool = False,
         log_detailed: bool = False,
         train_noise_multiplier: Optional[float] = None,
         value_std_coef_override: Optional[float] = None,
         use_warm_start: bool = True,
         update_warm_start: bool = True,
+        reanalyze: bool = False,
     ) -> Tuple[torch.Tensor, Optional[PlannerBasicInfo], torch.Tensor, torch.Tensor]:
         """Plan action sequences and return the first action for each batch element.
         
@@ -67,11 +69,13 @@ class Planner(torch.nn.Module):
 
         Args:
             z0 (Tensor[B, L] or Tensor[L]): Initial latent states.
+            task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection.
             log_detailed: If True, return PlannerAdvancedInfo with full iteration history.
             value_std_coef_override: Override default value_std_coef for this call.
             use_warm_start: If True, initialize mean from shifted prev_mean (only for B=1).
             update_warm_start: If True, update prev_mean after planning (only for B=1).
+            reanalyze: If True, use reanalyze-specific config (reanalyze_num_pi_trajs, etc.).
 
         Returns:
             Tuple of:
@@ -80,6 +84,8 @@ class Planner(torch.nn.Module):
                 - Tensor[B, T, A]: Final mean action sequences.
                 - Tensor[B, T, A]: Final std action sequences.
         """
+        assert not getattr(self.cfg, 'multitask', False), 'Planner currently does not support multitask.'
+        
         # Ensure z0 has batch dimension: [L] -> [1, L]
         if z0.dim() == 1:
             z0 = z0.unsqueeze(0)  # float32[1, L]
@@ -89,8 +95,18 @@ class Planner(torch.nn.Module):
         dtype = self.prev_mean.dtype
         _, A = self.prev_mean.shape
 
-        # Planning mode config: eval vs train
-        if eval_mode:
+        # Planning mode config: reanalyze vs eval vs train
+        if reanalyze:
+            # Reanalyze mode: use reanalyze-specific config
+            T = int(self.cfg.reanalyze_horizon)
+            iterations = int(self.cfg.reanalyze_iterations)
+            N = int(self.cfg.reanalyze_num_samples)
+            S = int(self.cfg.reanalyze_num_pi_trajs)
+            K = int(self.cfg.reanalyze_num_elites)
+            temp = float(self.cfg.reanalyze_temperature)
+            lambda_latent = 0.0  # No exploration bonus during reanalyze
+            value_std_coef = float(self.cfg.reanalyze_value_std_coef)
+        elif eval_mode:
             # Eval mode: all heads, value-only scoring
             T = int(self.cfg.horizon)
             iterations = int(self.cfg.iterations)
@@ -136,6 +152,7 @@ class Planner(torch.nn.Module):
                 use_policy=True,
                 horizon=T,
                 num_rollouts=S,
+                task=task,
                 policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
                 use_optimistic_policy=use_optimistic,
             )
@@ -144,6 +161,7 @@ class Planner(torch.nn.Module):
                 latents_p,     # [H, B, S, T+1, L]
                 actions_p,     # [B, S, T, A]
                 self.world_model,
+                task,
                 value_std_coef=value_std_coef,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
@@ -188,7 +206,7 @@ class Planner(torch.nn.Module):
             # World model rollout: z0 [B, L], actions [B, N, T, A]
             # Returns latents [H, B, N, T+1, L], actions [B, N, T, A]
             latents_s, actions_s = self.world_model.rollout_latents(
-                z0, actions=actions_s, use_policy=False
+                z0, actions=actions_s, use_policy=False, task=task
             )
             # latents_s: [H, B, N, T+1, L], actions_s: [B, N, T, A]
 
@@ -197,6 +215,7 @@ class Planner(torch.nn.Module):
                 latents_s,   # [H, B, N, T+1, L]
                 actions_s,   # [B, N, T, A]
                 self.world_model,
+                task,
                 value_std_coef=value_std_coef,
                 use_ema_value=use_ema_value,
                 aggregate_horizon=aggregate_horizon,
@@ -422,7 +441,7 @@ class Planner(torch.nn.Module):
                 action_noise=(noise_vec_first[0].detach() if noise_vec_first is not None else None),
                 std_first_action=std_first[0].detach(),
                 z0=z0[0].detach(),
-                task=None,
+                task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
                 value_std_coef=value_std_coef,
                 T=T,
