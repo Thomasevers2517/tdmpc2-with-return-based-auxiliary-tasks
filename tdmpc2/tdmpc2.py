@@ -333,19 +333,51 @@ class TDMPC2(torch.nn.Module):
 			a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
 			next_z_all = self.model.next(z_for_dyn, a_for_dyn, split_data=True)  # float32[H, T*B*N, L]
 
-			# V(z') for all Ve value heads
-			next_z_flat = next_z_all.reshape(H * T * B * N, L)
-			v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-			Ve = v_next_flat.shape[0]
-			v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
-			v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+			# V(z') and reward/value stats for Q estimate
+			Ve = self.cfg.num_q
+			if self.cfg.value_per_dynamics:
+				G = Ve // H  # value heads per dynamics head
+
+				# Values: each Ve head sees its linked dynamics head's next_z
+				next_z_ve = next_z_all.repeat_interleave(G, dim=0)  # float32[Ve, T*B*N, L]
+				v_next_raw = self.model.V(next_z_ve, return_type='all_values', detach=True, split_data=True)
+				# v_next_raw: float32[Ve, T*B*N, 1]
+				v_next_flat = v_next_raw  # alias for logging
+
+				# Mean/std over ALL Ve heads (dynamics + value uncertainty combined)
+				v_mean_coll = v_next_raw.mean(dim=0)                            # float32[T*B*N, 1]
+				v_std_coll = v_next_raw.std(dim=0, unbiased=(Ve > 1))           # float32[T*B*N, 1]
+
+				# Rewards: mean/std over all R reward heads AND H dynamics heads
+				reward_per_rh = reward_all.view(R, T, H, B * N, 1)              # float32[R, T, H, B*N, 1]
+				r_mean_coll = reward_per_rh.mean(dim=(0, 2))                    # float32[T, B*N, 1]
+				r_std_coll = reward_per_rh.std(dim=(0, 2), unbiased=(R * H > 1))
+
+				# Expand [T, B*N, 1] → [T*B_eff*N, 1] for loss (replicate across H)
+				reward_mean = r_mean_coll.unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+				reward_std = r_std_coll.unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+				v_mean = v_mean_coll.view(T, B * N, 1).unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+				v_std = v_std_coll.view(T, B * N, 1).unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+
+				# Logging: total v_std, v_std per dynamics head, r_std per dynamics head
+				vpd_v_std_total = v_std_coll.mean()
+				v_grouped = v_next_raw.view(H, G, T * B * N, 1)                 # float32[H, G, T*B*N, 1]
+				vpd_v_std_per_dyn = v_grouped.std(dim=1, unbiased=(G > 1)).mean()
+				vpd_r_std_per_dyn = reward_per_rh.std(dim=0, unbiased=(R > 1)).mean()  # std over R per (T,H,B*N)
+			else:
+				next_z_flat = next_z_all.reshape(H * T * B * N, L)
+				v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
+				Ve = v_next_flat.shape[0]
+				v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
+				v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+
+				v_mean = v_next_reord.mean(dim=0)                            # float32[T*H*B*N, 1]
+				v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))           # float32[T*H*B*N, 1]
+
+				reward_mean = reward_all.mean(dim=0)                         # float32[T*H*B*N, 1]
+				reward_std = reward_all.std(dim=0, unbiased=(R > 1))
 
 			# Q estimate per sample
-			reward_mean = reward_all.mean(dim=0)                         # float32[T*H*B*N, 1]
-			reward_std = reward_all.std(dim=0, unbiased=(R > 1))         # float32[T*H*B*N, 1]
-			v_mean = v_next_reord.mean(dim=0)                            # float32[T*H*B*N, 1]
-			v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))           # float32[T*H*B*N, 1]
-
 			q_mean = reward_mean + gamma * v_mean
 			q_std = reward_std + gamma_scalar * v_std
 			q_estimate_flat = q_mean + value_std_coef * q_std
@@ -401,6 +433,13 @@ class TDMPC2(torch.nn.Module):
 				"pi_num_rollouts": float(N),
 			}, device=self.device)
 
+			if self.cfg.value_per_dynamics:
+				info.update({
+					"pi_v_std_total": vpd_v_std_total,
+					"pi_v_std_per_dyn": vpd_v_std_per_dyn,
+					"pi_r_std_per_dyn": vpd_r_std_per_dyn,
+				})
+
 			return pi_loss, info
 
 	def update_pi(self, zs):
@@ -435,6 +474,8 @@ class TDMPC2(torch.nn.Module):
 		"""Compute TD-target: r + γ * (1 - terminated) * V(next_z).
 
 		Handles per-head dynamics and reward/value ensemble uncertainty.
+		When value_per_dynamics=True, each value head group bootstraps only
+		from its linked dynamics head (no cross-head dynamics reduction).
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps.
@@ -447,67 +488,116 @@ class TDMPC2(torch.nn.Module):
 		"""
 		T, H, B, L = next_z.shape
 		R = reward.shape[1]
-
-		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
-		v_logits_flat = self.model.V(next_z_flat, return_type='all', target=True)  # float32[Ve, T, H*B, K]
-		Ve = v_logits_flat.shape[0]
-		v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
-		v_values = v_values_flat.view(Ve, T, H, B, 1)
-
+		Ve = self.cfg.num_q
 		discount = self.discount
 		discount_scalar = float(self.discount)
 		std_coef = float(self.cfg.td_target_std_coef)
 
-		if self.cfg.local_td_bootstrap:
-			# LOCAL: Each Ve head bootstraps itself
-			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
-			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-			r_mean_exp = r_mean_per_h.unsqueeze(0)
+		if self.cfg.value_per_dynamics:
+			G = Ve // H  # value heads per dynamics head
 
-			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
-			td_std_exp = r_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp
+			# Expand H → Ve so each value head maps to its dynamics head
+			next_z_ve = next_z.repeat_interleave(G, dim=1)         # float32[T, Ve, B, L]
+			reward_ve = reward.repeat_interleave(G, dim=2)         # float32[T, R, Ve, B, 1]
+			terminated_ve = terminated.repeat_interleave(G, dim=1) # float32[T, Ve, B, 1]
 
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+			# V bootstrap: each value head only sees its dynamics head's next_z
+			next_z_flat = next_z_ve.permute(1, 0, 2, 3).contiguous().view(Ve, T * B, L)
+			v_logits = self.model.V(next_z_flat, return_type='all', target=True, split_data=True)
+			# v_logits: float32[Ve, T*B, K]
+			v_values = math.two_hot_inv(v_logits, self.cfg).view(Ve, T, B, 1)
 
-			if dyn_reduction == "max":
-				td_targets, _ = td_per_ve_h.max(dim=2)
-			elif dyn_reduction == "min":
-				td_targets, _ = td_per_ve_h.min(dim=2)
+			# Reward stats per value head (across R reward heads)
+			r_mean_ve = reward_ve.mean(dim=1)                    # float32[T, Ve, B, 1]
+			r_std_ve = reward_ve.std(dim=1, unbiased=(R > 1))    # float32[T, Ve, B, 1]
+
+			if self.cfg.local_td_bootstrap:
+				# Each Ve head bootstraps from its own V(next_z_from_its_dyn)
+				td_targets = (
+					r_mean_ve.permute(1, 0, 2, 3)
+					+ discount * (1 - terminated_ve.permute(1, 0, 2, 3)) * v_values
+					+ std_coef * r_std_ve.permute(1, 0, 2, 3)
+				)  # float32[Ve, T, B, 1]
 			else:
-				td_targets = td_per_ve_h.mean(dim=2)
+				# Global within each dynamics group: average G heads, broadcast back
+				v_grouped = v_values.view(H, G, T, B, 1)
+				v_mean_group = v_grouped.mean(dim=1)                     # float32[H, T, B, 1]
+				v_std_group = v_grouped.std(dim=1, unbiased=(G > 1))
 
-			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
-			td_std_log = r_std_per_h.mean(dim=1)
+				# Rewards are identical within a group; take one representative per H
+				r_mean_h = r_mean_ve[:, ::G]                             # float32[T, H, B, 1]
+				r_std_h = r_std_ve[:, ::G]
+				terminated_h = terminated_ve[:, ::G]                     # float32[T, H, B, 1]
+
+				td_h = (
+					r_mean_h.permute(1, 0, 2, 3)
+					+ discount * (1 - terminated_h.permute(1, 0, 2, 3)) * v_mean_group
+					+ std_coef * (r_std_h.permute(1, 0, 2, 3) + discount_scalar * v_std_group)
+				)  # float32[H, T, B, 1]
+
+				# Expand back to Ve (all G heads in a group get same target)
+				td_targets = td_h.unsqueeze(1).expand(H, G, T, B, 1).reshape(Ve, T, B, 1)
+
+			td_mean_log = (r_mean_ve.permute(1, 0, 2, 3) + discount * v_values).mean(dim=0)
+			td_std_log = r_std_ve.mean(dim=1)  # float32[T, B, 1]
 
 		else:
-			# GLOBAL: All Ve heads get same target
-			r_mean_per_h = reward.mean(dim=1)
-			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
-			v_mean_per_h = v_values.mean(dim=0)
-			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
+			# Original path: all Ve heads see all H dynamics heads' latents
+			next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
+			v_logits_flat = self.model.V(next_z_flat, return_type='all', target=True)  # float32[Ve, T, H*B, K]
+			v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
+			v_values = v_values_flat.view(Ve, T, H, B, 1)
 
-			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
-			td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h
-			td_per_h = td_mean_per_h + std_coef * td_std_per_h
+			if self.cfg.local_td_bootstrap:
+				# LOCAL: Each Ve head bootstraps itself
+				r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
+				r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
+				terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
+				r_mean_exp = r_mean_per_h.unsqueeze(0)
 
-			dyn_reduction = self.cfg.td_target_dynamics_reduction
-			if dyn_reduction == "from_std_coef":
-				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+				td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
+				td_std_exp = r_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+				td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp
 
-			if dyn_reduction == "max":
-				td_reduced, _ = td_per_h.max(dim=1)
-			elif dyn_reduction == "min":
-				td_reduced, _ = td_per_h.min(dim=1)
+				dyn_reduction = self.cfg.td_target_dynamics_reduction
+				if dyn_reduction == "from_std_coef":
+					dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+
+				if dyn_reduction == "max":
+					td_targets, _ = td_per_ve_h.max(dim=2)
+				elif dyn_reduction == "min":
+					td_targets, _ = td_per_ve_h.min(dim=2)
+				else:
+					td_targets = td_per_ve_h.mean(dim=2)
+
+				td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
+				td_std_log = r_std_per_h.mean(dim=1)
+
 			else:
-				td_reduced = td_per_h.mean(dim=1)
+				# GLOBAL: All Ve heads get same target
+				r_mean_per_h = reward.mean(dim=1)
+				r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
+				v_mean_per_h = v_values.mean(dim=0)
+				v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
 
-			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)
-			td_mean_log = td_mean_per_h.mean(dim=1)
-			td_std_log = td_std_per_h.mean(dim=1)
+				td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
+				td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h
+				td_per_h = td_mean_per_h + std_coef * td_std_per_h
+
+				dyn_reduction = self.cfg.td_target_dynamics_reduction
+				if dyn_reduction == "from_std_coef":
+					dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
+
+				if dyn_reduction == "max":
+					td_reduced, _ = td_per_h.max(dim=1)
+				elif dyn_reduction == "min":
+					td_reduced, _ = td_per_h.min(dim=1)
+				else:
+					td_reduced = td_per_h.mean(dim=1)
+
+				td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)
+				td_mean_log = td_mean_per_h.mean(dim=1)
+				td_std_log = td_std_per_h.mean(dim=1)
 
 		return td_targets, td_mean_log, td_std_log
 
@@ -748,12 +838,19 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.normalize_rho_weights:
 			rho_pows = rho_pows / rho_pows.sum()
 
+		vpd = self.cfg.value_per_dynamics
+		Ve = self.cfg.num_q
+
 		# Select latents for V predictions based on critic_source
-		if self.cfg.critic_source == 'replay_rollout':
-			z_for_v = self._apply_head_strategy(z_rollout)  # float32[S, B_v, L]
-		else:  # replay_true
-			z_for_v = z_true  # float32[S, B, L]
-		B_v = z_for_v.shape[1]
+		# When value_per_dynamics + replay_rollout, each Ve head sees its dynamics head's latent
+		use_vpd_split = vpd and self.cfg.critic_source == 'replay_rollout'
+
+		if not use_vpd_split:
+			if self.cfg.critic_source == 'replay_rollout':
+				z_for_v = self._apply_head_strategy(z_rollout)  # float32[S, B_v, L]
+			else:  # replay_true
+				z_for_v = z_true  # float32[S, B, L]
+			B_v = z_for_v.shape[1]
 
 		# Select starting latents for TD-target imagination
 		if self.cfg.critic_target_source == 'replay_true':
@@ -770,7 +867,6 @@ class TDMPC2(torch.nn.Module):
 
 		H = imagined['z_seq'].shape[1]
 		BN = B * N
-		BN_v = B_v * N
 
 		z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B, N, L)
 		rewards = imagined['rewards'].view(T_imag, R, H, S, B, N, 1)
@@ -779,13 +875,25 @@ class TDMPC2(torch.nn.Module):
 		terminated = terminated.detach()
 
 		# V predictions on critic_source states
-		z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
-		z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN_v, L)
-		z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN_v, L)
-
-		vs_flat = self.model.V(z_for_v_flat, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
-		Ve = vs_flat.shape[0]
-		vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
+		if use_vpd_split:
+			# value_per_dynamics: expand z_rollout H→Ve, call V with split_data
+			H_rollout = z_rollout.shape[1]
+			G = Ve // H_rollout  # value heads per dynamics head
+			z_for_v_ve = z_rollout.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
+			z_exp = z_for_v_ve.unsqueeze(0).unsqueeze(4).expand(T_imag, S, Ve, B, N, L)
+			# Rearrange to [Ve, T_imag*S*BN, L] for split_data call
+			z_flat = z_exp.permute(2, 0, 1, 3, 4, 5).contiguous().view(Ve, T_imag * S * B * N, L)
+			vs_flat = self.model.V(z_flat, return_type='all', split_data=True)  # float32[Ve, T_imag*S*BN, K]
+			B_v = B
+			BN_v = BN
+			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
+		else:
+			BN_v = B_v * N
+			z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
+			z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN_v, L)
+			z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN_v, L)
+			vs_flat = self.model.V(z_for_v_flat, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
+			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
 
 		# TD targets from imagined next states
 		with maybe_range('Value/td_target', self.cfg):
@@ -800,7 +908,7 @@ class TDMPC2(torch.nn.Module):
 				td_mean = td_mean_flat.view(T_imag, S, BN, 1)
 				td_std = td_std_flat.view(T_imag, S, BN, 1)
 
-				# When B_v > B (concat strategy), tile TD targets
+				# When B_v > B (concat strategy without vpd), tile TD targets
 				if BN_v != BN:
 					H_mult = BN_v // BN
 					td_targets = td_targets.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)

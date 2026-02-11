@@ -136,6 +136,12 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# dynamics rollout. This assumption only holds when imagination_horizon=1.
 	# With longer horizons, dynamics heads diverge after the first step,
 	# so heads would no longer be identical at t > 0.
+	if cfg.value_per_dynamics:
+		assert cfg.num_q % cfg.planner_num_dynamics_heads == 0, (
+			f"value_per_dynamics requires num_q ({cfg.num_q}) divisible by "
+			f"planner_num_dynamics_heads ({cfg.planner_num_dynamics_heads})."
+		)
+
 	if cfg.imagination_horizon != 1:
 		raise ValueError(
 			f"imagination_horizon={cfg.imagination_horizon} is not supported. Only imagination_horizon=1 is supported. "

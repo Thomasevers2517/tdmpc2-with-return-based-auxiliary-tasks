@@ -104,33 +104,62 @@ def compute_values(
     r_std_per_h = r_all.std(dim=0, unbiased=(R > 1))  # float32[H, B, N, T] - std over R
 
     # =========== STEP 2: Get V values ===========
+    vpd = cfg.value_per_dynamics
     if aggregate_horizon:
         # Aggregate horizon: V at ALL intermediate states z_1, ..., z_T (single batched call)
         # z_inter contains states after each action: z_1=next(z_0,a_0), z_2=next(z_1,a_1), etc.
         z_inter = latents_all[:, :, :, 1:, :]                   # float32[H, B, N, T, L]
-        z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
-        
-        # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
-        v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value)
-        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
-        v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
-        
-        # Per dynamics head h, compute value mean and std across Ve value heads at each horizon
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T] - mean over Ve
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N, T] - std over Ve
+
+        if vpd:
+            G = Ve // H  # value heads per dynamics head
+            # Expand H → Ve so each value head sees its dynamics head's latent
+            z_inter_ve = z_inter.repeat_interleave(G, dim=0)    # float32[Ve, B, N, T, L]
+            z_inter_flat = z_inter_ve.contiguous().view(Ve, B * N * T, L)
+            v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value, split_data=True)
+            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, B*N*T]
+            v_all = v_all.view(Ve, B, N, T)                     # float32[Ve, B, N, T]
+
+            # Group [Ve → H, G], compute per-group mean/std
+            v_grouped = v_all.view(H, G, B, N, T)
+            v_mean_per_h = v_grouped.mean(dim=1)                # float32[H, B, N, T]
+            v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))
+        else:
+            z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
+
+            # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
+            v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value)
+            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
+            v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
+
+            # Per dynamics head h, compute value mean and std across Ve value heads at each horizon
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T] - mean over Ve
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N, T] - std over Ve
     else:
         # Single horizon: V only at terminal z_T (original behavior)
         z_last = latents_all[:, :, :, -1, :]                    # float32[H, B, N, L]
-        z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
-        
-        # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
-        v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value)
-        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
-        v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
-        
-        # Per dynamics head h, compute value mean and std across Ve value heads
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
+
+        if vpd:
+            G = Ve // H
+            z_last_ve = z_last.repeat_interleave(G, dim=0)      # float32[Ve, B, N, L]
+            z_last_flat = z_last_ve.contiguous().view(Ve, B * N, L)
+            v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value, split_data=True)
+            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, B*N]
+            v_all = v_all.view(Ve, B, N)                        # float32[Ve, B, N]
+
+            v_grouped = v_all.view(H, G, B, N)
+            v_mean_per_h = v_grouped.mean(dim=1)                # float32[H, B, N]
+            v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))
+        else:
+            z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
+
+            # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
+            v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value)
+            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
+            v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
+
+            # Per dynamics head h, compute value mean and std across Ve value heads
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
 
     # =========== STEP 3: Compute returns ===========
     if aggregate_horizon:

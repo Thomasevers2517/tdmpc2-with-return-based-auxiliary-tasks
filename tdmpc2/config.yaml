@@ -38,6 +38,7 @@ planner_num_dynamics_heads: 4
 #   concat: all H heads concatenated into batch (B_eff = H*B, more data)
 #   split:  batch divided among heads (B_eff = B, each chunk from different head)
 rollout_head_strategy: single
+value_per_dynamics: false  # When true, each value head group only sees its linked dynamics head's latents
 num_q: 8
 num_reward_heads: 1
 dynamics_num_layers: 2

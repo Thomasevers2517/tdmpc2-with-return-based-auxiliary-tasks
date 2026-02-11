@@ -1,0 +1,59 @@
+# Sweep 12.3: Value per dynamics
+# 2 tasks × 3 seeds × 2 value_per_dynamics = 12 runs
+#
+# Tests whether linking each value head group to a specific dynamics head
+# (value_per_dynamics=true) improves performance vs the default where all
+# value heads see all dynamics heads' latents.
+# num_q=8 with planner_num_dynamics_heads=4 gives G=2 value heads per dynamics head.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - hopper-hop
+      - dog-run
+
+  seed:
+    values: [1, 2, 3]
+
+  # --- Swept parameter ---
+  value_per_dynamics:
+    values: [true, false]
+
+  # --- Fixed parameters ---
+  td_target_std_coef:
+    value: 0
+  value_prior_scale:
+    value: 0.1
+  num_reward_heads:
+    value: 2
+
+  num_q:
+    value: 8
+  planner_num_dynamics_heads:
+    value: 4
+  steps:
+    value: 100000
+  rollout_head_strategy:
+    value: single
+  num_rollouts:
+    value: 1
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

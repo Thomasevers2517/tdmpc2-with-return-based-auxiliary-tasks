@@ -359,15 +359,18 @@ class WorldModel(nn.Module):
 			}, device=z.device, non_blocking=True)
 			return action, info
 
-	def V(self, z, return_type='min', target=False, detach=False):
+	def V(self, z, return_type='min', target=False, detach=False, split_data=False):
 		"""Compute state-value predictions.
 
 		Args:
 			z (Tensor[..., L]): Latent state embeddings.
+				Broadcast (split_data=False): all Ve heads see same z.
+				Split (split_data=True): z[Ve, *, L], head i sees z[i].
 			return_type (str): 'all' → logits, 'all_values' → values per head,
 				'min'/'max'/'avg'/'mean' → reduced values.
 			target (bool): Use target network.
 			detach (bool): Use detached network.
+			split_data (bool): If True, z has leading Ve dim sliced per head.
 
 		Returns:
 			Tensor: Shape depends on return_type.
@@ -381,7 +384,7 @@ class WorldModel(nn.Module):
 			else:
 				vnet = self._Vs
 			with self._autocast_context():
-				out = vnet(z)
+				out = vnet(z, split_data=split_data)
 			out = out.float()  # float32[num_q, ..., K]
 
 			if return_type == 'all':
