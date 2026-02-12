@@ -112,9 +112,9 @@ class MLPWithPrior(nn.Module):
 			prior_out = self.prior_mlp(x).detach()  # float32[..., 1] if distributional else [..., out_dim]
 
 			if self.distributional:
-				# Prior outputs a scalar shift in symlog space.
-				# shift_scale_distribution redistributes the main MLP's bin
-				# probabilities so the distribution is properly shifted.
+				# Prior outputs a scalar shift in real (pre-symlog) space.
+				# shift_scale_distribution adds the shift in real space, giving
+				# a constant absolute perturbation regardless of value magnitude.
 				prior_shift = prior_out * self.prior_scale  # float32[..., 1]
 				out = shift_scale_distribution(out, self.cfg, shift=prior_shift)
 			else:

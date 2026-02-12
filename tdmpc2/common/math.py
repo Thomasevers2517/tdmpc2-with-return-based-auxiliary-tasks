@@ -118,20 +118,24 @@ def shift_scale_distribution(
 	"""Shift and/or scale a categorical distribution over discrete regression bins.
 
 	Given logits over K bins with centers c_i in symlog space, produces new logits
-	representing the distribution of (scale * x + shift) where x ~ P(logits).
+	by redistributing probability mass to transformed bin positions.
 
-	Each source bin center c_i with probability p_i maps to a new value
-	v_i = scale * c_i + shift. The probability mass p_i is then redistributed
-	to the two neighboring target bins via linear interpolation (same scheme
-	as two-hot encoding), preserving proper probability semantics.
+	Shift operates in real (pre-symlog) space: each bin center c_i maps to
+		c_i' = symlog(symexp(c_i) + shift)
+	This gives a constant absolute perturbation in real value space regardless
+	of value magnitude (e.g., a shift of 0.1 always moves the value by 0.1,
+	whether the current value is 0 or 1000).
 
-	Operates entirely in symlog space (bin-center space). Values that fall
-	outside [vmin, vmax] after transformation are clamped to the boundary bins.
+	Scale operates in symlog space: c_i' = scale * c_i.
+
+	The probability mass p_i from each source bin is redistributed to the two
+	neighboring target bins via linear interpolation (same as two-hot encoding).
+	Values outside [vmin, vmax] after transformation are clamped.
 
 	Args:
 		logits (Tensor[..., K]): Input logits over K bins.
 		cfg: Config with num_bins, vmin, vmax, bin_size.
-		shift (Tensor[..., 1] or None): Additive shift in symlog space.
+		shift (Tensor[..., 1] or None): Additive shift in real (pre-symlog) space.
 			Broadcast-compatible with logits' leading dims. None = no shift.
 		scale (Tensor[..., 1] or None): Multiplicative scale in symlog space.
 			Broadcast-compatible with logits' leading dims. None = no scale.
@@ -158,7 +162,9 @@ def shift_scale_distribution(
 	if scale is not None:
 		transformed = scale * transformed  # float32[..., K]
 	if shift is not None:
-		transformed = transformed + shift  # float32[..., K]
+		# Shift in real space: symlog(symexp(c_i) + shift)
+		# Constant absolute perturbation regardless of value magnitude.
+		transformed = symlog(symexp(transformed) + shift)  # float32[..., K]
 
 	# Clamp to valid bin range
 	transformed = transformed.clamp(cfg.vmin, cfg.vmax)  # float32[..., K]
