@@ -300,7 +300,9 @@ class TDMPC2(torch.nn.Module):
 		assert z.ndim == 4, f"Expected z: [T+1, H, B, L], got {z.shape}"
 		T_plus_1, H, B, L = z.shape
 		T = T_plus_1 - 1
-		N = int(self.cfg.num_rollouts) if self.cfg.pi_multi_rollout else 1
+		pi_n = int(self.cfg.pi_num_rollouts)
+		N = int(self.cfg.num_rollouts) if pi_n < 0 else pi_n
+		N = max(N, 1)
 		B_eff = H * B  # effective batch with all heads flattened
 
 		z = z[:-1].contiguous()  # float32[T, H, B, L]
@@ -344,26 +346,22 @@ class TDMPC2(torch.nn.Module):
 				# v_next_raw: float32[Ve, T*B*N, 1]
 				v_next_flat = v_next_raw  # alias for logging
 
-				# Mean/std over ALL Ve heads (dynamics + value uncertainty combined)
-				v_mean_coll = v_next_raw.mean(dim=0)                            # float32[T*B*N, 1]
-				v_std_coll = v_next_raw.std(dim=0, unbiased=(Ve > 1))           # float32[T*B*N, 1]
+				# Group by dynamics head: [Ve, T*B*N, 1] → [H, G, T*B*N, 1]
+				# Mean/std over G value heads only (pure value uncertainty per dynamics group)
+				v_grouped = v_next_raw.view(H, G, T * B * N, 1)               # float32[H, G, T*B*N, 1]
+				v_mean_per_h = v_grouped.mean(dim=1)                           # float32[H, T*B*N, 1]
+				v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))           # float32[H, T*B*N, 1]
 
-				# Rewards: mean/std over all R reward heads AND H dynamics heads
+				# Rewards: mean/std over R reward heads only (per dynamics head)
 				reward_per_rh = reward_all.view(R, T, H, B * N, 1)              # float32[R, T, H, B*N, 1]
-				r_mean_coll = reward_per_rh.mean(dim=(0, 2))                    # float32[T, B*N, 1]
-				r_std_coll = reward_per_rh.std(dim=(0, 2), unbiased=(R * H > 1))
+				r_mean_per_h = reward_per_rh.mean(dim=0)                        # float32[T, H, B*N, 1]
+				r_std_per_h = reward_per_rh.std(dim=0, unbiased=(R > 1))        # float32[T, H, B*N, 1]
 
-				# Expand [T, B*N, 1] → [T*B_eff*N, 1] for loss (replicate across H)
-				reward_mean = r_mean_coll.unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-				reward_std = r_std_coll.unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-				v_mean = v_mean_coll.view(T, B * N, 1).unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-				v_std = v_std_coll.view(T, B * N, 1).unsqueeze(1).expand(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-
-				# Logging: total v_std, v_std per dynamics head, r_std per dynamics head
-				vpd_v_std_total = v_std_coll.mean()
-				v_grouped = v_next_raw.view(H, G, T * B * N, 1)                 # float32[H, G, T*B*N, 1]
-				vpd_v_std_per_dyn = v_grouped.std(dim=1, unbiased=(G > 1)).mean()
-				vpd_r_std_per_dyn = reward_per_rh.std(dim=0, unbiased=(R > 1)).mean()  # std over R per (T,H,B*N)
+				# Reshape [H, T*B*N, 1] → [T, H, B*N, 1] → [T*B_eff*N, 1]
+				v_mean = v_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+				v_std = v_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+				reward_mean = r_mean_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+				reward_std = r_std_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
 			else:
 				next_z_flat = next_z_all.reshape(H * T * B * N, L)
 				v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
@@ -433,12 +431,48 @@ class TDMPC2(torch.nn.Module):
 				"pi_num_rollouts": float(N),
 			}, device=self.device)
 
+			# Per-dynamics-head uncertainty logging (value std over heads seeing same z)
 			if self.cfg.value_per_dynamics:
+				# v_std_per_h: per-sample value-head disagreement [H, T*B*N, 1]
+				v_std_struct = v_std_per_h.view(H, T, B, N, 1)              # float32[H, T, B, N, 1]
+				v_std_avg_n = v_std_struct.mean(dim=3)                       # float32[H, T, B, 1]
 				info.update({
-					"pi_v_std_total": vpd_v_std_total,
-					"pi_v_std_per_dyn": vpd_v_std_per_dyn,
-					"pi_r_std_per_dyn": vpd_r_std_per_dyn,
+					"pi_v_std_per_dyn": v_std_per_h.mean(),
+					"pi_r_std_per_dyn": r_std_per_h.mean(),
 				})
+			else:
+				# v_next_per_h: float32[Ve, H, T*B*N, 1] — std over Ve per dyn head
+				v_std_per_sample = v_next_per_h.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
+				v_std_struct = v_std_per_sample.view(H, T, B, N, 1)            # float32[H, T, B, N, 1]
+				v_std_avg_n = v_std_struct.mean(dim=3)                         # float32[H, T, B, 1]
+				info.update({
+					"pi_v_std_per_dyn": v_std_per_sample.mean(),
+					"pi_r_std_per_dyn": reward_all.view(R, T, H, B * N, 1).std(dim=0, unbiased=(R > 1)).mean(),
+				})
+
+			# Distribution of value-head disagreement across sample dimensions
+			# v_std_avg_n: [H, T, B, 1] — per-sample value-head std, averaged over N
+			info.update({
+				# Std-of-std over batch: concentrated (few high-disagreement samples) vs uniform
+				"pi_v_std_std_across_batch": v_std_avg_n.std(dim=2).mean(),
+				# Coefficient of variation: scale-invariant uncertainty (disagreement / |value|)
+				"pi_v_relative_std": (v_std / (v_mean.abs() + 1e-6)).mean(),
+			})
+
+			# Variance across N policy rollouts (action sampling uncertainty)
+			if N > 1:
+				q_with_n = q_estimate.view(T, H * B, N, 1)  # float32[T, H*B, N, 1]
+				info.update({
+					"pi_q_std_across_rollouts": q_with_n.std(dim=2).mean(),
+				})
+
+			# Value variation across batch and time dimensions
+			v_mean_struct = v_mean.view(T, H, B, N, 1)  # float32[T, H, B, N, 1]
+			v_mean_avg_n = v_mean_struct.mean(dim=3)     # float32[T, H, B, 1] — avg over N
+			info.update({
+				"pi_v_std_across_batch": v_mean_avg_n.std(dim=2).mean(),  # std over B, avg over T,H
+				"pi_v_std_across_time": v_mean_avg_n.std(dim=0).mean(),   # std over T, avg over H,B
+			})
 
 			return pi_loss, info
 

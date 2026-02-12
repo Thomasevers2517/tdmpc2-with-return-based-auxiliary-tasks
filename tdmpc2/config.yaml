@@ -138,7 +138,7 @@ start_dynamic_entropy_ratio: 1
 end_dynamic_entropy_ratio: 1
 
 pi_rollout_horizon: 1
-pi_multi_rollout: false
+pi_num_rollouts: -1            # -1 = match num_rollouts, >0 = explicit count
 
 policy_value_std_coef: 0
 policy_ema_tau: null  # null = inherit from tau
