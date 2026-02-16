@@ -284,28 +284,34 @@ class TDMPC2(torch.nn.Module):
 			return torch.tensor(0.0, device=device or torch.device('cuda:0'))
 		return torch.sqrt(accum)
 
-	def calc_pi_losses(self, z, optimistic=False):
+	def calc_pi_losses(self, z_source, z_target, optimistic=False):
 		"""Compute SVG policy loss using V(s) with per-head dynamics.
 
-		Maximizes: r(z, a) + γ * V(z') + entropy_bonus
-		where z' is reached via dynamics from policy action.
+		Maximizes: r(z_target, a) + γ * V(next(z_target, a)) + entropy_bonus
+		where the action a is sampled from pi(z_source).
 
 		Args:
-			z (Tensor[T+1, H, B, L]): Per-head latent states from dynamics rollout.
+			z_source (Tensor[T+1, H, B, L]): Latents fed to the policy.
+			z_target (Tensor[T+1, H, B, L]): Latents used to evaluate the
+				objective (reward, dynamics, value bootstrap).
 			optimistic (bool): If True, use optimistic policy with +1.0 std_coef.
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Policy loss and info dict.
 		"""
-		assert z.ndim == 4, f"Expected z: [T+1, H, B, L], got {z.shape}"
-		T_plus_1, H, B, L = z.shape
+		assert z_source.ndim == 4, f"Expected z_source: [T+1, H, B, L], got {z_source.shape}"
+		assert z_target.shape == z_source.shape, (
+			f"z_source {z_source.shape} and z_target {z_target.shape} must match"
+		)
+		T_plus_1, H, B, L = z_source.shape
 		T = T_plus_1 - 1
 		pi_n = int(self.cfg.pi_num_rollouts)
 		N = int(self.cfg.num_rollouts) if pi_n < 0 else pi_n
 		N = max(N, 1)
 		B_eff = H * B  # effective batch with all heads flattened
 
-		z = z[:-1].contiguous()  # float32[T, H, B, L]
+		z_source = z_source[:-1].contiguous()  # float32[T, H, B, L]
+		z_target = z_target[:-1].contiguous()  # float32[T, H, B, L]
 
 		if optimistic:
 			value_std_coef = self.cfg.optimistic_policy_value_std_coef
@@ -315,23 +321,25 @@ class TDMPC2(torch.nn.Module):
 			entropy_coeff = self.dynamic_entropy_coeff
 
 		with maybe_range('Agent/update_pi', self.cfg):
-			z_for_pi = z.reshape(T, B_eff, L)  # float32[T, H*B, L]
-			z_expanded = z_for_pi.unsqueeze(2).expand(T, B_eff, N, L).reshape(T, B_eff * N, L)
+			z_src_flat = z_source.reshape(T, B_eff, L)  # float32[T, H*B, L]
+			z_src_expanded = z_src_flat.unsqueeze(2).expand(T, B_eff, N, L).reshape(T, B_eff * N, L)
+			z_tgt_flat = z_target.reshape(T, B_eff, L)  # float32[T, H*B, L]
+			z_tgt_expanded = z_tgt_flat.unsqueeze(2).expand(T, B_eff, N, L).reshape(T, B_eff * N, L)
 
-			action, info = self.model.pi(z_expanded, optimistic=optimistic)  # float32[T, H*B*N, A]
+			action, info = self.model.pi(z_src_expanded, optimistic=optimistic)  # float32[T, H*B*N, A]
 			A = action.shape[-1]
 			gamma = self.discount
 			gamma_scalar = float(self.discount)
 
-			# Reward r(z, a) from ALL R reward heads
-			z_rew_flat = z_expanded.view(T * B_eff * N, L)
+			# Reward r(z_target, a) from ALL R reward heads
+			z_rew_flat = z_tgt_expanded.view(T * B_eff * N, L)
 			a_rew_flat = action.view(T * B_eff * N, A)
 			reward_logits_all = self.model.reward(z_rew_flat, a_rew_flat, head_mode='all')  # float32[R, T*H*B*N, K]
 			R = reward_logits_all.shape[0]
 			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H*B*N, 1]
 
-			# Dynamics with split_data=True
-			z_for_dyn = z_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
+			# Dynamics with split_data=True — uses z_target
+			z_for_dyn = z_tgt_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
 			a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
 			next_z_all = self.model.next(z_for_dyn, a_for_dyn, split_data=True)  # float32[H, T*B*N, L]
 
@@ -476,27 +484,63 @@ class TDMPC2(torch.nn.Module):
 
 			return pi_loss, info
 
-	def update_pi(self, zs):
+	def _select_actor_latents(self, z_true, z_rollout):
+		"""Select and shape-align latents for the actor based on config.
+
+		Uses ``actor_source`` to choose z_source (policy input) and
+		``actor_rollout_source`` to choose z_target (objective evaluation).
+		When a ``replay_true`` source is selected, the missing H dimension
+		is expanded to match z_rollout.
+
+		Args:
+			z_true (Tensor[T+1, B, L]): Encoder latents.
+			z_rollout (Tensor[T+1, H, B, L]): Dynamics-rollout latents.
+
+		Returns:
+			Tuple[Tensor[T+1, H, B, L], Tensor[T+1, H, B, L]]:
+				(z_source, z_target) both with the H dimension.
+		"""
+		H = z_rollout.shape[1]
+
+		def _pick(source_name: str) -> torch.Tensor:
+			"""Return detached latent with shape [T+1, H, B, L].
+
+			Detach is required because the WM computation graph is freed by
+			total_loss.backward() before the policy update runs.
+			"""
+			if source_name == 'replay_rollout':
+				return z_rollout.detach()
+			elif source_name == 'replay_true':
+				return z_true.detach().unsqueeze(1).expand_as(z_rollout)
+			else:
+				raise ValueError(f"Unknown actor latent source: {source_name!r}")
+
+		z_source = _pick(self.cfg.actor_source)
+		z_target = _pick(self.cfg.actor_rollout_source)
+		return z_source, z_target
+
+	def update_pi(self, z_source, z_target):
 		"""Update policy using SVG (backprop through world model).
 
 		Args:
-			zs (Tensor[T+1, H, B, L]): Per-head latent states from dynamics rollout.
+			z_source (Tensor[T+1, H, B, L]): Latents fed to the policy.
+			z_target (Tensor[T+1, H, B, L]): Latents for objective evaluation.
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Total policy loss and info dict.
 		"""
-		assert zs.ndim == 4, f"Expected zs: [T+1, H, B, L], got {zs.shape}"
+		assert z_source.ndim == 4, f"Expected z_source: [T+1, H, B, L], got {z_source.shape}"
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 
 		# Pessimistic policy (SVG)
 		if not log_grads or not self.cfg.compile:
-			pi_loss, info = self.calc_pi_losses(zs, optimistic=False)
+			pi_loss, info = self.calc_pi_losses(z_source, z_target, optimistic=False)
 		else:
-			pi_loss, info = self.calc_pi_losses_eager(zs, optimistic=False)
+			pi_loss, info = self.calc_pi_losses_eager(z_source, z_target, optimistic=False)
 
 		# Optimistic policy (if dual policy enabled)
 		if self.cfg.dual_policy_enabled:
-			opti_pi_loss, opti_info = self.calc_pi_losses(zs, optimistic=True)
+			opti_pi_loss, opti_info = self.calc_pi_losses(z_source, z_target, optimistic=True)
 			for k, v in opti_info.items():
 				info[f'opti_{k}'] = v
 			pi_loss = pi_loss + opti_pi_loss
@@ -1142,22 +1186,13 @@ class TDMPC2(torch.nn.Module):
 			self.optim.zero_grad(set_to_none=True)
 
 			# Policy update
-			# NOTE: Policy currently always trains on dynamics-predicted latents (z_rollout)
-			# when available, falling back to encoder latents (z_true) only when WM is
-			# skipped. To train policy on true encoder latents instead, a config like
-			# `policy_source: replay_true | replay_rollout` could be added here,
-			# analogous to critic_source. Using z_true would give train/test consistency
-			# (policy acts from encoder z at inference) but loses 4× batch diversity
-			# from H dynamics heads and uses only head 0 for the Q estimate.
+			# actor_source: which z the policy acts from (pi(z_source)).
+			# actor_rollout_source: which z evaluates the objective (reward, dynamics, V).
 			pi_grad_norm = torch.zeros((), device=self.device)
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
-				if z_rollout is not None:
-					z_for_pi = z_rollout.detach()  # float32[T+1, H, B, L]
-				else:
-					z_for_pi = z_true.detach().unsqueeze(1)  # float32[T+1, 1, B, L]
-
-				pi_loss, pi_info = self.update_pi(z_for_pi)
+				z_source, z_target = self._select_actor_latents(z_true, z_rollout)
+				pi_loss, pi_info = self.update_pi(z_source, z_target)
 				pi_total = pi_loss * self.cfg.policy_coef
 				pi_total.backward()
 				if log_grads:
@@ -1323,8 +1358,10 @@ class TDMPC2(torch.nn.Module):
 					components = self._compute_loss_components(obs, action, reward, terminated, update_value=True, log_grads=False)
 					val_info = components['info']
 
-					z_for_pi = components['z_rollout'].detach() if components['z_rollout'] is not None else components['z_true'].detach().unsqueeze(1)
-					pi_loss, pi_info = self.update_pi(z_for_pi)
+					z_source, z_target = self._select_actor_latents(
+						components['z_true'], components['z_rollout'],
+					)
+					pi_loss, pi_info = self.update_pi(z_source, z_target)
 					val_info.update(pi_info, non_blocking=True)
 					self.log_detailed = False
 				infos.append(val_info)

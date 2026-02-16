@@ -431,10 +431,10 @@ class WorldModel(nn.Module):
 	) -> TensorDict:
 		"""Compute per-timestep V(z_true) vs V(z_rollout) diagnostics.
 
-		For each timestep t:
-		  - V values from encoder latents vs dynamics latents (mean across heads)
-		  - Absolute difference and relative difference
-		  - Distributional entropy of V logits (categorical entropy of softmax)
+		Logs:
+		  - |E_h[V(z_h)] - V(z_true)| per timestep (dynamics value drift)
+		  - std of V across dynamics heads per timestep (head disagreement)
+		  - Distributional entropy of V at t=0 for encoder and dynamics latents
 
 		Args:
 			z_true (Tensor[T+1, B, L]): Encoder latents.
@@ -448,7 +448,6 @@ class WorldModel(nn.Module):
 		info = TensorDict({}, device=z_true.device)
 
 		# --- V values on true latents ---
-		# V returns logits: float32[Ve, T+1*B, K]
 		v_true_logits = self.V(
 			z_true.reshape(T_plus_1 * B, L), return_type='all',
 		)  # float32[Ve, T+1*B, K]
@@ -465,92 +464,57 @@ class WorldModel(nn.Module):
 		v_roll_logits = self.V(
 			z_roll_flat, return_type='all',
 		)  # float32[Ve, T+1*H*B, K]
-		v_roll_logits = v_roll_logits.view(
-			Ve, T_plus_1, H, B, K,
-		)  # float32[Ve, T+1, H, B, K]
+		v_roll_logits = v_roll_logits.view(Ve, T_plus_1, H, B, K)  # float32[Ve, T+1, H, B, K]
 
 		v_roll_vals = math.two_hot_inv(
 			v_roll_logits.reshape(Ve * T_plus_1 * H * B, K), self.cfg,
 		).view(Ve, T_plus_1, H, B, 1)  # float32[Ve, T+1, H, B, 1]
-		# Mean across V-ensemble and dynamics heads
 		v_roll_mean = v_roll_vals.mean(dim=(0, 2)).squeeze(-1)  # float32[T+1, B]
 
-		# --- V(mean_z) vs mean(V(z_h)) (Jensen's inequality decomposition) ---
-		# mean(V(z_h)): average the per-head scalar values across H dynamics heads
-		v_per_head = v_roll_vals.mean(dim=0).squeeze(-1)  # float32[T+1, H, B] — mean over Ve
-		mean_of_per_head_values = v_per_head.mean(dim=1)  # float32[T+1, B] — mean over H
+		# Per-head values for std computation: float32[T+1, H, B]
+		v_per_head = v_roll_vals.mean(dim=0).squeeze(-1)  # float32[T+1, H, B]
 
-		# V(mean_z): average the latents first, then evaluate V on the mean latent
-		z_roll_avg = z_rollout.mean(dim=1)  # float32[T+1, B, L] — avg latent across H heads
+		# --- V(mean_z): value of head-averaged latent ---
+		z_roll_avg = z_rollout.mean(dim=1)  # float32[T+1, B, L]
 		v_avg_z_logits = self.V(
 			z_roll_avg.reshape(T_plus_1 * B, L), return_type='all',
 		)  # float32[Ve, T+1*B, K]
 		v_avg_z_vals = math.two_hot_inv(
 			v_avg_z_logits.reshape(Ve * T_plus_1 * B, K), self.cfg,
 		).view(Ve, T_plus_1, B, 1)  # float32[Ve, T+1, B, 1]
-		value_of_avg_latent = v_avg_z_vals.mean(dim=0).squeeze(-1)  # float32[T+1, B]
-
-		# Jensen gap: V(E[z]) - E[V(z)]  (nonzero when V is nonlinear in z)
-		jensen_gap = value_of_avg_latent - mean_of_per_head_values  # float32[T+1, B]
-
-		# --- Distributional entropy of V logits ---
-		# Categorical entropy: -sum(p * log(p))
-		v_true_probs = torch.softmax(
-			v_true_logits, dim=-1,
-		)  # float32[Ve, T+1, B, K]
-		v_true_entropy = -(v_true_probs * torch.log(v_true_probs + 1e-8)).sum(
-			dim=-1,
-		)  # float32[Ve, T+1, B]
-
-		v_roll_probs = torch.softmax(
-			v_roll_logits, dim=-1,
-		)  # float32[Ve, T+1, H, B, K]
-		v_roll_entropy = -(v_roll_probs * torch.log(v_roll_probs + 1e-8)).sum(
-			dim=-1,
-		)  # float32[Ve, T+1, H, B]
+		v_avg_latent = v_avg_z_vals.mean(dim=0).squeeze(-1)  # float32[T+1, B]
 
 		# --- Per-timestep logging ---
 		for t in range(T_plus_1):
-			v_true_t = v_true_mean[t]  # float32[B]
-			v_roll_t = v_roll_mean[t]  # float32[B]
-			diff_roll_minus_true = v_roll_t - v_true_t  # float32[B]
-
+			diff_t = v_roll_mean[t] - v_true_mean[t]  # float32[B]
+			diff_avg_t = v_avg_latent[t] - v_true_mean[t]  # float32[B]
 			info.update({
-				# Value of encoder latent (ground-truth observation)
-				f'v_diag/V_of_encoder_z/step{t}': v_true_t.mean(),
-				# Average of per-head values: E_h[V(z_h)]  (evaluate V on each head, then average)
-				f'v_diag/mean_V_across_dyn_heads/step{t}': v_roll_t.mean(),
-				# Value of head-averaged latent: V(E_h[z_h])  (average latents first, then evaluate V)
-				f'v_diag/V_of_avg_dyn_latent/step{t}': value_of_avg_latent[t].mean(),
-				# Jensen gap: V(E_h[z_h]) - E_h[V(z_h)]  (nonlinear V effect)
-				f'v_diag/jensen_gap_V_avg_z_minus_avg_V_z/step{t}': jensen_gap[t].mean(),
-				# Signed diff: E_h[V(z_h)] - V(z_true)  (dynamics bias)
-				f'v_diag/mean_V_heads_minus_V_encoder/step{t}': diff_roll_minus_true.mean(),
-				# Signed diff: V(E_h[z_h]) - V(z_true)  (dynamics bias via avg latent)
-				f'v_diag/V_avg_latent_minus_V_encoder/step{t}': (value_of_avg_latent[t] - v_true_t).mean(),
-				# Absolute diff: |E_h[V(z_h)] - V(z_true)|
-				f'v_diag/abs_mean_V_heads_minus_V_encoder/step{t}': diff_roll_minus_true.abs().mean(),
-				# Relative diff: |E_h[V(z_h)] - V(z_true)| / |V(z_true)|
-				f'v_diag/rel_mean_V_heads_vs_V_encoder/step{t}': (diff_roll_minus_true.abs() / (v_true_t.abs() + 1e-6)).mean(),
-				# Entropy of V softmax bins on encoder latent  (higher = more uncertain)
-				f'v_diag/bin_entropy_V_encoder_z/step{t}': v_true_entropy[:, t].mean(),
-				# Entropy of V softmax bins on rollout latents (higher = more uncertain)
-				f'v_diag/bin_entropy_V_dyn_z/step{t}': v_roll_entropy[:, t].mean(),
+				# |E_h[V(z_h)] - V(z_true)|  (dynamics value drift)
+				f'v_diag/mean_V_heads_minus_V_encoder/step{t}': diff_t.abs().mean(),
+				# |V(E_h[z_h]) - V(z_true)|  (avg-latent value drift)
+				f'v_diag/V_avg_latent_minus_V_encoder/step{t}': diff_avg_t.abs().mean(),
+				# Std of V across dynamics heads (head disagreement)
+				f'v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0).mean(),
 			}, non_blocking=True)
+
+		# --- Bin entropy at t=0 only ---
+		v_true_probs_0 = torch.softmax(v_true_logits[:, 0], dim=-1)  # float32[Ve, B, K]
+		v_true_entropy_0 = -(v_true_probs_0 * torch.log(v_true_probs_0 + 1e-8)).sum(dim=-1)  # float32[Ve, B]
+
+		v_roll_probs_0 = torch.softmax(v_roll_logits[:, 0], dim=-1)  # float32[Ve, H, B, K]
+		v_roll_entropy_0 = -(v_roll_probs_0 * torch.log(v_roll_probs_0 + 1e-8)).sum(dim=-1)  # float32[Ve, H, B]
+
+		info.update({
+			'v_diag/bin_entropy_V_encoder_z/step0': v_true_entropy_0.mean(),
+			'v_diag/bin_entropy_V_dyn_z/step0': v_roll_entropy_0.mean(),
+		}, non_blocking=True)
 
 		# --- Aggregate metrics (averaged over all timesteps and batch) ---
 		all_diff = v_roll_mean - v_true_mean  # float32[T+1, B]
+		all_diff_avg = v_avg_latent - v_true_mean  # float32[T+1, B]
 		info.update({
-			'v_diag/V_of_encoder_z': v_true_mean.mean(),
-			'v_diag/mean_V_across_dyn_heads': v_roll_mean.mean(),
-			'v_diag/V_of_avg_dyn_latent': value_of_avg_latent.mean(),
-			'v_diag/jensen_gap_V_avg_z_minus_avg_V_z': jensen_gap.mean(),
-			'v_diag/mean_V_heads_minus_V_encoder': all_diff.mean(),
-			'v_diag/V_avg_latent_minus_V_encoder': (value_of_avg_latent - v_true_mean).mean(),
-			'v_diag/abs_mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
-			'v_diag/bin_entropy_V_encoder_z': v_true_entropy.mean(),
-			'v_diag/bin_entropy_V_dyn_z': v_roll_entropy.mean(),
-			# Std of V across dynamics heads (disagreement)
+			'v_diag/mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
+			'v_diag/V_avg_latent_minus_V_encoder': all_diff_avg.abs().mean(),
 			'v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1).mean(),
 		}, non_blocking=True)
 

@@ -92,6 +92,8 @@ final_rho: -1  # if >0, overrides rho schedule so end-of-horizon discount = fina
 critic_type: V  # Only 'V' is implemented.
 critic_source: replay_rollout       # 'replay_rollout' (dynamics-predicted z) or 'replay_true' (encoder z) for V predictions.
 critic_target_source: replay_true    # 'replay_rollout' or 'replay_true' for imagination start states (TD targets).
+actor_source: replay_rollout          # 'replay_rollout' or 'replay_true': which z the policy acts from in SVG.
+actor_rollout_source: replay_rollout  # 'replay_rollout' or 'replay_true': which z the 1-step dynamics starts from in SVG.
 
 # --- TD targets ---
 local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
