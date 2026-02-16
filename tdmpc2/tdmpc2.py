@@ -1079,9 +1079,14 @@ class TDMPC2(torch.nn.Module):
 		info.update(value_info, non_blocking=True)
 
 		if self.log_detailed:
-			# Model diagnostics (prior effect, etc.) on a subset of states
-			diag_z = z_true[0].detach()  # float32[B, L] — first timestep
-			info.update(self.model.model_diagnostics(diag_z), non_blocking=True)
+			# Model diagnostics: V(z_true) vs V(z_rollout) + distributional entropy
+			info.update(
+				self.model.model_diagnostics(
+					z_true.detach(),     # float32[T+1, B, L]
+					z_rollout.detach(),  # float32[T+1, H, B, L]
+				),
+				non_blocking=True,
+			)
 
 		critic_weighted = self.cfg.value_coef * value_loss * self.cfg.imagine_value_loss_coef_mult
 		total_loss = wm_loss + critic_weighted
