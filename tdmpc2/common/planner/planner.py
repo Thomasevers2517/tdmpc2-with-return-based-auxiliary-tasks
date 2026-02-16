@@ -140,7 +140,7 @@ class Planner(torch.nn.Module):
                 use_optimistic_policy=use_optimistic,
             )
             # Shapes: latents_p [H, B, S, T+1, L], actions_p [B, S, T, A]
-            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p = compute_values(
+            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p, _ = compute_values(
                 latents_p,     # [H, B, S, T+1, L]
                 actions_p,     # [B, S, T, A]
                 self.world_model,
@@ -178,6 +178,8 @@ class Planner(torch.nn.Module):
         scores_hist = [] if enable_detailed_logging else None
         mean_hist = [] if enable_detailed_logging else None
         std_hist = [] if enable_detailed_logging else None
+        policy_seed_elite_counts = []
+        value_diagnostics = {}  # populated by last iteration's compute_values
 
         # Iterative refinement
         for it in range(iterations):
@@ -193,7 +195,7 @@ class Planner(torch.nn.Module):
             # latents_s: [H, B, N, T+1, L], actions_s: [B, N, T, A]
 
             # Values for sampled trajectories
-            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s = compute_values(
+            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s, value_diagnostics = compute_values(
                 latents_s,   # [H, B, N, T+1, L]
                 actions_s,   # [B, N, T, A]
                 self.world_model,
@@ -261,6 +263,12 @@ class Planner(torch.nn.Module):
 
             # Elite selection per batch element: [B, E] -> [B, K]
             elite_scores, elite_indices = torch.topk(scores, K, dim=1, largest=True, sorted=True)  # [B, K]
+
+            # Track how many elites came from policy seeds
+            if include_policy:
+                policy_seed_elite_counts.append((elite_indices < S).sum(dim=1))  # int64[B]
+            else:
+                policy_seed_elite_counts.append(torch.zeros(B, device=elite_indices.device, dtype=torch.long))
             
             # Compute weights over elite scores per batch (BMPC-style: subtract max, scale by temp)
             max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
@@ -392,6 +400,13 @@ class Planner(torch.nn.Module):
                 scores_all=scores_b0,
                 values_scaled_all=vals_scaled_b0,
                 weighted_latent_disagreements_all=weighted_latent_dis_b0,
+                v_std_across_value_heads=value_diagnostics.get('v_std_across_value_heads'),
+                v_std_across_dynamics_heads=value_diagnostics.get('v_std_across_dynamics_heads'),
+                v_std_across_candidates=value_diagnostics.get('v_std_across_candidates'),
+                policy_seed_elite_counts=(
+                    torch.stack(policy_seed_elite_counts, dim=0).squeeze(-1)
+                    if len(policy_seed_elite_counts) > 0 else None
+                ),  # int64[I]
             )
 
         # Detailed logging: upgrade info_basic to info_adv if requested (only for B=1)

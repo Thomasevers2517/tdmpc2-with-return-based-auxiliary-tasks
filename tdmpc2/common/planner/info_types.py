@@ -18,7 +18,7 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         task=task,
     )  # [H,1,1,T+1,L]
     # compute_values expects latents_all [H,B,N,T+1,L] and actions [B,N,T,A]; here B=1, N=1
-    vals_unscaled, vals_scaled, vals_std, val_dis = compute_values(
+    vals_unscaled, vals_scaled, vals_std, val_dis, _ = compute_values(
         lat_all,
         noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         world_model,
@@ -59,6 +59,10 @@ class PlannerBasicInfo:
         scores_all: Combined scores for all candidates; Tensor[E].
         values_scaled_all: Scaled values for all candidates; Tensor[E].
         weighted_latent_disagreements_all: Weighted latent disagreements for all candidates; Tensor[E].
+        v_std_across_value_heads: Scalar std of bootstrap V across value ensemble heads.
+        v_std_across_dynamics_heads: Scalar std of bootstrap V across dynamics heads.
+        v_std_across_candidates: Scalar std of bootstrap V across candidate action sequences.
+        policy_seed_elite_counts: int64[I] count of policy-seeded elites per planning iteration.
     """
     value_chosen: torch.Tensor  # 0-dim tensor
     latent_disagreement_chosen: Optional[torch.Tensor]
@@ -79,6 +83,10 @@ class PlannerBasicInfo:
     scores_all: torch.Tensor  # (E,)
     values_scaled_all: torch.Tensor  # (E,)
     weighted_latent_disagreements_all: Optional[torch.Tensor]  # (E,)
+    v_std_across_value_heads: Optional[torch.Tensor]  # 0-dim - std of V across value ensemble heads
+    v_std_across_dynamics_heads: Optional[torch.Tensor]  # 0-dim - std of V across dynamics heads
+    v_std_across_candidates: Optional[torch.Tensor]  # 0-dim - std of V across candidate action sequences
+    policy_seed_elite_counts: Optional[torch.Tensor]  # int64[I] - policy-seeded elite count per iteration
 
 
 @dataclass

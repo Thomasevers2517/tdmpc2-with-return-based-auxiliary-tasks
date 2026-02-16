@@ -398,6 +398,18 @@ class WorldModel(nn.Module):
 				return torch.amax(V, dim=0)
 			return V.mean(0)
 
+	def model_diagnostics(self, z: torch.Tensor) -> TensorDict:
+		"""Run diagnostic measurements on the model (called when log_detailed).
+
+		Args:
+			z (Tensor[B, L]): Latent states for diagnostics.
+
+		Returns:
+			TensorDict with diagnostic statistics.
+		"""
+		info = TensorDict({}, device=z.device)
+		return info
+
 	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None,
 						num_rollouts=None, policy_action_noise_std=0.0,
 						use_optimistic_policy=False, use_target_policy=False):

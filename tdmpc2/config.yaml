@@ -37,7 +37,7 @@ planner_num_dynamics_heads: 4
 #   single: head-0 only (legacy, B unchanged)
 #   concat: all H heads concatenated into batch (B_eff = H*B, more data)
 #   split:  batch divided among heads (B_eff = B, each chunk from different head)
-rollout_head_strategy: single
+rollout_head_strategy: split
 value_per_dynamics: false  # When true, each value head group only sees its linked dynamics head's latents
 num_q: 8
 num_reward_heads: 1
@@ -51,8 +51,8 @@ reward_dropout_enabled: false
 
 # --- Prior networks (frozen random priors for ensemble diversity) ---
 prior_hidden_div: 16          # prior_hidden_dim = network_hidden_dim // div
-dynamics_prior_scale: 0.1     # Prior perturbation for dynamics heads. 0 = no prior.
-value_prior_scale: 0.1        # Prior perturbation for reward & value heads (distributional shift). 0 = no prior.
+dynamics_prior_scale: 0       # Prior perturbation for dynamics heads. 0 = no prior.
+value_prior_scale: 0          # Prior perturbation for reward & value heads (distributional shift). 0 = no prior.
 
 # ===========================================================================
 #  3. Optimizer & Learning Rates
@@ -138,7 +138,7 @@ start_dynamic_entropy_ratio: 1
 end_dynamic_entropy_ratio: 1
 
 pi_rollout_horizon: 1
-pi_num_rollouts: -1            # -1 = match num_rollouts, >0 = explicit count
+pi_num_rollouts: 1             # -1 = match num_rollouts, >0 = explicit count
 
 policy_value_std_coef: 0
 policy_ema_tau: null  # null = inherit from tau
@@ -160,8 +160,8 @@ temperature: 0.5
 mult_by_temp: true
 
 # --- Planner value aggregation ---
-planner_value_std_coef_train: 0.3
-planner_value_std_coef_eval: -1
+planner_value_std_coef_train: 0
+planner_value_std_coef_eval: 0
 planner_aggregate_value: false
 planner_lambda_disagreement: 0
 planner_policy_elites_first_iter_only: false
@@ -169,7 +169,7 @@ planner_policy_elites_first_iter_only: false
 # ===========================================================================
 #  9. Exploration & Rollouts
 # ===========================================================================
-num_rollouts: 4
+num_rollouts: 1
 buffer_update_interval: 1
 train_act_std_coeff: 0
 policy_seed_noise_std: 0.05
@@ -215,8 +215,8 @@ data_dir: ???
 # 13. Dual Policy (optimistic + pessimistic — research feature)
 # ===========================================================================
 dual_policy_enabled: false
-optimistic_policy_value_std_coef: 0
-optimistic_entropy_mult: 100
+optimistic_policy_value_std_coef: 1
+optimistic_entropy_mult: 1
 
 normalize_rho_weights: true
 

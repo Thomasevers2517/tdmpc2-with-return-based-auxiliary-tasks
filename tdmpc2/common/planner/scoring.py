@@ -10,7 +10,7 @@ def compute_values(
     value_std_coef: float = 0.0,
     use_ema_value: bool = False,
     aggregate_horizon: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """Compute trajectory values using dynamics heads and reward heads.
     
     With V-function (state-only value), we bootstrap using V(z_last) directly
@@ -50,9 +50,11 @@ def compute_values(
         aggregate_horizon: If True, compute λ-style compound return averaging over all horizons.
 
     Returns:
-        Tuple[Tensor[B, N], Tensor[B, N], Tensor[B, N], Tensor[B, N]]: 
-            (values_unscaled, values_scaled, values_std, value_disagreement).
+        Tuple[Tensor[B, N], Tensor[B, N], Tensor[B, N], Tensor[B, N], dict]: 
+            (values_unscaled, values_scaled, values_std, value_disagreement, diagnostics).
             values_std is the aggregated std per candidate after dynamics reduction.
+            diagnostics is a dict of scalar tensors with per-dimension bootstrap V stds:
+            'v_std_across_value_heads', 'v_std_across_dynamics_heads', 'v_std_across_candidates'.
     """
     H, B, N, Tp1, L = latents_all.shape  # H=dynamics heads, B=batch, N=candidates, Tp1=T+1, L=latent_dim
     T = Tp1 - 1
@@ -225,7 +227,27 @@ def compute_values(
     # Return the aggregated std (mean over dynamics heads) for logging
     values_std = total_std_per_h.mean(dim=0)  # float32[B, N]
 
-    return values_unscaled, values_scaled, values_std, value_disagreement
+    # =========== STEP 5: Diagnostics (per-dimension V bootstrap stds) ===========
+    # Compute std of raw bootstrap V predictions across each ensemble dimension.
+    # These are cheap scalar summaries for understanding disagreement sources.
+    if vpd:
+        # v_grouped: [H, G, B, N] or [H, G, B, N, T] — G = value heads per dynamics group
+        diag_v_std_ve = v_grouped.std(dim=1, unbiased=False).mean()  # float32[] - value head disagreement within group
+        diag_v_std_h = v_grouped.std(dim=0, unbiased=False).mean()   # float32[] - dynamics group disagreement
+        diag_v_std_n = v_grouped.std(dim=3, unbiased=False).mean()   # float32[] - candidate action variation
+    else:
+        # v_all: [Ve, H, B, N] or [Ve, H, B, N, T]
+        diag_v_std_ve = v_all.std(dim=0, unbiased=False).mean()  # float32[] - value head disagreement
+        diag_v_std_h = v_all.std(dim=1, unbiased=False).mean()   # float32[] - dynamics head disagreement
+        diag_v_std_n = v_all.std(dim=3, unbiased=False).mean()   # float32[] - candidate action variation
+
+    diagnostics = {
+        'v_std_across_value_heads': diag_v_std_ve,
+        'v_std_across_dynamics_heads': diag_v_std_h,
+        'v_std_across_candidates': diag_v_std_n,
+    }
+
+    return values_unscaled, values_scaled, values_std, value_disagreement, diagnostics
 
 
 def compute_disagreement(final_latents_all: torch.Tensor) -> torch.Tensor:

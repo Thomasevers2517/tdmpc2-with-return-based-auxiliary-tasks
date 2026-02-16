@@ -682,6 +682,12 @@ class TDMPC2(torch.nn.Module):
 			consistency_losses = delta.pow(2).mean(dim=(0, 2, 3))          # float32[T]
 			encoder_consistency_losses = delta_enc.pow(2).mean(dim=(0, 2, 3))
 
+			# Dynamics head disagreement: std across H heads at each (T, B) position
+			dyn_head_std = z_next.std(dim=0)                           # float32[T, B, L]
+			# Ensemble-mean dynamics vs true target
+			dyn_ensemble_mean = z_next.mean(dim=0)                     # float32[T, B, L]
+			dyn_mean_error = (dyn_ensemble_mean - target_TBL.squeeze(0).detach()).pow(2).mean(dim=-1)  # float32[T, B]
+
 		consistency_loss = (rho_pows * consistency_losses).mean()
 		encoder_consistency_loss = (rho_pows * encoder_consistency_losses).mean()
 
@@ -739,6 +745,8 @@ class TDMPC2(torch.nn.Module):
 			'encoder_consistency_loss': encoder_consistency_loss,
 			'encoder_consistency_loss_weighted': encoder_consistency_losses * self.cfg.encoder_consistency_coef * H,
 			'latent_batch_variance': latent_batch_variance,
+			'dynamics_head_std': dyn_head_std.mean(),
+			'dynamics_mean_vs_true_mse': dyn_mean_error.mean(),
 			'reward_loss': reward_loss,
 			'reward_loss_weighted': reward_loss * self.cfg.reward_coef * R,
 			'termination_loss': termination_loss,
@@ -754,6 +762,12 @@ class TDMPC2(torch.nn.Module):
 			}, non_blocking=True)
 
 		if self.log_detailed:
+			for t_step in range(T):
+				info.update({
+					f'dynamics_head_std/step{t_step}': dyn_head_std[t_step].mean(),
+					f'dynamics_mean_vs_true_mse/step{t_step}': dyn_mean_error[t_step].mean(),
+				}, non_blocking=True)
+
 			reward_pred_all_for_log = reward_pred_all.mean(dim=2)
 			for i in range(T):
 				rp_step = reward_pred_all_for_log[:, i, :, 0]
@@ -888,7 +902,7 @@ class TDMPC2(torch.nn.Module):
 
 		# Select starting latents for TD-target imagination
 		if self.cfg.critic_target_source == 'replay_true':
-			start_z = z_true.detach() if not update_world_model else z_true
+			start_z = z_true.detach()
 		else:  # replay_rollout
 			start_z = self._apply_head_strategy(z_rollout).detach()
 
@@ -1064,6 +1078,11 @@ class TDMPC2(torch.nn.Module):
 		info.update(wm_info, non_blocking=True)
 		info.update(value_info, non_blocking=True)
 
+		if self.log_detailed:
+			# Model diagnostics (prior effect, etc.) on a subset of states
+			diag_z = z_true[0].detach()  # float32[B, L] — first timestep
+			info.update(self.model.model_diagnostics(diag_z), non_blocking=True)
+
 		critic_weighted = self.cfg.value_coef * value_loss * self.cfg.imagine_value_loss_coef_mult
 		total_loss = wm_loss + critic_weighted
 
@@ -1118,6 +1137,13 @@ class TDMPC2(torch.nn.Module):
 			self.optim.zero_grad(set_to_none=True)
 
 			# Policy update
+			# NOTE: Policy currently always trains on dynamics-predicted latents (z_rollout)
+			# when available, falling back to encoder latents (z_true) only when WM is
+			# skipped. To train policy on true encoder latents instead, a config like
+			# `policy_source: replay_true | replay_rollout` could be added here,
+			# analogous to critic_source. Using z_true would give train/test consistency
+			# (policy acts from encoder z at inference) but loses 4× batch diversity
+			# from H dynamics heads and uses only head 0 for the Q estimate.
 			pi_grad_norm = torch.zeros((), device=self.device)
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
