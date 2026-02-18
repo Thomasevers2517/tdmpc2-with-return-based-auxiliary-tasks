@@ -1,0 +1,63 @@
+# Sweep 17: Video test sweep
+# quadruped-walk, hopper-hop, dog-stand × 2 seeds = 6 runs
+# save_video and save_train_video enabled
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [quadruped-walk, hopper-hop, dog-stand]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # --- Video ---
+  save_video:
+    value: true
+  save_train_video:
+    value: true
+
+  # --- Baseline parameters ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
+  pi_num_rollouts:
+    value: 1
+  value_per_dynamics:
+    value: false
+  dynamics_prior_scale:
+    value: 0
+  value_prior_scale:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  td_target_std_coef:
+    value: 0
+  local_td_bootstrap:
+    value: true
+  jacobian_correction_scale:
+    value: 1.0
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true

@@ -149,6 +149,7 @@ class Logger:
 			_log.info("%s", colored("Wandb disabled.", "blue", attrs=["bold"]))
 			cfg.save_agent = False
 			cfg.save_video = False
+			cfg.save_train_video = False
 			self._wandb = None
 			self._video = None
 			return
@@ -167,7 +168,7 @@ class Logger:
 		self._wandb = wandb
 		self._video = (
 			VideoRecorder(cfg, self._wandb)
-			if self._wandb and cfg.save_video
+			if self._wandb and (cfg.save_video or cfg.save_train_video)
 			else None
 		)
 

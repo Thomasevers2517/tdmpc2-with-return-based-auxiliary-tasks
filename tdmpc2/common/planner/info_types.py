@@ -5,7 +5,7 @@ from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
-def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False):
+def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, value_std_coef: float, lambda_latent: float, use_ema_value: bool = False):
     """Core kernel to roll out a single noisy sequence and score it.
 
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
@@ -15,14 +15,12 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         z0,
         actions=noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         use_policy=False,
-        task=task,
     )  # [H,1,1,T+1,L]
     # compute_values expects latents_all [H,B,N,T+1,L] and actions [B,N,T,A]; here B=1, N=1
     vals_unscaled, vals_scaled, vals_std, val_dis, _ = compute_values(
         lat_all,
         noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         world_model,
-        task,
         value_std_coef=value_std_coef,
         use_ema_value=use_ema_value,
     )
@@ -156,7 +154,6 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         if z0.dim() != 1:
             z0 = z0.view(-1)
         z0 = z0.to(device)
-        task = self.task
         # Use compiled helper when available/desired
         impl = _post_noise_effects_impl
         try:
@@ -165,7 +162,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
                 impl = torch.compile(_post_noise_effects_impl, mode=getattr(cfg, 'compile_type', 'reduce-overhead'), fullgraph=False)
         except Exception:
             pass
-        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.value_std_coef, task, float(self.lambda_latent), self.use_ema_value)
+        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.value_std_coef, float(self.lambda_latent), self.use_ema_value)
 
         # Store 0-dim tensors
         self.value_chosen_post_noise = vals_scaled.squeeze(0)

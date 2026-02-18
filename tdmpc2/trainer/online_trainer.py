@@ -52,7 +52,7 @@ class OnlineTrainer(Trainer):
 			steps_per_second=self._step / elapsed_time
 		)
 
-	def eval(self, mpc=True, eval_head_reduce: str = 'default'):
+	def eval(self, mpc=True, eval_head_reduce: str = 'default', record_video: bool = False):
 		"""Evaluate a TD-MPC2 agent.
 		
 		Args:
@@ -60,6 +60,7 @@ class OnlineTrainer(Trainer):
 			eval_head_reduce: Head reduction mode for eval.
 				'default' uses planner_value_std_coef_eval (typically pessimistic).
 				'mean' uses value_std_coef=0 for mean-only reduction.
+			record_video: If True, record video of the first eval episode.
 		"""
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
@@ -69,7 +70,7 @@ class OnlineTrainer(Trainer):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
 			self.agent.reset_planner_state()  # Reset warm start for each eval episode
 			self.val_tds = [self.to_td(obs)]
-			if self.cfg.save_video:
+			if record_video:
 				self.logger.video.init(self.env, enabled=(i==0))
 			while not done:
 				torch.compiler.cudagraph_mark_step_begin()
@@ -79,7 +80,7 @@ class OnlineTrainer(Trainer):
 				obs, reward, done, info = self.env.step(action)
 				ep_reward += reward
 				t += 1
-				if self.cfg.save_video:
+				if record_video:
 					self.logger.video.record(self.env)
 
 				val_td = self.to_td(obs, action, reward, info['terminated'])
@@ -88,7 +89,7 @@ class OnlineTrainer(Trainer):
 			ep_rewards.append(ep_reward)
 			ep_successes.append(info['success'])
 			ep_lengths.append(t)
-			if self.cfg.save_video:
+			if record_video:
 				self.logger.video.save(self._step)
 			if mpc:
 				# Add to appropriate validation buffers based on head reduction mode
@@ -144,6 +145,8 @@ class OnlineTrainer(Trainer):
 		# Ensure trainer logger level matches cfg.debug
 		get_logger(__name__, cfg=self.cfg)
 		train_metrics, done, eval_next = {}, True, False
+		self._record_train_ep = False
+		self._start_train_recording = False
 		while self._step <= self.cfg.steps:
 			# Logging cadence flags
 			detail_freq = self.cfg.log_detail_freq
@@ -155,12 +158,19 @@ class OnlineTrainer(Trainer):
 
 			# Reset environment
 			if done:
+				# Save training video if we were recording this episode
+				if self._record_train_ep:
+					self.logger.video.save(self._step, key='videos/train_video')
+					self._record_train_ep = False
+
 				if eval_next:
 					# Default eval with min head reduction
-					eval_metrics = self.eval(mpc=True, eval_head_reduce='default')
+					eval_metrics = self.eval(mpc=True, eval_head_reduce='default', record_video=self.cfg.save_video)
 					eval_metrics.update(self.common_metrics())
 					self.logger.log(eval_metrics, 'eval')
 					eval_next = False
+					if self.cfg.save_train_video:
+						self._start_train_recording = True
 
 					# Policy-only eval (no MPC)
 					policy_eval_metrics = self.eval(mpc=False)
@@ -206,6 +216,11 @@ class OnlineTrainer(Trainer):
 				obs = self.env.reset()
 				self._tds = []
 				self.agent.reset_planner_state()
+				# Init training video recording for the episode after eval
+				if self._start_train_recording:
+					self.logger.video.init(self.env, enabled=True)
+					self._record_train_ep = True
+					self._start_train_recording = False
 			elif (self._step % self.cfg.buffer_update_interval == 0 and self._step > 0) and self.cfg.buffer_update_interval !=-1:
 				self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=False)
 				self._ep_rew += torch.tensor([td['reward'] for td in self._tds]).sum()
@@ -223,6 +238,8 @@ class OnlineTrainer(Trainer):
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
+			if self._record_train_ep:
+				self.logger.video.record(self.env)
 
 			# Update agent
 			if self._step >= self.cfg.seed_steps:

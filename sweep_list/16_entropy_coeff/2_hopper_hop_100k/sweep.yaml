@@ -1,0 +1,63 @@
+# Sweep 16.2: Entropy coeff sweep on hopper-hop, 100k
+# Baseline config with varying start_entropy_coeff
+# 3 entropy values × 3 seeds = 9 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    value: hopper-hop
+
+  seed:
+    values: [1, 2, 3]
+
+  start_entropy_coeff:
+    values: [1e-4, 3e-4, 1e-5]
+
+  # --- Baseline parameters ---
+  end_entropy_coeff:
+    value: 0
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
+  pi_num_rollouts:
+    value: 1
+  value_per_dynamics:
+    value: false
+  dynamics_prior_scale:
+    value: 0
+  value_prior_scale:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  td_target_std_coef:
+    value: 0
+  local_td_bootstrap:
+    value: true
+  jacobian_correction_scale:
+    value: 1.0
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

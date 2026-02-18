@@ -948,6 +948,7 @@ class TDMPC2(torch.nn.Module):
 		if self.cfg.critic_target_source == 'replay_true':
 			start_z = z_true.detach()
 		else:  # replay_rollout
+			raise NotImplementedError("critic_target_source='replay_rollout' is not implemented yet. Use 'replay_true' or implement rollout-based targets.")
 			start_z = self._apply_head_strategy(z_rollout).detach()
 
 		# Imagination rollout for TD targets
