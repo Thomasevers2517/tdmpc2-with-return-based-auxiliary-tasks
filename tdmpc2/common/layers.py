@@ -152,29 +152,42 @@ class Ensemble(nn.Module):
 
 	def __init__(self, modules, **kwargs):
 		super().__init__()
-		# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
-		self.params = from_modules(*modules, as_module=True)
-		
-		# Create template module on meta device (no memory, just structure)
-		# IMPORTANT: Store via __dict__ to avoid registering as submodule.
-		# This prevents .to(device) from trying to move the meta tensor (which would fail).
-		template = deepcopy(modules[0])
-		template = template.to("meta")
-		self.__dict__["_module"] = template
-		
-		self._repr = str(modules[0])
 		self._n = len(modules)
+		self._repr = str(modules[0])
+
+		if self._n == 1:
+			# --- Single-member fast path ---
+			# Store the module directly as a real submodule. forward() just
+			# calls it normally — no functional_call, no vmap, no meta device.
+			self._single_module = modules[0]
+			# Still store params via from_modules so external code that
+			# accesses self.params (for EMA .lerp_(), .clone(), indexing)
+			# keeps working identically.
+			self.params = from_modules(modules[0], as_module=True)
+		else:
+			# --- Multi-member path (vmap) ---
+			# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
+			self.params = from_modules(*modules, as_module=True)
+
+			# Create template module on meta device (no memory, just structure)
+			# IMPORTANT: Store via __dict__ to avoid registering as submodule.
+			# This prevents .to(device) from trying to move the meta tensor (which would fail).
+			template = deepcopy(modules[0])
+			template = template.to("meta")
+			self.__dict__["_module"] = template
 
 	def __len__(self):
 		return self._n
 
 	@property
 	def module(self):
-		"""Template module (on meta device). Exposed for backward compatibility."""
+		"""Template module (on meta device for N>1, real module for N=1)."""
+		if self._n == 1:
+			return self._single_module
 		return self._module
 
 	def forward(self, *args, split_data: bool = False, **kwargs):
-		"""Vectorized forward pass using functional_call + vmap.
+		"""Vectorized forward pass.
 
 		When ``split_data=False`` (default / broadcast mode), all ensemble members
 		receive the **same** input tensors — vmap iterates only over the stacked
@@ -185,6 +198,10 @@ class Ensemble(nn.Module):
 		that first arg in lockstep, so member *i* sees ``args[0][i]``.  Any
 		remaining positional / keyword args are still broadcast.
 
+		For single-member ensembles (N=1), the module is called directly — no
+		functional_call, no vmap.  This avoids torch.compile + vmap + cudagraph
+		interactions that produce incorrect results when vmap batch dim is 1.
+
 		Args:
 			*args: Positional inputs forwarded to the wrapped module.
 			split_data: If True, slice ``args[0]`` along dim 0 per member.
@@ -193,12 +210,28 @@ class Ensemble(nn.Module):
 		Returns:
 			Tensor[H, *batch, out_dim]: Stacked outputs, one per member.
 		"""
+		# --- Single-member fast path (N=1) ---
+		# Just call the module directly — it's a real submodule with real params.
+		if self._n == 1:
+			if split_data:
+				assert len(args) >= 1, "split_data=True requires at least one positional arg"
+				assert args[0].shape[0] == 1, (
+					f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
+					f"!= ensemble size (1)"
+				)
+				# Squeeze the leading H=1 dim, forward, then restore it
+				fwd_args = (args[0][0], *args[1:])
+			else:
+				fwd_args = args
+			out = self._single_module(*fwd_args, **kwargs)
+			return out.unsqueeze(0)  # Restore leading H=1 dim
+
+		# --- Multi-member path (N>1): functional_call + vmap ---
 		from torch.func import functional_call
 
-		module = self._module  # Template module on meta device (not registered as submodule)
+		module = self._module  # Template module on meta device
 
 		if split_data:
-			# --- per-member data mode ---
 			assert len(args) >= 1, "split_data=True requires at least one positional arg"
 			assert args[0].shape[0] == len(self), (
 				f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
@@ -216,7 +249,6 @@ class Ensemble(nn.Module):
 				self.params, first_arg
 			)
 		else:
-			# --- broadcast mode (original behaviour) ---
 			def call_single(params_slice):
 				params_dict = dict(params_slice.flatten_keys(".").items())
 				return functional_call(module, params_dict, args, kwargs)
