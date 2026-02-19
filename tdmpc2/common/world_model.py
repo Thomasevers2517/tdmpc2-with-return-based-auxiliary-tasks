@@ -494,7 +494,8 @@ class WorldModel(nn.Module):
 				# |V(E_h[z_h]) - V(z_true)|  (avg-latent value drift)
 				f'v_diag/V_avg_latent_minus_V_encoder/step{t}': diff_avg_t.abs().mean(),
 				# Std of V across dynamics heads (head disagreement)
-				f'v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0).mean(),
+				# Guard: unbiased=False when H=1 to avoid NaN from division by zero
+				f'v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0, unbiased=(H > 1)).mean(),
 			}, non_blocking=True)
 
 		# --- Bin entropy at t=0 only ---
@@ -515,7 +516,8 @@ class WorldModel(nn.Module):
 		info.update({
 			'v_diag/mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
 			'v_diag/V_avg_latent_minus_V_encoder': all_diff_avg.abs().mean(),
-			'v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1).mean(),
+			# Guard: unbiased=False when H=1 to avoid NaN from division by zero
+			'v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1, unbiased=(H > 1)).mean(),
 		}, non_blocking=True)
 
 		return info

@@ -1,0 +1,30 @@
+# ============================================================
+# Post-fix verification: H=2 dynamics heads with full compilation
+# Task: reacher-easy, 100k steps, compile=true, reduce-overhead
+# ============================================================
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    value: reacher-easy
+  seed:
+    values: [1, 2]
+  steps:
+    value: 100000
+  
+  # Compilation: full compile with reduce-overhead
+  compile:
+    value: true
+  compile_type:
+    value: reduce-overhead
+  
+  # 1 dynamics head (the previously-broken N=1 case)
+  planner_num_dynamics_heads:
+    value: 1

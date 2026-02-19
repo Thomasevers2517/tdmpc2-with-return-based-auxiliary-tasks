@@ -133,74 +133,57 @@ class Ensemble(nn.Module):
 	"""
 	Vectorized ensemble of modules.
 	
-	Uses tensordict's from_modules for parameter storage (supporting tuple-indexing,
-	.data, .clone(), .lerp_() for EMA updates), but uses torch.func.functional_call
-	for the forward pass instead of to_module() mutation.
+	For N>1: Uses tensordict's from_modules for parameter storage (supporting
+	tuple-indexing, .data, .clone(), .lerp_() for EMA updates), and
+	torch.func.functional_call + vmap for the forward pass.
 	
-	This is more compatible with torch.compile because functional_call doesn't
-	mutate the module - it's a pure function that takes params as input.
-	
-	The previous approach used `with params.to_module(self.module)` which mutates
-	the module's parameters inside vmap. This can cause issues with torch.compile
-	because the compiler traces a static graph and mutation patterns are fragile.
-	
-	With functional_call:
-	- No mutation: params are passed explicitly to each forward call
-	- Compile-friendly: torch.func is designed for this pattern
-	- Same storage: TensorDictParams still handles param storage, indexing, EMA
+	For N=1: Uses direct module call to avoid vmap/functional_call overhead and
+	potential torch.compile compatibility issues. The single module is stored as
+	a real submodule.
 	"""
 
 	def __init__(self, modules, **kwargs):
 		super().__init__()
 		self._n = len(modules)
 		self._repr = str(modules[0])
+		self._use_vmap = self._n > 1
 
-		if self._n == 1:
-			# --- Single-member fast path ---
-			# Store the module directly as a real submodule. forward() just
-			# calls it normally — no functional_call, no vmap, no meta device.
-			self._single_module = modules[0]
-			# Still store params via from_modules so external code that
-			# accesses self.params (for EMA .lerp_(), .clone(), indexing)
-			# keeps working identically.
-			self.params = from_modules(modules[0], as_module=True)
-		else:
-			# --- Multi-member path (vmap) ---
+		if self._use_vmap:
+			# N>1: Use tensordict + vmap path
 			# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
 			self.params = from_modules(*modules, as_module=True)
 
-			# Create template module on meta device (no memory, just structure)
-			# IMPORTANT: Store via __dict__ to avoid registering as submodule.
-			# This prevents .to(device) from trying to move the meta tensor (which would fail).
+			# Create template module on meta device (no memory, just structure).
+			# Store via __dict__ to avoid registering as submodule,
+			# preventing .to(device) from trying to move meta tensors.
 			template = deepcopy(modules[0])
 			template = template.to("meta")
 			self.__dict__["_module"] = template
+		else:
+			# N=1: Keep the single module directly as a real submodule
+			# This avoids vmap/functional_call entirely
+			self._single_module = modules[0]
+			# Also create params via from_modules for EMA interface compatibility
+			# (so .params.lerp_(), .params.clone() etc still work)
+			self.params = from_modules(modules[0], as_module=True)
 
 	def __len__(self):
 		return self._n
 
 	@property
 	def module(self):
-		"""Template module (on meta device for N>1, real module for N=1)."""
-		if self._n == 1:
+		"""Template module (on meta device for N>1, or real module for N=1)."""
+		if self._use_vmap:
+			return self._module
+		else:
 			return self._single_module
-		return self._module
 
 	def forward(self, *args, split_data: bool = False, **kwargs):
-		"""Vectorized forward pass.
+		"""Forward pass: direct call for N=1, vectorized vmap for N>1.
 
-		When ``split_data=False`` (default / broadcast mode), all ensemble members
-		receive the **same** input tensors — vmap iterates only over the stacked
-		parameters.
-
-		When ``split_data=True``, the **first positional arg** must have its dim-0
-		equal to the ensemble size H.  vmap then slices both the parameters *and*
-		that first arg in lockstep, so member *i* sees ``args[0][i]``.  Any
-		remaining positional / keyword args are still broadcast.
-
-		For single-member ensembles (N=1), the module is called directly — no
-		functional_call, no vmap.  This avoids torch.compile + vmap + cudagraph
-		interactions that produce incorrect results when vmap batch dim is 1.
+		When ``split_data=False`` (broadcast), all members see the same inputs.
+		When ``split_data=True``, ``args[0]`` dim-0 must equal H and is sliced
+		per member.
 
 		Args:
 			*args: Positional inputs forwarded to the wrapped module.
@@ -210,26 +193,22 @@ class Ensemble(nn.Module):
 		Returns:
 			Tensor[H, *batch, out_dim]: Stacked outputs, one per member.
 		"""
-		# --- Single-member fast path (N=1) ---
-		# Just call the module directly — it's a real submodule with real params.
-		if self._n == 1:
+		if not self._use_vmap:
+			# N=1: Direct module call, add leading H=1 dimension
 			if split_data:
-				assert len(args) >= 1, "split_data=True requires at least one positional arg"
-				assert args[0].shape[0] == 1, (
-					f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
-					f"!= ensemble size (1)"
-				)
-				# Squeeze the leading H=1 dim, forward, then restore it
-				fwd_args = (args[0][0], *args[1:])
+				# args[0] has shape [1, *batch, ...], squeeze the leading dim
+				assert args[0].shape[0] == 1, f"split_data with N=1: expected dim-0=1, got {args[0].shape[0]}"
+				first_arg = args[0].squeeze(0)  # [*batch, ...]
+				rest_args = args[1:]
+				out = self._single_module(first_arg, *rest_args, **kwargs)  # [*batch, out_dim]
 			else:
-				fwd_args = args
-			out = self._single_module(*fwd_args, **kwargs)
-			return out.unsqueeze(0)  # Restore leading H=1 dim
+				out = self._single_module(*args, **kwargs)  # [*batch, out_dim]
+			return out.unsqueeze(0)  # [1, *batch, out_dim]
 
-		# --- Multi-member path (N>1): functional_call + vmap ---
+		# N>1: Vectorized vmap + functional_call path
 		from torch.func import functional_call
 
-		module = self._module  # Template module on meta device
+		module = self._module  # Template on meta device
 
 		if split_data:
 			assert len(args) >= 1, "split_data=True requires at least one positional arg"
@@ -237,14 +216,13 @@ class Ensemble(nn.Module):
 				f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
 				f"!= ensemble size ({len(self)})"
 			)
-			first_arg = args[0]       # Tensor[H, *batch, features]  — will be sliced
-			rest_args = args[1:]       # broadcast (shared across members)
+			first_arg = args[0]
+			rest_args = args[1:]
 
 			def call_single(params_slice, x_slice):
 				params_dict = dict(params_slice.flatten_keys(".").items())
 				return functional_call(module, params_dict, (x_slice, *rest_args), kwargs)
 
-			# in_dims=(0, 0): slice params AND first arg along dim 0
 			return torch.vmap(call_single, in_dims=(0, 0), randomness="different")(
 				self.params, first_arg
 			)
@@ -253,11 +231,11 @@ class Ensemble(nn.Module):
 				params_dict = dict(params_slice.flatten_keys(".").items())
 				return functional_call(module, params_dict, args, kwargs)
 
-			# in_dims=0: slice only params along dim 0; args broadcast
 			return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
 
 	def __repr__(self):
-		return f'Vectorized {len(self)}x ' + self._repr
+		mode = "Direct" if not self._use_vmap else "Vectorized"
+		return f'{mode} {len(self)}x ' + self._repr
 
 
 class ShiftAug(nn.Module):
