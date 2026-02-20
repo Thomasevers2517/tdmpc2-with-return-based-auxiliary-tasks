@@ -11,7 +11,7 @@ command:
   - ${args_no_hyphens}
 parameters:
   task:
-    values: [dog-run]
+    values: [dog-run, humanoid_h1-slide-v0]
   seed:
     values: [1, 2, 3, 4, 5, 6, 7, 8]
   steps:

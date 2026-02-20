@@ -155,74 +155,32 @@ class TDMPC2(torch.nn.Module):
 		self.planner = Planner(cfg=self.cfg, world_model=self.model, scale=None)
 
 		if cfg.compile:
-			log.info('Compiling update function with torch.compile...')
-			# Compile leaf functions individually — _compute_loss_components stays
-			# uncompiled so Python-level branching (update_value, update_world_model)
-			# never triggers cudagraph guard failures / recompilation.
-			# Fine-grained compile control via compile_* flags for debugging.
+			log.info("Compiling with torch.compile mode='%s'...", cfg.compile_type)
 			mode = self.cfg.compile_type
-			
-			self.model.encode_eager = self.model.encode
-			if getattr(self.cfg, 'compile_encoder', True):
-				self.model.encode = torch.compile(self.model.encode, mode=mode, fullgraph=False)
-				log.info("Encoder compiled with mode='%s'", mode)
-			else:
-				log.info("Encoder NOT compiled (compile_encoder=false)")
-			
-			self.world_model_losses_eager = self.world_model_losses
-			if getattr(self.cfg, 'compile_world_model_losses', True):
-				self.world_model_losses = torch.compile(self.world_model_losses, mode=mode, fullgraph=False)
-				log.info("world_model_losses compiled")
-			else:
-				log.info("world_model_losses NOT compiled (compile_world_model_losses=false)")
-			
-			self.calculate_value_loss_eager = self.calculate_value_loss
-			if getattr(self.cfg, 'compile_value_loss', True):
-				self.calculate_value_loss = torch.compile(self.calculate_value_loss, mode=mode, fullgraph=False)
-				log.info("calculate_value_loss compiled")
-			else:
-				log.info("calculate_value_loss NOT compiled (compile_value_loss=false)")
-			
+
+			# Keep eager refs for gradient logging.
+			self._compute_loss_components_eager = self._compute_loss_components
+			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=mode, fullgraph=False)
 			self.calc_pi_losses_eager = self.calc_pi_losses
-			if getattr(self.cfg, 'compile_policy_loss', True):
-				self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=mode, fullgraph=False)
-				log.info("calc_pi_losses compiled")
-			else:
-				log.info("calc_pi_losses NOT compiled (compile_policy_loss=false)")
+			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=mode, fullgraph=False)
 
-			if getattr(self.cfg, 'compile_optim_step', True):
-				@torch.compile(mode=mode, fullgraph=False)
-				def optim_step():
-					self.optim.step()
-					return
+			@torch.compile(mode=mode, fullgraph=False)
+			def optim_step():
+				self.optim.step()
+				return
 
-				@torch.compile(mode=mode, fullgraph=False)
-				def pi_optim_step():
-					self.pi_optim.step()
-					return
-				self.optim_step = optim_step
-				self.pi_optim_step = pi_optim_step
-				log.info("optim_step/pi_optim_step compiled")
-			else:
-				self.optim_step = self.optim.step
-				self.pi_optim_step = self.pi_optim.step
-				log.info("optim_step/pi_optim_step NOT compiled (compile_optim_step=false)")
+			@torch.compile(mode=mode, fullgraph=False)
+			def pi_optim_step():
+				self.pi_optim.step()
+				return
+			self.optim_step = optim_step
+			self.pi_optim_step = pi_optim_step
 
-			if getattr(self.cfg, 'compile_act', True):
-				self.act = torch.compile(self.act, mode=mode, dynamic=False)
-				log.info("act compiled")
-			else:
-				log.info("act NOT compiled (compile_act=false)")
-			
-			if getattr(self.cfg, 'compile_planner', True):
-				self.planner.plan = torch.compile(self.planner.plan, mode=mode, fullgraph=False, dynamic=False)
-				log.info("planner.plan compiled")
-			else:
-				log.info("planner.plan NOT compiled (compile_planner=false)")
+			self.act = torch.compile(self.act, mode=mode, dynamic=False)
+			self.planner.plan = torch.compile(self.planner.plan, mode=mode, fullgraph=False, dynamic=False)
+			log.info('Compilation done.')
 		else:
-			self.model.encode_eager = self.model.encode
-			self.world_model_losses_eager = self.world_model_losses
-			self.calculate_value_loss_eager = self.calculate_value_loss
+			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
@@ -1119,12 +1077,12 @@ class TDMPC2(torch.nn.Module):
 		else:
 			raise ValueError(f"Unknown rollout_head_strategy='{strategy}'")
 
-	def _compute_loss_components(self, obs, action, reward, terminated, update_value, log_grads, update_world_model=True):
+	def _compute_loss_components(self, obs, action, reward, terminated, update_value, update_world_model=True):
 		"""Compute world model and value losses.
 
-		NOT compiled — orchestrates compiled leaf functions so that
-		Python-level branching (update_value, update_world_model) never
-		triggers cudagraph guard failures.
+		Compiled as a unit when cfg.compile=True. Python-level branching
+		(update_value, update_world_model, log_detailed) produces graph breaks
+		with fullgraph=False, which is acceptable.
 
 		Args:
 			obs: float32[T+1, B, ...].
@@ -1132,16 +1090,9 @@ class TDMPC2(torch.nn.Module):
 			reward: float32[T, B, 1].
 			terminated: float32[T, B, 1].
 			update_value: If False, skip value losses.
-			log_grads: Whether to log gradient statistics.
 			update_world_model: If False, skip WM losses.
 		"""
 		device = self.device
-
-		# Select compiled vs eager leaf functions (eager needed for gradient probing)
-		use_eager = log_grads and self.cfg.compile
-		wm_losses_fn = self.world_model_losses_eager if use_eager else self.world_model_losses
-		value_loss_fn = self.calculate_value_loss_eager if use_eager else self.calculate_value_loss
-		encode_fn = self.model.encode_eager if use_eager else self.model.encode
 
 		def encode_obs(obs_seq, grad_enabled, eval_mode=False):
 			"""Encode observations with optional eval mode for stable targets."""
@@ -1152,18 +1103,18 @@ class TDMPC2(torch.nn.Module):
 					if eval_mode:
 						was_training = self.model._encoder.training
 						self.model._encoder.eval()
-						latents_flat = encode_fn(flat_obs)
+						latents_flat = self.model.encode(flat_obs)
 						if was_training:
 							self.model._encoder.train()
 					else:
-						latents_flat = encode_fn(flat_obs)
+						latents_flat = self.model.encode(flat_obs)
 			return latents_flat.view(steps, batch, *latents_flat.shape[1:])
 
 		z_true = encode_obs(obs, grad_enabled=True, eval_mode=False)
 		z_target = encode_obs(obs, grad_enabled=False, eval_mode=True) if self.cfg.encoder_dropout > 0 else None
 
 		if update_world_model:
-			wm_loss, wm_info, z_rollout = wm_losses_fn(z_true, z_target, action, reward, terminated)
+			wm_loss, wm_info, z_rollout = self.world_model_losses(z_true, z_target, action, reward, terminated)
 		else:
 			wm_loss = torch.zeros((), device=device)
 			wm_info = TensorDict({}, device=device)
@@ -1171,7 +1122,7 @@ class TDMPC2(torch.nn.Module):
 
 		if update_value:
 			assert z_rollout is not None, "Value loss requires z_rollout (update_world_model must be True when update_value is True)"
-			value_loss, value_info, imagined_data = value_loss_fn(z_true, z_rollout)
+			value_loss, value_info, imagined_data = self.calculate_value_loss(z_true, z_rollout)
 		else:
 			value_loss = torch.zeros((), device=device)
 			value_info = TensorDict({}, device=device)
@@ -1220,10 +1171,10 @@ class TDMPC2(torch.nn.Module):
 
 		with maybe_range('Agent/update', self.cfg):
 			self.model.train(True)
-			# _compute_loss_components is NOT compiled — it orchestrates
-			# compiled leaf functions (world_model_losses, calculate_value_loss).
-			# When log_grads=True, the leaf functions use their eager variants.
-			components = self._compute_loss_components(obs, action, reward, terminated, update_value, log_grads, update_world_model)
+			# Use eager variant when logging gradients — probe_wm_gradients needs
+			# to run separate per-loss backward passes outside the compiled graph.
+			compute_fn = self._compute_loss_components_eager if log_grads else self._compute_loss_components
+			components = compute_fn(obs, action, reward, terminated, update_value, update_world_model)
 
 			info = components['info']
 			z_true = components['z_true']
@@ -1239,11 +1190,7 @@ class TDMPC2(torch.nn.Module):
 
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 
-			if log_grads:
-				self.optim.step()
-			else:
-				self.optim_step()
-
+			self.optim_step()
 			self.optim.zero_grad(set_to_none=True)
 
 			# Policy update
@@ -1265,10 +1212,7 @@ class TDMPC2(torch.nn.Module):
 					pi_params = self.model._pi.parameters()
 				pi_grad_norm = torch.nn.utils.clip_grad_norm_(pi_params, self.cfg.grad_clip_norm)
 
-				if self.cfg.compile and log_grads:
-					self.pi_optim.step()
-				else:
-					self.pi_optim_step()
+				self.pi_optim_step()
 				self.pi_optim.zero_grad(set_to_none=True)
 
 			# Soft updates
@@ -1417,7 +1361,7 @@ class TDMPC2(torch.nn.Module):
 				obs, action, reward, terminated, indices = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
-					components = self._compute_loss_components(obs, action, reward, terminated, update_value=True, log_grads=False)
+					components = self._compute_loss_components(obs, action, reward, terminated, update_value=True)
 					val_info = components['info']
 
 					z_source, z_target = self._select_actor_latents(

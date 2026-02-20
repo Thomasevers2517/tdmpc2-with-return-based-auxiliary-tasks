@@ -11,16 +11,6 @@ steps: 100_000
 seed: 1
 compile: true
 compile_type: reduce-overhead  # 'default', 'reduce-overhead', 'max-autotune'
-# Fine-grained compile control (for debugging H=1 NaN issues)
-# If compile=true, each of these controls whether that specific component is compiled.
-# Set individual ones to false to bisect which component causes NaN.
-compile_encoder: true
-compile_world_model_losses: true
-compile_value_loss: true
-compile_policy_loss: true
-compile_optim_step: true
-compile_act: true
-compile_planner: true
 dtype: float32
 debug: false  # If true, emit a log line after every agent.update (heavy).
 nvtx_profiler: false  # If true: add lightweight NVTX record_function ranges (disables compile).
