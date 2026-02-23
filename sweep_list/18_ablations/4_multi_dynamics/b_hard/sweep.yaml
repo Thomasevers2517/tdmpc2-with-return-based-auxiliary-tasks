@@ -11,8 +11,10 @@ command:
   - ${program}
   - ${args_no_hyphens}
 parameters:
+  label:
+    value: "initial ablations 20 feb"
   task:
-    values: [dog-run, humanoid_h1-slide-v0]
+    values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
   seed:
     values: [1, 2, 3, 4, 5, 6, 7, 8]
   steps:

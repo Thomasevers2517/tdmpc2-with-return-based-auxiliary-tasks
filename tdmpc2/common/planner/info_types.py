@@ -85,6 +85,9 @@ class PlannerBasicInfo:
     v_std_across_dynamics_heads: Optional[torch.Tensor]  # 0-dim - std of V across dynamics heads
     v_std_across_candidates: Optional[torch.Tensor]  # 0-dim - std of V across candidate action sequences
     policy_seed_elite_counts: Optional[torch.Tensor]  # int64[I] - policy-seeded elite count per iteration
+    z0: Optional[torch.Tensor]  # float32[L] — encoded observation used for planning
+    warm_start_mean: Optional[torch.Tensor]  # float32[T, A] — shifted prev_mean before refinement
+    plan_drift: Optional[torch.Tensor]  # 0-dim — mean|final_mean - warm_start| over overlapping horizon
 
 
 @dataclass
@@ -120,7 +123,6 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     action_seq_chosen: torch.Tensor  # (T,A)
     action_noise: Optional[torch.Tensor]  # (A,) applied at t=0; None if no noise
     std_first_action: torch.Tensor  # (A,)
-    z0: torch.Tensor  # (L,)
     task: Optional[torch.Tensor]
     lambda_latent: float
     value_std_coef: float

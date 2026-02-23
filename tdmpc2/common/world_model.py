@@ -34,47 +34,38 @@ class WorldModel(nn.Module):
 		# Multi-head dynamics ensemble (vmap + functional_call)
 		h_total = int(cfg.planner_num_dynamics_heads)
 		prior_hidden_div = int(cfg.prior_hidden_div)
-		dynamics_prior_scale = float(cfg.dynamics_prior_scale)
 		value_prior_scale = float(cfg.value_prior_scale)
 		dynamics_num_layers = int(cfg.dynamics_num_layers)
 		dynamics_dropout = float(cfg.dynamics_dropout)
 		dyn_heads = [
-			layers.DynamicsHeadWithPrior(
-				in_dim=cfg.latent_dim + cfg.action_dim,
-				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
-				out_dim=cfg.latent_dim,
-				cfg=cfg,
-				prior_hidden_div=prior_hidden_div,
-				prior_scale=dynamics_prior_scale,
-				dropout=dynamics_dropout,
+			nn.Sequential(
+				layers.mlp(
+					cfg.latent_dim + cfg.action_dim,
+					dynamics_num_layers * [cfg.mlp_dim],
+					cfg.latent_dim,
+					dropout=dynamics_dropout,
+				),
+				layers.SimNorm(cfg),
 			)
 			for _ in range(h_total)
 		]
-		for dyn_head in dyn_heads:
-			dyn_head.apply(init.weight_init)
 		self._dynamics_heads = layers.Ensemble(dyn_heads)
 		self._dynamics = self._dynamics_heads  # legacy alias
 
-		# Multi-head reward ensemble
+		# Multi-head reward ensemble (plain MLP, no prior)
 		num_reward_heads = int(cfg.num_reward_heads)
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = cfg.num_reward_layers
 		reward_dropout = cfg.dropout if cfg.reward_dropout_enabled else 0.0
 		reward_mlps = [
-			layers.MLPWithPrior(
-				in_dim=cfg.latent_dim + cfg.action_dim,
-				hidden_dims=num_reward_layers * [reward_hidden_dim],
-				out_dim=max(cfg.num_bins, 1),
-				prior_hidden_div=prior_hidden_div,
-				prior_scale=value_prior_scale,
+			layers.mlp(
+				cfg.latent_dim + cfg.action_dim,
+				num_reward_layers * [reward_hidden_dim],
+				max(cfg.num_bins, 1),
 				dropout=reward_dropout,
-				distributional=True,
-				cfg=cfg,
 			)
 			for _ in range(num_reward_heads)
 		]
-		for mlp_with_prior in reward_mlps:
-			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Rs = layers.Ensemble(reward_mlps)
 
 		# Termination head
@@ -104,16 +95,14 @@ class WorldModel(nn.Module):
 			)
 			for _ in range(cfg.num_q)
 		]
-		for mlp_with_prior in v_mlps:
-			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
 
 		self.apply(init.weight_init)
-		# Zero-init main network output layers for reward and value heads
+		# Zero-init output layers for reward and value heads
 		reward_output_layer_key = str(num_reward_layers)
 		v_output_layer_key = str(num_value_layers)
 		init.zero_([
-			self._Rs.params["main_mlp", reward_output_layer_key, "weight"],
+			self._Rs.params[reward_output_layer_key, "weight"],
 			self._Vs.params["main_mlp", v_output_layer_key, "weight"],
 		])
 

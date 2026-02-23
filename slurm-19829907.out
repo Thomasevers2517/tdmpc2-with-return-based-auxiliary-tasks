@@ -1,0 +1,11 @@
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn20/ttomilin.19333369’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn20/mli2.19327702’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn20/duijterlinde.19334410’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/duijterlinde.19518056’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/qchen.19513900’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/qchen.19514928’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/qchen.19517722’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/qchen.19514624’: No such file or directory
+/usr/bin/find: ‘/gpfs/scratch1/nodespecific/gcn7/jenkins.19515498’: No such file or directory
+srun: error: srv8: task 0: Exited with exit code 1
+srun: Terminating StepId=19829907.0

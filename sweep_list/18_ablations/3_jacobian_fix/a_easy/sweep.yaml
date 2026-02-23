@@ -1,6 +1,6 @@
 # Sweep 18.3a: Jacobian fix — easy DMC tasks (100k)
 # Diff from baseline: jacobian_correction_scale=1, start_entropy_coeff=3e-5
-# 5 tasks × 8 seeds = 40 runs
+# 4 tasks × 8 seeds = 32 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -11,8 +11,10 @@ command:
   - ${program}
   - ${args_no_hyphens}
 parameters:
+  label:
+    value: "initial ablations 20 feb"
   task:
-    values: [hopper-hop, quadruped-walk, humanoid-stand, cheetah-run, finger-turn_hard]
+    values: [hopper-hop, quadruped-walk, cheetah-run, finger-turn_hard]
   seed:
     values: [1, 2, 3, 4, 5, 6, 7, 8]
   steps:

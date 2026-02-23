@@ -49,6 +49,8 @@ CAT_TO_COLOR = {
 	"eval_mean_head_reduce": "green",
 	"validation_all_mean_head_reduce": "magenta",
 	"validation_recent_mean_head_reduce": "cyan",
+	"episode_diag_eval": "green",
+	"episode_diag_train": "blue",
 }
 
 
@@ -225,12 +227,24 @@ class Logger:
 
 		Assumes payload already contains scalar/serializable values and that
 		'step' is provided separately for x-axis alignment.
+
+		PIL.Image values are automatically wrapped in wandb.Image so they
+		appear as image panels rather than raw objects.
 		"""
 		if not self._wandb:
 			return
+		try:
+			from PIL import Image as _PILImage
+			_pil_available = True
+		except ImportError:
+			_PILImage = None
+			_pil_available = False
 		_d = {}
 		for k, v in payload.items():
-			_d[f"{category}/{k}"] = v
+			if _pil_available and isinstance(v, _PILImage.Image):
+				_d[f"{category}/{k}"] = self._wandb.Image(v)
+			else:
+				_d[f"{category}/{k}"] = v
 		self._wandb.log(_d, step=step)
 
 	def _csv_eval_append(self, payload: dict):

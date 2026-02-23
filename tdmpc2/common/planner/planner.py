@@ -169,6 +169,8 @@ class Planner(torch.nn.Module):
 
         # Containers for per-iteration histories (for advanced logging, only for B=1)
         enable_detailed_logging = (B == 1)
+        # Snapshot warm-start mean before refinement for plan-drift diagnostic
+        warm_start_for_info = mean[0].detach().clone() if B == 1 else None  # float32[T, A]
         actions_hist = [] if enable_detailed_logging else None
         latents_hist = [] if enable_detailed_logging else None
         values_unscaled_hist = [] if enable_detailed_logging else None
@@ -347,6 +349,11 @@ class Planner(torch.nn.Module):
         # Build info (only for B=1)
         info_basic = None
         if B == 1:
+            # Plan drift: mean|final_mean - warm_start| over overlapping T-1 steps
+            plan_drift_val = None
+            if warm_start_for_info is not None and T > 1:
+                plan_drift_val = (mean[0, :-1] - warm_start_for_info[:-1]).abs().mean().detach()
+
             elite_scores_b0 = elite_scores[0]  # [K]
             value_elite_mean = elite_scores_b0.mean()
             value_elite_std = elite_scores_b0.std(unbiased=False) if K > 1 else elite_scores_b0.new_zeros(())
@@ -407,6 +414,9 @@ class Planner(torch.nn.Module):
                     torch.stack(policy_seed_elite_counts, dim=0).squeeze(-1)
                     if len(policy_seed_elite_counts) > 0 else None
                 ),  # int64[I]
+                z0=z0[0].detach().clone(),
+                warm_start_mean=warm_start_for_info,
+                plan_drift=plan_drift_val,
             )
 
         # Detailed logging: upgrade info_basic to info_adv if requested (only for B=1)
@@ -436,7 +446,6 @@ class Planner(torch.nn.Module):
                 action_seq_chosen=chosen_seq[0].detach(),  # [T, A]
                 action_noise=(noise_vec_first[0].detach() if noise_vec_first is not None else None),
                 std_first_action=std_first[0].detach(),
-                z0=z0[0].detach(),
                 task=None,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
                 value_std_coef=value_std_coef,

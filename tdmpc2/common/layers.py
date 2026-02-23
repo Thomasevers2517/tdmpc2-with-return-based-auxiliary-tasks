@@ -81,6 +81,7 @@ class MLPWithPrior(nn.Module):
 				if isinstance(m, nn.Linear):
 					nn.init.xavier_normal_(m.weight)
 					nn.init.zeros_(m.bias)
+					m._skip_global_init = True  # Protect from weight_init override
 			# DO NOT freeze with requires_grad_(False) - causes issues with torch.compile + vmap
 			# Instead, we detach the output in forward() to prevent gradient flow
 		else:

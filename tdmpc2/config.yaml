@@ -212,7 +212,22 @@ save_video: false
 save_train_video: false
 save_agent: false
 exp_name: default
+label: none
 data_dir: ???
+
+# --- Episode diagnostics ---
+# Frequency (in training episodes) at which to run diagnostics and log
+# scalar metrics (obs_total_variation, obs_mean_pairwise_mse) for train episodes.
+# -1 = disabled.  During eval, diagnostics always run (no extra cost at eval_freq).
+episode_diag_train_freq: 2
+# Frequency (in training episodes, relative to episode_diag_train_freq) at
+# which to also generate the heatmap image for training episodes.
+# E.g. if episode_diag_train_freq=5 and episode_diag_train_image_freq=10,
+# heatmap is generated every 50th training episode.  -1 = never.
+episode_diag_train_image_freq: 2
+# Maximum heatmap side length in pixels.  Matrices larger than this are
+# average-pooled before rendering to keep wandb upload size small.
+episode_diag_max_resolution: 256
 
 # ===========================================================================
 # 13. Dual Policy (optimistic + pessimistic — research feature)

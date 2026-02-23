@@ -43,7 +43,7 @@ else
   echo "conda command not found in PATH" >&2
   exit 2
 fi
-ENV_PATH="/projects/0/prjs0951/conda_envs/tdmpc2"
+ENV_PATH="/home/tevers/.conda/envs/bmpc"
 conda activate "${ENV_PATH}"
 
 echo "Python: $(python -V)"

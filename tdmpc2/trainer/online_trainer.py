@@ -6,6 +6,7 @@ from tensordict.tensordict import TensorDict
 from trainer.base import Trainer
 from common.logger import get_logger
 from common.buffer import Buffer
+from common.episode_diagnostics import EpisodeDiagnostics, ValueTrajectoryAnalyzer
 log = get_logger(__name__)
 
 
@@ -30,6 +31,14 @@ class OnlineTrainer(Trainer):
 			raise ValueError(f"pi_update_freq must be > 0, got {self.cfg.pi_update_freq}")
 		if self.cfg.value_update_freq <= 0 and self.cfg.value_update_freq != -1:
 			raise ValueError(f"value_update_freq must be > 0 or -1, got {self.cfg.value_update_freq}")
+
+		self._episode_diagnostics = EpisodeDiagnostics(self.cfg)
+		self._episode_diagnostics.add_analyzer(
+			ValueTrajectoryAnalyzer(self.cfg, self.agent.model)
+		)
+		# Per-episode obs accumulator for training diagnostics (reset each episode)
+		self._ep_obs_for_diag: list[torch.Tensor] = []
+
 
 		self.validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
 		self.recent_validation_buffer = Buffer(cfg=self.cfg, isTrainBuffer=False)
@@ -65,6 +74,9 @@ class OnlineTrainer(Trainer):
 		ep_rewards, ep_successes, ep_lengths = [], [], []
 		ep_elite_std, ep_elite_mean = [], []
 		# self.validation_buffer.empty()
+		ep_diag_total_variation: list[float] = []
+		ep_diag_mean_pairwise: list[float] = []
+		eval_diag_heatmap: dict = {}   # heatmap from first episode only
   
 		for i in range(self.cfg.eval_episodes):
 			obs, done, ep_reward, t = self.env.reset(), False, 0, 0
@@ -91,6 +103,25 @@ class OnlineTrainer(Trainer):
 			ep_lengths.append(t)
 			if record_video:
 				self.logger.video.save(self._step)
+
+			# --- Episode diagnostics (state obs only; skip dict/image obs) ---
+			first_obs_td = self.val_tds[0]['obs']
+			if isinstance(first_obs_td, torch.Tensor):
+				# val_tds[k]['obs']: float32[1, D] → cat → float32[T, D]
+				obs_seq = torch.cat([td['obs'] for td in self.val_tds], dim=0)
+				if obs_seq.ndim == 2 and obs_seq.shape[0] > 1:
+					include_img = (i == 0)  # heatmap only for first eval episode
+					diag = self._episode_diagnostics.analyze(obs_seq, include_images=include_img)
+					if 'obs_total_variation' in diag:
+						ep_diag_total_variation.append(diag['obs_total_variation'])
+					if 'obs_mean_pairwise_mse' in diag:
+						ep_diag_mean_pairwise.append(diag['obs_mean_pairwise_mse'])
+					if include_img:
+						# Collect any PIL.Image values for the first episode
+						eval_diag_heatmap.update(
+							{k: v for k, v in diag.items() if hasattr(v, 'save')}
+						)
+
 			if mpc:
 				# Add to appropriate validation buffers based on head reduction mode
 				if eval_head_reduce == 'default':
@@ -103,15 +134,23 @@ class OnlineTrainer(Trainer):
 			# Return that validation should run after all evals complete
 			# (validation is now called from train() after all eval modes finish)
 			pass
-	
-		return dict(
+
+		# --- Aggregate and return episode diagnostics ---
+		diag_result: dict = {}
+		if ep_diag_total_variation:
+			diag_result['obs_total_variation'] = float(np.mean(ep_diag_total_variation))
+			diag_result['obs_mean_pairwise_mse'] = float(np.mean(ep_diag_mean_pairwise))
+		diag_result.update(eval_diag_heatmap)
+
+		result = dict(
 			episode_reward=np.nanmean(ep_rewards),
 			episode_success=np.nanmean(ep_successes),
-			episode_length= np.nanmean(ep_lengths),
+			episode_length=np.nanmean(ep_lengths),
 			episode_elite_std=np.nanmean(ep_elite_std),
 			episode_elite_mean=np.nanmean(ep_elite_mean),
-
 		)
+		result.update(diag_result)
+		return result
 
 	def to_td(self, obs, action=None, reward=None, terminated=None):
 		"""Creates a TensorDict for a new episode.
@@ -208,6 +247,19 @@ class OnlineTrainer(Trainer):
 						episode_success=info['success'],
 						episode_length=self._ep_len,
 						episode_terminated=info['terminated'])
+					# --- Training episode diagnostics (merge into train metrics) ---
+					if (
+						self.cfg.episode_diag_train_freq > 0
+						and len(self._ep_obs_for_diag) > 1
+						and (self._ep_idx % self.cfg.episode_diag_train_freq == 0)
+					):
+						obs_seq = torch.stack(self._ep_obs_for_diag, dim=0)  # float32[T, D]
+						if obs_seq.ndim == 2:
+							img_freq = self.cfg.episode_diag_train_image_freq
+							include_img = (img_freq > 0 and self._ep_idx % (self.cfg.episode_diag_train_freq * img_freq) == 0)
+							diag = self._episode_diagnostics.analyze(obs_seq, include_images=include_img)
+							if diag:
+								train_metrics.update(diag)
 					train_metrics.update(self.common_metrics())
 					self.logger.log(train_metrics, 'train')
 					self._ep_idx = self.buffer.add(torch.cat(self._tds), end_episode=True)
@@ -215,6 +267,8 @@ class OnlineTrainer(Trainer):
 				self._ep_len = 0
 				obs = self.env.reset()
 				self._tds = []
+				# Reset per-episode obs accumulator for training diagnostics
+				self._ep_obs_for_diag = [obs] if isinstance(obs, torch.Tensor) and self.cfg.episode_diag_train_freq > 0 else []
 				self.agent.reset_planner_state()
 				# Init training video recording for the episode after eval
 				if self._start_train_recording:
@@ -238,6 +292,9 @@ class OnlineTrainer(Trainer):
 				action = self.env.rand_act()
 			obs, reward, done, info = self.env.step(action)
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
+			# Accumulate obs for episode diagnostics (only flat state tensors)
+			if self.cfg.episode_diag_train_freq > 0 and isinstance(obs, torch.Tensor):
+				self._ep_obs_for_diag.append(obs)
 			if self._record_train_ep:
 				self.logger.video.record(self.env)
 

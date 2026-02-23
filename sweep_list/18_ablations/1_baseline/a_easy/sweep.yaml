@@ -1,5 +1,5 @@
 # Sweep 18.1a: Baseline (original TD-MPC2) — easy DMC tasks (100k)
-# 5 tasks × 8 seeds = 40 runs
+# 4 tasks × 12 seeds = 48 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -10,10 +10,12 @@ command:
   - ${program}
   - ${args_no_hyphens}
 parameters:
+  label:
+    value: "initial ablations 20 feb"
   task:
-    values: [hopper-hop, quadruped-walk, humanoid-stand, cheetah-run, finger-turn_hard]
+    values: [hopper-hop, quadruped-walk, cheetah-run, finger-turn_hard]
   seed:
-    values: [1, 2, 3, 4, 5, 6, 7, 8]
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
   steps:
     value: 100000
 
