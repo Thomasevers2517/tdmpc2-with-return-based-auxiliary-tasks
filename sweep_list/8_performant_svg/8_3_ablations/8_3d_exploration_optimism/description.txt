@@ -1,0 +1,23 @@
+Sweep 8.3d: Exploration Noise × Planner Optimism Grid
+======================================================
+
+Purpose:
+Jointly ablate the two main exploration mechanisms:
+
+1. train_act_std_coeff: Multiplier for Gaussian noise added to actions in the
+   actual environment. 0 = no noise (deterministic actions), 1 = standard noise.
+   Noise-based exploration is the simplest form — just be random.
+
+2. planner_value_std_coef_train: Coefficient applied to ensemble value disagreement
+   when scoring planner trajectories during training. Positive = optimistic (prefer
+   uncertain states), 0 = neutral (mean only). This is *directed* exploration —
+   the agent seeks out states where its model is uncertain.
+
+The full 2×4 grid tests all combinations, including the baseline (noise=0, opt=0.3).
+This reveals whether optimism alone suffices, whether noise alone works, and how
+they interact.
+
+Ablated parameters: train_act_std_coeff × planner_value_std_coef_train
+  Grid: {0, 1} × {0, 0.3, 1, 2} = 8 configs (includes baseline)
+
+Total runs: 8 configs × 6 tasks × 2 seeds = 96

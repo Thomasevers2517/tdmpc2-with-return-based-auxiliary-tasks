@@ -1,0 +1,39 @@
+# Sweep 2f: Encoder Consistency Loss on dog-run
+# Hypothesis: Additional encoder training signal from consistency loss
+# (dynamics-to-encoder direction reversed) may improve representations.
+# BMPC baseline: encoder_consistency_coef=0 (no reverse consistency)
+# Grid: encoder_consistency_coef ∈ {0.1, 1}
+# 2 tasks × 2 configs × 2 seeds = 8 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  encoder_consistency_coef:
+    values: [0.1, 1]
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

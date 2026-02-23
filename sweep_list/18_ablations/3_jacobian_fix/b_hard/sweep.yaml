@@ -1,0 +1,91 @@
+# Sweep 18.3b: Jacobian fix — hard DMC tasks (300k)
+# Diff from baseline: jacobian_correction_scale=1, start_entropy_coeff=3e-5
+# 3 tasks × 8 seeds = 24 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  label:
+    value: "initial ablations 20 feb"
+  task:
+    values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
+  steps:
+    value: 300000
+
+  # --- Sweep-specific: jacobian fix ---
+  jacobian_correction_scale:
+    value: 1
+  start_entropy_coeff:
+    value: 3e-5
+  utd_ratio:
+    value: 1
+  value_update_freq:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 1
+  num_q:
+    value: 5
+  tau:
+    value: 0.01
+  consistency_coef:
+    value: 20
+  buffer_update_interval:
+    value: -1
+  local_td_bootstrap:
+    value: false
+
+  # --- Standard defaults ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
+  pi_num_rollouts:
+    value: 1
+  value_per_dynamics:
+    value: false
+  dynamics_prior_scale:
+    value: 0
+  value_prior_scale:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  td_target_std_coef:
+    value: 0
+  min_std:
+    value: 0.05
+  max_std:
+    value: 2
+  log_std_min:
+    value: -10
+  log_std_max:
+    value: 2
+  end_entropy_coeff:
+    value: 0
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false
+  save_train_video:
+    value: false
+  best_eval:
+    value: false
+  train_act_std_coeff:
+    value: 1

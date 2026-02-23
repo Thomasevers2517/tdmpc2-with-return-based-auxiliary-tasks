@@ -1,0 +1,38 @@
+# Sweep 3c: Reanalyze Horizon = 1
+# Hypothesis: Shorter reanalyze horizon (1 instead of inheriting from planner)
+# may produce tighter expert targets.
+# 1 config × 3 tasks × 2 seeds = 6 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # Override
+  reanalyze_horizon:
+    value: 1
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

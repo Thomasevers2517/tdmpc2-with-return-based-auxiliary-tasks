@@ -1,0 +1,200 @@
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # Sweep 4: Action Noise (BMPC-style)
+  # 
+  # Tests train_act_std_coeff: [0, 1]
+  # When =1, adds std-scaled noise to final action:
+  # action = action + std * randn (BMPC always uses this)
+  #############################################
+
+  task:
+    values:
+      - quadruped-walk
+      - hopper-hop
+
+  seed:
+    values: [1, 2]
+
+  #############################################
+  # SWEEP PARAMETERS
+  #############################################
+
+  train_act_std_coeff:
+    values: [0, 1]
+
+  #############################################
+  # KEY SETTINGS (after planner temp fix)
+  #############################################
+
+  fix_kl_order:
+    value: false
+  start_entropy_coeff:
+    value: 1e-4
+  bmpc_policy_parameterization:
+    value: true
+  planner_value_std_coef_train:
+    value: 0.3
+
+  reanalyze_interval:
+    value: 10
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+
+  #############################################
+  # BASELINE DEFAULTS
+  #############################################
+
+  greedy_train_action_selection:
+    value: false
+  kl_scale_min:
+    value: 0.1
+  local_td_bootstrap:
+    value: true
+  num_q:
+    value: 4
+
+  #############################################
+  # REANALYZE SETTINGS (inherit from planner where null)
+  #############################################
+
+  reanalyze_batch_size:
+    value: 64
+  reanalyze_value_std_coef:
+    value: 0
+
+  #############################################
+  # ENTROPY SETTINGS
+  #############################################
+
+  optimistic_entropy_mult:
+    value: 100
+  start_dynamic_entropy_ratio:
+    value: 1
+  end_dynamic_entropy_ratio:
+    value: 1
+  entropy_action_dim_power:
+    value: 1.0
+  jacobian_correction_scale:
+    value: 1
+  hinge_coef:
+    value: 0
+
+  #############################################
+  # PLANNER
+  #############################################
+
+  num_samples:
+    value: 512
+  num_pi_trajs:
+    value: 24
+  iterations:
+    value: 6
+  num_elites:
+    value: 64
+  horizon:
+    value: 3
+  temperature:
+    value: 0.5
+  planner_use_all_heads_eval:
+    value: true
+  planner_value_std_coef_eval:
+    value: -1
+  ema_value_planning:
+    value: false
+
+  #############################################
+  # POLICY OPTIMIZATION METHOD
+  #############################################
+
+  policy_optimization_method:
+    value: distillation
+  optimistic_policy_optimization_method:
+    value: distillation
+  dual_policy_enabled:
+    value: true
+
+  #############################################
+  # TD TARGET SETTINGS
+  #############################################
+
+  td_target_dynamics_reduction:
+    value: mean
+  td_target_std_coef:
+    value: 0
+
+  #############################################
+  # POLICY STD COEF SETTINGS
+  #############################################
+
+  policy_value_std_coef:
+    value: 0
+  optimistic_policy_value_std_coef:
+    value: 1
+
+  #############################################
+  # PRIOR SETTINGS
+  #############################################
+
+  prior_scale:
+    value: 0.1
+  prior_logit_scale:
+    value: 1
+  prior_hidden_div:
+    value: 16
+
+  #############################################
+  # ARCHITECTURE
+  #############################################
+
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_reward_heads:
+    value: 2
+  enc_lr_step_ratio:
+    value: 0.5
+  planner_num_dynamics_heads:
+    value: 2
+
+  #############################################
+  # TRAINING
+  #############################################
+
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  multi_gamma_loss_weight:
+    value: 0
+  utd_ratio:
+    value: 4
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  eval_mean_head_reduce:
+    value: false
+  compile:
+    value: true
+  dropout:
+    value: 0
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false

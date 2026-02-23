@@ -1,0 +1,46 @@
+Pre-ablation 6: Dual Policy
+============================
+Sweep ID: asr7wp6i
+Config:  dual_policy_enabled=true, optimistic_policy_value_std_coef=0.3 (baseline=disabled)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Hopper-hop:      Significantly boosted performance. Exploration clearly helps here.
+- Quadruped-walk:  Also seems to work / slightly positive.
+- Dog-run:         Slightly worse results. Makes sense — more exploration can hurt
+                   when exploitation is already effective.
+
+Key Insight:
+  The dual policy result proves that policy seeding in the planner is actually
+  doing something meaningful — it's not a no-op. The seeded actions provide the
+  initial search range for CEM/MPPI. Without meaningful seeds, the random
+  initialization wouldn't cover the relevant action space.
+
+  The dual policy essentially says "explore unknown regions with an optimistic
+  policy." This helps hopper-hop escape local minima but may hurt tasks where
+  staying close to the current best policy is better.
+
+Trade-off:
+  - Exploration helps: hopper-hop benefits significantly.
+  - Exploration hurts: dog-run slightly worse.
+  - It's unclear whether the net effect is positive across all tasks.
+
+Open Question:
+  Should we use dual policy? Arguments:
+  - PRO: Hopper-hop clearly benefits from extra exploration.
+  - CON: Dog-run slightly worse; adds complexity.
+  - ALTERNATIVE: Seed with the normal policy (less extreme exploration, draws
+    actions toward current best, but limits exploration range).
+
+  Using a normal (non-optimistic) policy for seeding would be less aggressive —
+  you go "slightly out of bounds" rather than into fully unknown regions.
+  But then you lose the exploration benefit that helped hopper-hop.
+
+Conclusion:
+  Keep disabled for now (simplicity), but this is a noteworthy finding.
+  The dual policy mechanism does provide meaningful exploration.
+  Revisit if exploration proves important on harder tasks.
+
+TODO:
+  Run a sweep to test turning off Jacobian correction scale, to verify
+  expected results there as well.

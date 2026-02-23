@@ -1,0 +1,74 @@
+program: tdmpc2/train.py
+method: grid
+project: tdmpc2-tdmpc2
+entity: thomasevers9
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+
+# Baseline ablation: back to basics with key hyperparameter sweeps
+# Tests core design choices: optimism, dynamics heads, encoder consistency, policy method
+# bmpc_policy_parameterization=null → auto-derived from policy_optimization_method
+#   distillation → bmpc=true, svg → bmpc=false
+
+parameters:
+  # Seeds for statistical significance
+  seed:
+    values: [1, 2]
+
+  # Task
+  task:
+    value: quadruped-walk
+
+  # Sweep parameters
+  planner_value_std_coef_train:
+    values: [0, 1]  # 0=neutral, 1=optimistic
+  planner_num_dynamics_heads:
+    values: [1, 2]
+  encoder_consistency_coef:
+    values: [0, 1]
+  policy_optimization_method:
+    values: [distillation, svg]
+
+  # Fixed: back to basics
+  num_reward_heads:
+    value: 1  # single reward head
+  planner_action_noise_std:
+    value: 1  # add noise to planner actions
+  greedy_train_action_selection:
+    value: false  # softmax sampling from elites
+  value_update_freq:
+    value: 1
+  tau:
+    value: 0.01
+  fix_kl_order:
+    value: false
+  start_entropy_coeff:
+    value: 0.0001  # 1e-4
+  bmpc_policy_parameterization:
+    value: null  # auto: distillation→true, svg→false
+  num_q:
+    value: 2
+  
+  # Standard params
+  dual_policy_enabled:
+    value: true
+  local_td_bootstrap:
+    value: true
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  save_video:
+    value: false
+  compile:
+    value: true
+  enable_wandb:
+    value: true
+  wandb_entity:
+    value: thomasevers9
+  wandb_project:
+    value: tdmpc2-tdmpc2

@@ -7,7 +7,7 @@ set -euo pipefail
 # Fixed basic resources (fail if the cluster rejects these)
 ACCOUNT="tdsei8531"
 PARTITION="gpu_a100"
-TIME_LIMIT="00:15:00"
+TIME_LIMIT="01:00:00"
 GPUS="1"
 CPUS="9"
 MEM="8G"
@@ -47,7 +47,7 @@ else
   echo "conda command not found in PATH; ensure the appropriate conda module is loaded" >&2
   exit 2
 fi
-ENV_PATH="/projects/0/prjs0951/conda_envs/tdmpc2"
+ENV_PATH="/home/tevers/.conda/envs/bmpc"
 if [[ ! -d "${ENV_PATH}" ]]; then
   echo "Conda environment path not found: ${ENV_PATH}" >&2
   exit 2

@@ -28,7 +28,6 @@ def get_logger(name: Optional[str] = None, cfg: Optional[object] = None) -> logg
 
 _log = get_logger(__name__)
 
-from common import TASK_SET
 
 
 CONSOLE_FORMAT = [
@@ -50,6 +49,8 @@ CAT_TO_COLOR = {
 	"eval_mean_head_reduce": "green",
 	"validation_all_mean_head_reduce": "magenta",
 	"validation_recent_mean_head_reduce": "cyan",
+	"episode_diag_eval": "green",
+	"episode_diag_train": "blue",
 }
 
 
@@ -150,6 +151,7 @@ class Logger:
 			_log.info("%s", colored("Wandb disabled.", "blue", attrs=["bold"]))
 			cfg.save_agent = False
 			cfg.save_video = False
+			cfg.save_train_video = False
 			self._wandb = None
 			self._video = None
 			return
@@ -168,7 +170,7 @@ class Logger:
 		self._wandb = wandb
 		self._video = (
 			VideoRecorder(cfg, self._wandb)
-			if self._wandb and cfg.save_video
+			if self._wandb and (cfg.save_video or cfg.save_train_video)
 			else None
 		)
 
@@ -225,12 +227,24 @@ class Logger:
 
 		Assumes payload already contains scalar/serializable values and that
 		'step' is provided separately for x-axis alignment.
+
+		PIL.Image values are automatically wrapped in wandb.Image so they
+		appear as image panels rather than raw objects.
 		"""
 		if not self._wandb:
 			return
+		try:
+			from PIL import Image as _PILImage
+			_pil_available = True
+		except ImportError:
+			_PILImage = None
+			_pil_available = False
 		_d = {}
 		for k, v in payload.items():
-			_d[f"{category}/{k}"] = v
+			if _pil_available and isinstance(v, _PILImage.Image):
+				_d[f"{category}/{k}"] = self._wandb.Image(v)
+			else:
+				_d[f"{category}/{k}"] = v
 		self._wandb.log(_d, step=step)
 
 	def _csv_eval_append(self, payload: dict):
@@ -240,36 +254,6 @@ class Logger:
 		pd.DataFrame(np.array(self._eval)).to_csv(
 			self._log_dir / "eval.csv", header=keys, index=None
 		)
-
-	def pprint_multitask(self, d, cfg):
-		"""Pretty-print evaluation metrics for multi-task training."""
-		_log.info("%s", colored(f'Evaluated agent on {len(cfg.tasks)} tasks:', 'yellow', attrs=['bold']))
-		dmcontrol_reward = []
-		metaworld_reward = []
-		metaworld_success = []
-		for k, v in d.items():
-			if '+' not in k:
-				continue
-			task = k.split('+')[1]
-			if task in TASK_SET['mt30'] and k.startswith('episode_reward'): # DMControl
-				dmcontrol_reward.append(v)
-				_log.info("%s", colored(f'  {task:<22}\tR: {v:.01f}', 'yellow'))
-			elif task in TASK_SET['mt80'] and task not in TASK_SET['mt30']: # Meta-World
-				if k.startswith('episode_reward'):
-					metaworld_reward.append(v)
-				elif k.startswith('episode_success'):
-					metaworld_success.append(v)
-					_log.info("%s", colored(f'  {task:<22}\tS: {v:.02f}', 'yellow'))
-		dmcontrol_reward = np.nanmean(dmcontrol_reward)
-		d['episode_reward+avg_dmcontrol'] = dmcontrol_reward
-		_log.info("%s", colored(f'  {"dmcontrol":<22}\tR: {dmcontrol_reward:.01f}', 'yellow', attrs=['bold']))
-		if cfg.task == 'mt80':
-			metaworld_reward = np.nanmean(metaworld_reward)
-			metaworld_success = np.nanmean(metaworld_success)
-			d['episode_reward+avg_metaworld'] = metaworld_reward
-			d['episode_success+avg_metaworld'] = metaworld_success
-			_log.info("%s", colored(f'  {"metaworld":<22}\tR: {metaworld_reward:.01f}', 'yellow', attrs=['bold']))
-			_log.info("%s", colored(f'  {"metaworld":<22}\tS: {metaworld_success:.02f}', 'yellow', attrs=['bold']))
 
 	def log(self, d, category="train"):
 		# assert category in CAT_TO_COLOR.keys(), f"invalid category: {category}"
@@ -296,7 +280,7 @@ class Logger:
 			info: PlannerBasicInfo or PlannerAdvancedInfo instance.
 			step: Global step for x-axis alignment.
 			category: Log category (train/eval/etc.).
-			prefix: Metric prefix (default "planner", use "reanalyze" for reanalyze logging).
+			prefix: Metric prefix (default "planner").
 		"""
 		try:
 			from common.planner.info_types import PlannerBasicInfo, PlannerAdvancedInfo

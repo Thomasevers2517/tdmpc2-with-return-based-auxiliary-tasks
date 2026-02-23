@@ -1,0 +1,14 @@
+Pre-ablation 7: Value Update Frequency
+=======================================
+Sweep ID: kv0fro3n
+Config:  value_update_freq=1 (baseline=2)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Hopper-hop:      Significantly worsened. Updating value every step hurts.
+- Quadruped-walk:  Not overwhelming effect.
+- Dog-run:         Not overwhelming effect.
+
+Conclusion:
+  Keep value_update_freq=2 (baseline). Reducing to 1 notably hurts hopper-hop.
+  The effect isn't dramatic overall but the hopper-hop degradation is clear.

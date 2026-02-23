@@ -1,0 +1,18 @@
+Sweep 8.3h: Eval Planner Optimism Ablation
+==========================================
+
+Purpose:
+Test the planner's value scoring strategy during evaluation. The baseline uses
+planner_value_std_coef_eval=-1 (pessimistic: prefer trajectories where the model
+is confident, i.e. min over dynamics heads). This sweep tests eval with 0 (neutral:
+mean over heads, no uncertainty adjustment).
+
+The hypothesis is that pessimistic evaluation produces more robust, reliable
+actions by avoiding uncertain states, while neutral evaluation may be fooled by
+over-optimistic predictions in poorly-modeled regions.
+
+Ablated parameter: planner_value_std_coef_eval
+  Baseline: -1 (not run)
+  Ablate:   0
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

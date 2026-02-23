@@ -1,0 +1,37 @@
+# Sweep 2d: Number of Rollouts on dog-run
+# Hypothesis: Multiple action samples per starting state reduce variance in V gradients.
+# BMPC baseline: single rollout.
+# 2 tasks × 1 config × 2 seeds = 4 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  num_rollouts:
+    value: 4
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

@@ -1,0 +1,19 @@
+Sweep 8.3p: Buffer Update Interval Ablation
+============================================
+
+Purpose:
+Test how often new transitions are stored in the replay buffer. The baseline
+stores every transition (interval=1). With interval=10, only every 10th
+environment step is stored; with interval=500, only every 500th step.
+
+Sparser buffer updates mean the buffer grows more slowly and contains more
+diverse (temporally spread) data, but loses fine-grained trajectory information.
+This trades off data diversity vs data quantity and temporal coverage. For tasks
+with dense rewards, frequent updates help; for sparse rewards, sparser updates
+may improve the signal-to-noise by keeping only "interesting" transitions.
+
+Ablated parameter: buffer_update_interval
+  Baseline: 1 (not run)
+  Ablate:   10, 500
+
+Total runs: 2 configs × 6 tasks × 2 seeds = 24

@@ -1,0 +1,92 @@
+# Sweep test/2: planner_value_std_coef_train × train_act_std_coeff on hopper-hop
+# 2 std coefs × 2 act std × 10 seeds = 40 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    value: hopper-hop
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  steps:
+    value: 100000
+
+  # --- Sweep axes ---
+  planner_value_std_coef_train:
+    values: [0, 1]
+  train_act_std_coeff:
+    values: [0, 1]
+
+  # --- Fixed settings ---
+  value_prior_scale:
+    value: 0
+  prior_hidden_div:
+    value: 16
+  buffer_update_interval:
+    value: 1
+  jacobian_correction_scale:
+    value: 1
+  local_td_bootstrap:
+    value: true
+  planner_num_dynamics_heads:
+    value: 4
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  num_q:
+    value: 8
+  tau:
+    value: 0.003
+  consistency_coef:
+    value: 10
+  start_entropy_coeff:
+    value: 1e-4
+
+  # --- Standard defaults ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
+  pi_num_rollouts:
+    value: 1
+  value_per_dynamics:
+    value: false
+  dynamics_prior_scale:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  td_target_std_coef:
+    value: 0
+  min_std:
+    value: 0.05
+  max_std:
+    value: 2
+  log_std_min:
+    value: -10
+  log_std_max:
+    value: 2
+  end_entropy_coeff:
+    value: 0
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: true
+  save_train_video:
+    value: true
+  best_eval:
+    value: false

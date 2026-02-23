@@ -1,0 +1,47 @@
+# Sweep 2g: Trust Region + EMA Policy on dog-run
+# Hypothesis: KL regularization to EMA policy prevents rapid policy changes,
+# improving stability. EMA policy for TD targets provides stabler bootstraps.
+# BMPC baseline: no trust region, no EMA policy.
+# Fixed: td_target_use_ema_policy=true
+# Grid: policy_trust_region_coef × policy_ema_tau
+# 2 tasks × 2 × 3 × 2 seeds = 24 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid_h1-walk-v0]
+
+  seed:
+    values: [1, 2]
+
+  # Fixed overrides from baseline
+  td_target_use_ema_policy:
+    value: true
+
+  # Grid parameters
+  policy_trust_region_coef:
+    values: [0.1, 1]
+  policy_ema_tau:
+    values: [0.003, 0.01, 0.03]
+
+  steps:
+    value: 200000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

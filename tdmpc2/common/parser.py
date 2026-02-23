@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import hydra
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
-from common import MODEL_SIZE, TASK_SET
+from common import MODEL_SIZE
 
 
 def cfg_to_dataclass(cfg, frozen=False):
@@ -76,43 +76,9 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		if cfg.task == 'mt30' and cfg.model_size == 19:
 			cfg.latent_dim = 512 # This checkpoint is slightly smaller
 
-	# Multi-task
-	cfg.multitask = cfg.task in TASK_SET.keys()
-	if cfg.multitask:
-		cfg.task_title = cfg.task.upper()
-		# Account for slight inconsistency in task_dim for the mt30 experiments
-		cfg.task_dim = 96 if cfg.task == 'mt80' or cfg.get('model_size', 5) in {1, 317} else 64
-	else:
-		cfg.task_dim = 0
-	cfg.tasks = TASK_SET.get(cfg.task, [cfg.task])
-
-	# ----------------------------------------------------------------------
-	# Multi-gamma configuration (flattened keys)
-	# ----------------------------------------------------------------------
-	# We keep keys flattened (multi_gamma_*) instead of a nested dict to
-	# simplify conversion to a torch.compile-safe dataclass (attribute access
-	# is cheaper / avoids nested structure graph breaks). The base config
-	# sets defaults; here we just guarantee presence & perform lightweight
-	# static validation that does not depend on the agent state.
-	# Added keys:
-	#   multi_gamma_gammas           : list[float] of *auxiliary* discount factors (primary excluded)
-	#   multi_gamma_head             : 'joint' | 'separate' head style
-	#   multi_gamma_loss_weight      : λ applied to mean auxiliary loss (excludes primary)
-	#   multi_gamma_debug_logging    : toggles verbose diagnostics
-	#   multi_gamma_log_num_examples : sample count for debug snapshots
-	# NOTE: Actual assertion that gammas[0] == primary discount occurs later
-	# in the agent (where the computed heuristic discount is accessible).
-	# ----------------------------------------------------------------------
-	if not hasattr(cfg, 'multi_gamma_debug_logging'):
-		cfg.multi_gamma_debug_logging = False
-	if not hasattr(cfg, 'multi_gamma_log_num_examples'):
-		cfg.multi_gamma_log_num_examples = 8
-
-	# Basic syntactic validation (cannot depend on agent internals yet)
-	if hasattr(cfg, 'multi_gamma_gammas') and cfg.multi_gamma_gammas:
-		gammas = list(cfg.multi_gamma_gammas)
-		assert len(gammas) <= 6, f'multi_gamma supports at most 6 auxiliary gammas (got {len(gammas)}).'
-		assert cfg.multi_gamma_head in {'joint', 'separate'}, f"Invalid multi_gamma_head {cfg.multi_gamma_head}."
+	# Multi-task removed — always single-task
+	with open_dict(cfg):
+		cfg.tasks = [cfg.task]
 
 	# ----------------------------------------------------------------------
 	# Fail-fast configuration constraints (centralized here)
@@ -163,25 +129,19 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# Note: std estimation is now adaptive - uses unbiased=True when n>=2, biased otherwise
 
 	# ----------------------------------------------------------------------
-	# Actor-critic source constraints (only 'imagine' mode supported)
+	# Imagination horizon constraint (only horizon=1 supported)
 	# ----------------------------------------------------------------------
 	# Rationale: The value loss optimization picks head 0 for V predictions
 	# (z_seq[:-1, 0]) because all dynamics heads are identical before the
 	# dynamics rollout. This assumption only holds when imagination_horizon=1.
-	# With replay_rollout or longer horizons, dynamics heads diverge after
-	# the first step, so heads would no longer be identical at t > 0.
-	if cfg.ac_source != 'imagine':
-		raise ValueError(
-			f"ac_source='{cfg.ac_source}' is not supported. Only ac_source='imagine' is supported. "
-			"The value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
-			"which only holds when imagination_horizon=1 (imagine mode)."
+	# With longer horizons, dynamics heads diverge after the first step,
+	# so heads would no longer be identical at t > 0.
+	if cfg.value_per_dynamics:
+		assert cfg.num_q % cfg.planner_num_dynamics_heads == 0, (
+			f"value_per_dynamics requires num_q ({cfg.num_q}) divisible by "
+			f"planner_num_dynamics_heads ({cfg.planner_num_dynamics_heads})."
 		)
-	if cfg.aux_value_source != 'imagine':
-		raise ValueError(
-			f"aux_value_source='{cfg.aux_value_source}' is not supported. Only aux_value_source='imagine' is supported. "
-			"The auxiliary value loss picks head 0 for V predictions assuming all heads are identical at t=0, "
-			"which only holds when imagination_horizon=1 (imagine mode)."
-		)
+
 	if cfg.imagination_horizon != 1:
 		raise ValueError(
 			f"imagination_horizon={cfg.imagination_horizon} is not supported. Only imagination_horizon=1 is supported. "
@@ -189,7 +149,6 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 			"all heads are identical at t=0 for value predictions."
 		)
 
- 
 	if cfg.final_rho != -1:
 		import math as _math
 		cfg.rho = _math.pow(cfg.final_rho, 1 / cfg.horizon)
@@ -231,5 +190,12 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 		if hasattr(cfg, param):
 			old_val = cfg[param]
 			cfg[param] = resolve_std_coef(old_val, default_mag)
+
+	# ----------------------------------------------------------------------
+	# policy_ema_tau inheritance: if null, inherit from tau
+	# ----------------------------------------------------------------------
+	policy_ema_tau_val = cfg.get('policy_ema_tau')
+	if policy_ema_tau_val is None or policy_ema_tau_val == 'None':
+		cfg.policy_ema_tau = cfg.tau
 
 	return cfg_to_dataclass(cfg)

@@ -1,0 +1,16 @@
+Sweep 8.3e: Consistency Coefficient Ablation
+=============================================
+
+Purpose:
+Test increasing the consistency loss coefficient from 10 (baseline) to 20.
+The consistency loss enforces that the world model's latent predictions match
+the encoder's output one step later — a self-supervised signal that keeps the
+world model grounded. A higher coefficient puts more weight on this grounding
+signal relative to reward/value losses. This may help stability but could also
+constrain the latent space too much.
+
+Ablated parameter: consistency_coef
+  Baseline: 10 (not run)
+  Ablate:   20
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

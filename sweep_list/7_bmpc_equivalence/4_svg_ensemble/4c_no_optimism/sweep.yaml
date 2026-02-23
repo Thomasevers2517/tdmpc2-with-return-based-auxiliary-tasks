@@ -1,0 +1,82 @@
+# Sweep 4c: SVG Ensemble — no planner optimism
+# Change: planner_value_std_coef_train 1 → 0 (mean scoring, no optimism)
+# 1 config × 3 tasks × 2 seeds = 6 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, hopper-hop, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  steps:
+    value: 100000
+
+  # SVG policy (not distillation)
+  policy_optimization_method:
+    value: svg
+  bmpc_policy_parameterization:
+    value: false
+  start_entropy_coeff:
+    value: 3e-5
+
+  # Ensemble architecture
+  planner_num_dynamics_heads:
+    value: 4
+  num_q:
+    value: 8
+  ensemble_lr_scaling:
+    value: true
+
+  # Training intensity
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  num_rollouts:
+    value: 4
+
+  # Exploration
+  train_act_std_coeff:
+    value: 0
+  prior_scale:
+    value: 0.1
+  policy_seed_noise_std:
+    value: 0.05
+
+  # ABLATION: no planner optimism
+  planner_value_std_coef_train:
+    value: 0
+
+  planner_value_std_coef_eval:
+    value: -1
+  local_td_bootstrap:
+    value: true
+
+  # Unchanged from SVG baseline
+  tau:
+    value: 0.003
+  enc_lr_scale:
+    value: 0.3
+  temperature:
+    value: 0.5
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-bmpc-ablations
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

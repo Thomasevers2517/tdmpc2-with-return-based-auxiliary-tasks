@@ -1,0 +1,268 @@
+# BMPC JAX Equivalence Sweep
+# Verifies our implementation matches BMPC JAX when all differences are configured
+# Expected to match BMPC JAX performance on dog-run and quadruped-walk
+# 2 tasks × 3 seeds = 6 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  #############################################
+  # TASKS AND SEEDS
+  #############################################
+
+  task:
+    values: [dog-run, quadruped-walk]
+
+  seed:
+    values: [1, 2]
+
+  #############################################
+  # NEW BMPC-MATCHING SETTINGS
+  #############################################
+
+  # Expert std scaling (BMPC multiplies by 1.5, clips to min 0.1)
+  expert_std_scale:
+    value: 1.5
+
+  # Normalize rho^t weights to sum to 1 (BMPC does this)
+  normalize_rho_weights:
+    value: true
+
+  # Use planner output from act() as initial expert (no separate reanalyze)
+  initial_expert_from_behavior:
+    value: true
+
+  #############################################
+  # EXISTING SETTINGS TO MATCH BMPC
+  #############################################
+
+  # Encoder LR = base LR (BMPC uses same LR for all)
+  enc_lr_scale:
+    value: 1.0
+
+  # Planning std bounds (BMPC uses min_plan_std=0, but min_policy_std=0.1 for expert)
+  # Using 0.1 for both since expert std clipping is more important for distillation
+  min_std:
+    value: 0.1
+  max_std:
+    value: 2
+
+  # EMA tau for target network (BMPC uses 0.01)
+  tau:
+    value: 0.01
+
+  # Use chosen action as expert mean during reanalyze
+  reanalyze_use_chosen_action:
+    value: true
+
+  # No EMA policy for TD targets
+  td_target_use_ema_policy:
+    value: false
+
+  # No policy trust region
+  policy_trust_region_coef:
+    value: 0
+
+  # Consistency coef (BMPC uses 10, tdmpc2 default is 20)
+  consistency_coef:
+    value: 10
+
+  # No encoder consistency loss (BMPC doesn't have this)
+  encoder_consistency_coef:
+    value: 0
+
+  # Value updates every step (BMPC does)
+  value_update_freq:
+    value: 1
+
+  # No entropy term in policy loss (BMPC uses pure KL)
+  end_entropy_coeff:
+    value: 0
+  start_entropy_coeff:
+    value: 0
+
+  # Slice mode for reanalyze (BMPC style)
+  reanalyze_slice_mode:
+    value: true
+
+  # No ensemble LR scaling (BMPC doesn't have this)
+  ensemble_lr_scaling:
+    value: false
+
+  # Single rollout per starting state
+  num_rollouts:
+    value: 1
+
+  # Dropout 0.01 (BMPC uses value_dropout: 0.01)
+  dropout:
+    value: 0.01
+
+  # No optimism/pessimism (BMPC uses mean only)
+  optimistic_policy_value_std_coef:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+
+  # Single dynamics head (BMPC doesn't use multi-head dynamics)
+  planner_num_dynamics_heads:
+    value: 1
+
+  # 5 value heads (BMPC default)
+  num_q:
+    value: 5
+
+  # Single reward head (BMPC doesn't have reward ensemble)
+  num_reward_heads:
+    value: 1
+
+  # Global TD bootstrap (BMPC style)
+  local_td_bootstrap:
+    value: false
+
+  # No dual policy
+  dual_policy_enabled:
+    value: false
+
+  # UTD ratio 1 (BMPC uses 1 with 4 parallel envs)
+  utd_ratio:
+    value: 1
+
+  # Reanalyze batch size: 20 slices × 3 timesteps = 60
+  reanalyze_batch_size:
+    value: 60
+
+  #############################################
+  # ARCHITECTURE TO MATCH BMPC
+  #############################################
+
+  # BMPC uses AdamW with default weight_decay (0.0 in optax)
+  optimizer_type:
+    value: adamw
+  weight_decay:
+    value: 0
+
+  # BMPC uses 2 hidden layers for reward (tdmpc2 default is 1)
+  num_reward_layers:
+    value: 2
+
+  # Encoder dropout 0 (BMPC doesn't have encoder dropout)
+  encoder_dropout:
+    value: 0
+
+  # Policy log_std bounds (BMPC uses MIN_LOG_STD=-5, MAX_LOG_STD=1)
+  log_std_min:
+    value: -5
+  log_std_max:
+    value: 1
+
+  #############################################
+  # DISABLE EXTRA TDMPC2 FEATURES
+  # (configs not in BMPC that could affect behavior)
+  #############################################
+
+  # Prior networks: BMPC doesn't have frozen random priors
+  prior_scale:
+    value: 0
+
+  # Hinge loss: BMPC doesn't have this regularization
+  hinge_coef:
+    value: 0
+
+  # Multi-gamma auxiliary: BMPC doesn't have auxiliary value heads
+  multi_gamma_loss_weight:
+    value: 0
+
+  # Planner disagreement: BMPC doesn't use latent disagreement
+  planner_lambda_disagreement:
+    value: 0
+
+  # No aggregate horizon (BMPC uses single bootstrap depth)
+  planner_aggregate_value:
+    value: false
+
+  # No extra planner iterations for high-dim actions
+  extra_iter_action_dim_threshold:
+    value: 0
+
+  # Hot buffer: BMPC doesn't have this
+  hot_buffer_enabled:
+    value: false
+
+  # final_rho: disable override, use rho=0.5 directly
+  final_rho:
+    value: -1
+
+  # BMPC-style policy parameterization (already default=true)
+  bmpc_policy_parameterization:
+    value: true
+
+  # Temperature multiply (BMPC uses softmax(temp * values))
+  mult_by_temp:
+    value: true
+
+  # TD target settings: neutral (BMPC doesn't have multi-head dynamics uncertainty)
+  td_target_std_coef:
+    value: 0
+  td_target_dynamics_reduction:
+    value: mean
+
+  # Training action noise: BMPC adds std-scaled noise during training
+  # final_action = action + std * noise where noise ~ N(0, 1)
+  # Equivalent to train_act_std_coeff: 1
+  train_act_std_coeff:
+    value: 1
+  planner_action_noise_std:
+    value: 0
+
+  # Policy seed noise: BMPC samples from policy directly without extra noise
+  # Set to 0 because policy's own std is used for sampling
+  policy_seed_noise_std:
+    value: 0
+
+  # Softmax sampling for train actions (not greedy)
+  greedy_train_action_selection:
+    value: false
+
+  # Policy multi-rollout: disabled
+  pi_multi_rollout:
+    value: false
+
+  # Policy update frequency: every step
+  pi_update_freq:
+    value: 1
+
+  #############################################
+  # TRAINING CONFIG
+  #############################################
+
+  steps:
+    value: 200000
+
+  #############################################
+  # LOGGING
+  #############################################
+
+  enable_wandb:
+    value: true
+
+  wandb_project:
+    value: tdmpc2-bmpc-equiv
+
+  wandb_entity:
+    value: thomasevers9
+
+  compile:
+    value: true
+
+  save_video:
+    value: false

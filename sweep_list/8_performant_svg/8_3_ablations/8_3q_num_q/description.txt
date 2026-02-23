@@ -1,0 +1,19 @@
+Sweep 8.3q: Number of Value Heads Ablation
+===========================================
+
+Purpose:
+Test how the number of value ensemble heads (num_q) affects performance.
+More value heads provide better uncertainty estimates via std across heads,
+which feeds into optimistic/pessimistic scoring and TD targets. However,
+more heads also increase compute cost and may introduce estimation noise if
+individual heads are under-trained.
+
+The baseline uses num_q=8 (included in the grid for reference). We test
+16 (more heads), 5 (moderate), and 2 (minimal ensemble) to map the
+sensitivity of performance to value ensemble size.
+
+Ablated parameter: num_q
+  Baseline: 8 (included in grid)
+  Values:   16, 8, 5, 2
+
+Total runs: 4 configs × 7 tasks × 2 seeds = 56

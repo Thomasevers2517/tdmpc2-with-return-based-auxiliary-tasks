@@ -1,0 +1,15 @@
+Sweep 8.3a: UTD Ratio Ablation
+===============================
+
+Purpose:
+Test the impact of update-to-data ratio (UTD) — how many gradient updates the
+world model and value function receive per environment step. Higher UTD means
+more sample-efficient learning but risks overfitting to limited data. The SVG
+baseline uses UTD=4 (from BMPC). This sweep checks whether UTD=2 or UTD=1
+(the original TD-MPC2 default) suffice.
+
+Ablated parameter: utd_ratio
+  Baseline: 4 (not run — covered by 8.2)
+  Ablate:   2, 1
+
+Total runs: 2 configs × 6 tasks × 2 seeds = 24

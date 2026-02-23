@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import from_modules
 from copy import deepcopy
-from common.math import two_hot
+from common.math import shift_scale_distribution
 
 
 class MLPWithPrior(nn.Module):
@@ -30,9 +30,6 @@ class MLPWithPrior(nn.Module):
 		out_dim (int): Output dimension.
 		prior_hidden_div (int): Divisor for prior hidden dim (prior_hidden = hidden_dim // div).
 		prior_scale (float): Scale factor for prior scalar value. 0 = no prior.
-		prior_logit_scale (float): Multiplier for prior two-hot logits (distributional mode only).
-			Main MLP outputs logits typically in [-5, +5], while two_hot outputs [0, 1].
-			This parameter scales the two-hot output to match main MLP magnitude.
 		act: Optional activation for output layer (e.g., SimNorm for dynamics).
 		dropout (float): Dropout probability for main MLP.
 		distributional (bool): If True, prior outputs a scalar that gets two-hot encoded.
@@ -47,7 +44,6 @@ class MLPWithPrior(nn.Module):
 		out_dim: int,
 		prior_hidden_div: int = 4,
 		prior_scale: float = 1.0,
-		prior_logit_scale: float = 5.0,
 		act=None,
 		dropout: float = 0.,
 		distributional: bool = False,
@@ -55,7 +51,6 @@ class MLPWithPrior(nn.Module):
 	):
 		super().__init__()
 		self.prior_scale = prior_scale
-		self.prior_logit_scale = prior_logit_scale
 		self.out_dim = out_dim
 		self.distributional = distributional
 		self.cfg = cfg
@@ -86,6 +81,7 @@ class MLPWithPrior(nn.Module):
 				if isinstance(m, nn.Linear):
 					nn.init.xavier_normal_(m.weight)
 					nn.init.zeros_(m.bias)
+					m._skip_global_init = True  # Protect from weight_init override
 			# DO NOT freeze with requires_grad_(False) - causes issues with torch.compile + vmap
 			# Instead, we detach the output in forward() to prevent gradient flow
 		else:
@@ -94,42 +90,38 @@ class MLPWithPrior(nn.Module):
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""
 		Forward pass: main_mlp(x) + detach(prior_mlp(x)) * prior_scale.
-		
-		For distributional mode:
-			main_mlp(x) + two_hot(detach(prior_mlp(x)) * prior_scale)
-		
+
+		For distributional mode the prior outputs a scalar shift that is applied
+		via shift_scale_distribution, which properly redistributes probability
+		mass across bins rather than adding logits (which lacks proper
+		probabilistic semantics).
+
 		Args:
 			x (Tensor[..., in_dim]): Input tensor.
-		
+
 		Returns:
 			Tensor[..., out_dim]: Output with prior perturbation.
 		"""
 		out = self.main_mlp(x)  # float32[..., out_dim]
-		
+
 		# Note: prior_mlp is None when prior_scale=0, so this branch is static
 		# and should be optimized away by torch.compile
 		if self.prior_mlp is not None:
 			# Compute prior output and detach to prevent gradient flow.
-			# This is the key: detach() blocks gradients so prior params won't be updated,
-			# but keeps requires_grad=True which plays nicely with torch.compile + vmap.
+			# detach() blocks gradients so prior params stay fixed,
+			# but keeps requires_grad=True for torch.compile + vmap compat.
 			prior_out = self.prior_mlp(x).detach()  # float32[..., 1] if distributional else [..., out_dim]
-			
+
 			if self.distributional:
-				# Prior outputs scalar, scale it, then convert to two-hot distribution
-				# This ensures prior stays within symlog bounds [-10, 10] -> symexp ~[-22k, +22k]
-				prior_scalar = prior_out * self.prior_scale  # float32[..., 1]
-				# two_hot expects [B, 1], so flatten leading dims, apply, then reshape back
-				leading_shape = prior_scalar.shape[:-1]  # e.g., (B, T) or (B,)
-				prior_scalar_flat = prior_scalar.view(-1, 1)  # float32[N, 1]
-				prior_logits_flat = two_hot(prior_scalar_flat, self.cfg)  # float32[N, num_bins]
-				prior_logits = prior_logits_flat.view(*leading_shape, -1)  # float32[..., num_bins]
-				# Scale two_hot output to match main MLP logit magnitude
-				# two_hot outputs [0, 1], main MLP outputs ~[-5, +5], so we scale up
-				out = out + prior_logits * self.prior_logit_scale
+				# Prior outputs a scalar shift in real (pre-symlog) space.
+				# shift_scale_distribution adds the shift in real space, giving
+				# a constant absolute perturbation regardless of value magnitude.
+				prior_shift = prior_out * self.prior_scale  # float32[..., 1]
+				out = shift_scale_distribution(out, self.cfg, shift=prior_shift)
 			else:
-				# Original mode: directly add scaled prior output
+				# Scalar mode: directly add scaled prior output
 				out = out + prior_out * self.prior_scale
-		
+
 		return out
 	
 	def __repr__(self):
@@ -142,71 +134,109 @@ class Ensemble(nn.Module):
 	"""
 	Vectorized ensemble of modules.
 	
-	Uses tensordict's from_modules for parameter storage (supporting tuple-indexing,
-	.data, .clone(), .lerp_() for EMA updates), but uses torch.func.functional_call
-	for the forward pass instead of to_module() mutation.
+	For N>1: Uses tensordict's from_modules for parameter storage (supporting
+	tuple-indexing, .data, .clone(), .lerp_() for EMA updates), and
+	torch.func.functional_call + vmap for the forward pass.
 	
-	This is more compatible with torch.compile because functional_call doesn't
-	mutate the module - it's a pure function that takes params as input.
-	
-	The previous approach used `with params.to_module(self.module)` which mutates
-	the module's parameters inside vmap. This can cause issues with torch.compile
-	because the compiler traces a static graph and mutation patterns are fragile.
-	
-	With functional_call:
-	- No mutation: params are passed explicitly to each forward call
-	- Compile-friendly: torch.func is designed for this pattern
-	- Same storage: TensorDictParams still handles param storage, indexing, EMA
+	For N=1: Uses direct module call to avoid vmap/functional_call overhead and
+	potential torch.compile compatibility issues. The single module is stored as
+	a real submodule.
 	"""
 
 	def __init__(self, modules, **kwargs):
 		super().__init__()
-		# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
-		self.params = from_modules(*modules, as_module=True)
-		
-		# Create template module on meta device (no memory, just structure)
-		# IMPORTANT: Store via __dict__ to avoid registering as submodule.
-		# This prevents .to(device) from trying to move the meta tensor (which would fail).
-		template = deepcopy(modules[0])
-		template = template.to("meta")
-		self.__dict__["_module"] = template
-		
-		self._repr = str(modules[0])
 		self._n = len(modules)
+		self._repr = str(modules[0])
+		self._use_vmap = self._n > 1
+
+		if self._use_vmap:
+			# N>1: Use tensordict + vmap path
+			# Store stacked params as TensorDictParams (for .data, .clone(), .lerp_(), indexing)
+			self.params = from_modules(*modules, as_module=True)
+
+			# Create template module on meta device (no memory, just structure).
+			# Store via __dict__ to avoid registering as submodule,
+			# preventing .to(device) from trying to move meta tensors.
+			template = deepcopy(modules[0])
+			template = template.to("meta")
+			self.__dict__["_module"] = template
+		else:
+			# N=1: Keep the single module directly as a real submodule
+			# This avoids vmap/functional_call entirely
+			self._single_module = modules[0]
+			# Also create params via from_modules for EMA interface compatibility
+			# (so .params.lerp_(), .params.clone() etc still work)
+			self.params = from_modules(modules[0], as_module=True)
 
 	def __len__(self):
 		return self._n
 
 	@property
 	def module(self):
-		"""Template module (on meta device). Exposed for backward compatibility."""
-		return self._module
+		"""Template module (on meta device for N>1, or real module for N=1)."""
+		if self._use_vmap:
+			return self._module
+		else:
+			return self._single_module
 
-	def forward(self, *args, **kwargs):
+	def forward(self, *args, split_data: bool = False, **kwargs):
+		"""Forward pass: direct call for N=1, vectorized vmap for N>1.
+
+		When ``split_data=False`` (broadcast), all members see the same inputs.
+		When ``split_data=True``, ``args[0]`` dim-0 must equal H and is sliced
+		per member.
+
+		Args:
+			*args: Positional inputs forwarded to the wrapped module.
+			split_data: If True, slice ``args[0]`` along dim 0 per member.
+			**kwargs: Keyword inputs forwarded to the wrapped module.
+
+		Returns:
+			Tensor[H, *batch, out_dim]: Stacked outputs, one per member.
 		"""
-		Vectorized forward pass using functional_call.
-		
-		Instead of mutating self.module with to_module(), we use functional_call
-		which is a pure function: functional_call(module, params, args) runs the
-		module's forward with the given params without modifying the module.
-		"""
+		if not self._use_vmap:
+			# N=1: Direct module call, add leading H=1 dimension
+			if split_data:
+				# args[0] has shape [1, *batch, ...], squeeze the leading dim
+				assert args[0].shape[0] == 1, f"split_data with N=1: expected dim-0=1, got {args[0].shape[0]}"
+				first_arg = args[0].squeeze(0)  # [*batch, ...]
+				rest_args = args[1:]
+				out = self._single_module(first_arg, *rest_args, **kwargs)  # [*batch, out_dim]
+			else:
+				out = self._single_module(*args, **kwargs)  # [*batch, out_dim]
+			return out.unsqueeze(0)  # [1, *batch, out_dim]
+
+		# N>1: Vectorized vmap + functional_call path
 		from torch.func import functional_call
-		
-		module = self._module  # Template module on meta device (not registered as submodule)
-		
-		def call_single(params_slice):
-			# params_slice is a TensorDict with params for one ensemble member
-			# Convert to flat dict format for functional_call: {"layer.weight": tensor, ...}
-			# flatten_keys(".") converts ("main_mlp", "0", "weight") -> "main_mlp.0.weight"
-			params_dict = dict(params_slice.flatten_keys(".").items())
-			# functional_call runs module.forward with the given params (no mutation)
-			return functional_call(module, params_dict, args, kwargs)
-		
-		# vmap over the first dimension of self.params (the ensemble dimension)
-		return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
+
+		module = self._module  # Template on meta device
+
+		if split_data:
+			assert len(args) >= 1, "split_data=True requires at least one positional arg"
+			assert args[0].shape[0] == len(self), (
+				f"split_data: dim-0 of first arg ({args[0].shape[0]}) "
+				f"!= ensemble size ({len(self)})"
+			)
+			first_arg = args[0]
+			rest_args = args[1:]
+
+			def call_single(params_slice, x_slice):
+				params_dict = dict(params_slice.flatten_keys(".").items())
+				return functional_call(module, params_dict, (x_slice, *rest_args), kwargs)
+
+			return torch.vmap(call_single, in_dims=(0, 0), randomness="different")(
+				self.params, first_arg
+			)
+		else:
+			def call_single(params_slice):
+				params_dict = dict(params_slice.flatten_keys(".").items())
+				return functional_call(module, params_dict, args, kwargs)
+
+			return torch.vmap(call_single, in_dims=0, randomness="different")(self.params)
 
 	def __repr__(self):
-		return f'Vectorized {len(self)}x ' + self._repr
+		mode = "Direct" if not self._use_vmap else "Vectorized"
+		return f'{mode} {len(self)}x ' + self._repr
 
 
 class ShiftAug(nn.Module):
@@ -328,7 +358,7 @@ class DynamicsHeadWithPrior(nn.Module):
 	This encourages diverse representations across ensemble members.
 
 	Args:
-		in_dim (int): Input dimension (latent_dim + action_dim + task_dim).
+		in_dim (int): Input dimension (latent_dim + action_dim).
 		mlp_dims (list[int]): Hidden dimensions for the main MLP.
 		out_dim (int): Output dimension (latent_dim).
 		cfg: Config object with simnorm_dim and prior settings.
@@ -363,9 +393,6 @@ class DynamicsHeadWithPrior(nn.Module):
 		
 		# SimNorm applied after MLPWithPrior
 		self.simnorm = SimNorm(cfg)
-		
-		# Expose main_mlp for weight_init compatibility
-		self.main_mlp = self.mlp_with_prior.main_mlp
 
 	def forward(self, x: torch.Tensor) -> torch.Tensor:
 		"""
@@ -413,18 +440,18 @@ def enc(cfg, out={}):
 	Returns a dictionary of encoders for each observation in the dict.
 	
 	Args:
-		cfg: Config object with obs_shape, task_dim, num_enc_layers, enc_dim, 
+	cfg: Config object with obs_shape, num_enc_layers, enc_dim, 
 		     latent_dim, encoder_dropout, num_channels, simnorm_dim.
 		out: Optional dict to populate (default empty).
 	
 	Returns:
 		nn.ModuleDict of encoders keyed by observation type ('state', 'rgb').
 	"""
-	encoder_dropout = getattr(cfg, 'encoder_dropout', 0.0)
+	encoder_dropout = cfg.encoder_dropout
 	for k in cfg.obs_shape.keys():
 		if k == 'state':
 			# Apply dropout at last hidden layer (before SimNorm) to allow encoder compute before noise
-			out[k] = mlp(cfg.obs_shape[k][0] + cfg.task_dim, max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
+			out[k] = mlp(cfg.obs_shape[k][0], max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
 		elif k == 'rgb':
 			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:

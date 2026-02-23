@@ -4,7 +4,6 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch import autocast
-from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from common import layers, math, init
 from common.nvtx_utils import maybe_range
@@ -13,170 +12,103 @@ from tensordict.nn import TensorDictParams
 
 
 class WorldModel(nn.Module):
-	"""
-	TD-MPC2 implicit world model architecture.
-	Can be used for both single-task and multi-task experiments.
-	
-	This implementation uses State-Value functions V(s) instead of 
-	State-Action Value functions Q(s,a). The value heads take only
-	the latent state z as input, not the action.
+	"""TD-MPC2 implicit world model architecture (single-task, V-function only).
+
+	Modules: encoder, dynamics (multi-head ensemble), reward (multi-head ensemble),
+	termination (optional), policy, V-function (ensemble).
 	"""
 
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		
-		# Validate critic_type - only V is supported
-		critic_type = getattr(cfg, 'critic_type', 'V')
-		if critic_type != 'V':
-			raise ValueError(
-				f"critic_type='{critic_type}' is not supported. "
-				"This codebase only implements state-value functions (V). "
-				"Set critic_type='V' in your config."
-			)
-		
+
 		if self.cfg.dtype == 'float16':
 			self.autocast_dtype = torch.float16
 		elif self.cfg.dtype == 'bfloat16':
-			self.autocast_dtype = torch.bfloat16	
+			self.autocast_dtype = torch.bfloat16
 		else:
 			self.autocast_dtype = None
-   
-		if cfg.multitask:
-			self._task_emb = nn.Embedding(len(cfg.tasks), cfg.task_dim, max_norm=1)
-			self.register_buffer("_action_masks", torch.zeros(len(cfg.tasks), cfg.action_dim))
-			for i in range(len(cfg.tasks)):
-				self._action_masks[i, :cfg.action_dims[i]] = 1.
+
 		self._encoder = layers.enc(cfg)
-		# Multi-head dynamics: independent heads; first head exposed for legacy uses/repr
-		h_total = int(getattr(cfg, 'planner_num_dynamics_heads', 1))
-		# Unified prior config for ensemble diversity
+
+		# Multi-head dynamics ensemble (vmap + functional_call)
+		h_total = int(cfg.planner_num_dynamics_heads)
 		prior_hidden_div = int(cfg.prior_hidden_div)
-		prior_scale = float(cfg.prior_scale)
-		# Dynamics head config: layer count and dropout
-		dynamics_num_layers = int(getattr(cfg, 'dynamics_num_layers', 2))
-		dynamics_dropout = float(getattr(cfg, 'dynamics_dropout', 0.0))
-		self._dynamics_heads = nn.ModuleList([
-			layers.DynamicsHeadWithPrior(
-				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				mlp_dims=dynamics_num_layers * [cfg.mlp_dim],
-				out_dim=cfg.latent_dim,
-				cfg=cfg,
-				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
-				dropout=dynamics_dropout,
+		value_prior_scale = float(cfg.value_prior_scale)
+		dynamics_num_layers = int(cfg.dynamics_num_layers)
+		dynamics_dropout = float(cfg.dynamics_dropout)
+		dyn_heads = [
+			nn.Sequential(
+				layers.mlp(
+					cfg.latent_dim + cfg.action_dim,
+					dynamics_num_layers * [cfg.mlp_dim],
+					cfg.latent_dim,
+					dropout=dynamics_dropout,
+				),
+				layers.SimNorm(cfg),
 			)
 			for _ in range(h_total)
-		])
-		# Keep a reference for __repr__ and any legacy code paths expecting `_dynamics`
-		self._dynamics = self._dynamics_heads[0]
-		
-		# Multi-head reward ensemble for pessimistic reward estimation
-		# Uses Ensemble (vmap) for efficient vectorized forward pass.
-		# NOTE: We apply weight_init to each MLP before wrapping in Ensemble because
-		# Ensemble stores params in TensorDictParams which apply() does not traverse.
-		num_reward_heads = int(getattr(cfg, 'num_reward_heads', 1))
+		]
+		self._dynamics_heads = layers.Ensemble(dyn_heads)
+		self._dynamics = self._dynamics_heads  # legacy alias
+
+		# Multi-head reward ensemble (plain MLP, no prior)
+		num_reward_heads = int(cfg.num_reward_heads)
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
-		num_reward_layers = getattr(cfg, 'num_reward_layers', 2)  # Default 2 for backward compat
-		reward_dropout = cfg.dropout if getattr(cfg, 'reward_dropout_enabled', False) else 0.0
-		prior_logit_scale = getattr(cfg, 'prior_logit_scale', 5.0)  # Default 5.0 for backward compat
+		num_reward_layers = cfg.num_reward_layers
+		reward_dropout = cfg.dropout if cfg.reward_dropout_enabled else 0.0
 		reward_mlps = [
-			layers.MLPWithPrior(
-				in_dim=cfg.latent_dim + cfg.action_dim + cfg.task_dim,
-				hidden_dims=num_reward_layers * [reward_hidden_dim],
-				out_dim=max(cfg.num_bins, 1),
-				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
-				prior_logit_scale=prior_logit_scale,
+			layers.mlp(
+				cfg.latent_dim + cfg.action_dim,
+				num_reward_layers * [reward_hidden_dim],
+				max(cfg.num_bins, 1),
 				dropout=reward_dropout,
-				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
-				cfg=cfg,
 			)
 			for _ in range(num_reward_heads)
 		]
-		for mlp_with_prior in reward_mlps:
-			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Rs = layers.Ensemble(reward_mlps)
-		
-		self._termination = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 1) if cfg.episodic else None
-		self._pi = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim)
-		# Optimistic policy for dual-policy architecture (same architecture as _pi)
-		self._pi_optimistic = layers.mlp(cfg.latent_dim + cfg.task_dim, 2*[cfg.mlp_dim], 2*cfg.action_dim) if cfg.dual_policy_enabled else None
-		# V-function ensemble: input is latent only (no action)
-		# NOTE: cfg.num_q is kept as the config name for backward compatibility in experiment tracking
-		# Apply weight_init to each MLP before wrapping in Ensemble (same reason as reward heads).
-		v_input_dim = cfg.latent_dim + cfg.task_dim
-		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div  # Allow smaller V networks via value_dim_div
-		num_value_layers = cfg.num_value_layers  # Number of hidden layers (default 2)
+
+		# Termination head
+		self._termination = layers.mlp(
+			cfg.latent_dim, num_reward_layers * [reward_hidden_dim], 1
+		) if cfg.episodic else None
+
+		# Policy heads
+		self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
+		self._pi_optimistic = layers.mlp(
+			cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim
+		) if cfg.dual_policy_enabled else None
+
+		# V-function ensemble (input is latent only)
+		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div
+		num_value_layers = cfg.num_value_layers
 		v_mlps = [
 			layers.MLPWithPrior(
-				in_dim=v_input_dim,
+				in_dim=cfg.latent_dim,
 				hidden_dims=num_value_layers * [v_mlp_dim],
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
-				prior_scale=prior_scale,
-				prior_logit_scale=prior_logit_scale,
+				prior_scale=value_prior_scale,
 				dropout=cfg.dropout,
-				distributional=True,  # Prior outputs scalar → two-hot for numerical stability
+				distributional=True,
 				cfg=cfg,
 			)
 			for _ in range(cfg.num_q)
 		]
-		for mlp_with_prior in v_mlps:
-			mlp_with_prior.main_mlp.apply(init.weight_init)
 		self._Vs = layers.Ensemble(v_mlps)
 
-		# ------------------------------------------------------------------
-		# Auxiliary multi-gamma state-value heads (training-only)
-		# Simplified (no ensemble dimension) per user request.
-		# We construct either:
-		#   joint: a single MLP outputting (G_aux * K) logits reshaped to (G_aux,K)
-		#   separate: ModuleList of G_aux MLP heads each outputting K logits
-		# These heads are used only for auxiliary supervision and never for
-		# planning or policy bootstrapping. Therefore, we do not maintain
-		# target networks or ensembles (min/avg collapse to identity).
-		# ------------------------------------------------------------------
-		self._num_aux_gamma = 0
-		self._aux_joint_Vs = None      # single MLP head for joint aux values
-		self._aux_separate_Vs = None   # ModuleList[MLP] for separate aux values
-		self._target_aux_joint_Vs = None
-		self._target_aux_separate_Vs = None
-		self._detach_aux_joint_Vs = None
-		self._detach_aux_separate_Vs = None	
-  
-		if getattr(cfg, 'multi_gamma_gammas', None):
-			gammas = cfg.multi_gamma_gammas
-			self._num_aux_gamma = len(gammas)
-			# Auxiliary V heads: input is latent only (no action)
-			# Use same v_mlp_dim and num_value_layers as primary V heads for consistency
-			aux_in_dim = cfg.latent_dim + (cfg.task_dim if cfg.multitask else 0)
-			aux_v_mlp_dim = v_mlp_dim  # Already computed above as cfg.mlp_dim // cfg.value_dim_div
-			if cfg.multi_gamma_head == 'joint':
-				self._aux_joint_Vs = layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim*cfg.joint_aux_dim_mult], max(cfg.num_bins * self._num_aux_gamma, 1), dropout=cfg.dropout)
-			elif cfg.multi_gamma_head == 'separate':
-				self._aux_separate_Vs = torch.nn.ModuleList([
-					layers.mlp(aux_in_dim, num_value_layers*[aux_v_mlp_dim], max(cfg.num_bins, 1), dropout=cfg.dropout)
-					for _ in range(self._num_aux_gamma)
-				])
-			else:
-				raise ValueError(f"Unsupported multi_gamma_head: {cfg.multi_gamma_head}")
-
 		self.apply(init.weight_init)
-		# Zero-init main network output layers for reward and value heads.
-		# When prior_scale=0: output = main(x) = 0 initially → V≈0, R≈0
-		# When prior_scale>0: output = main(x) + prior(x) = 0 + prior(x) → diversity from prior
-		# The main network can still learn to compensate since its output layer is trainable.
-		# NOTE: MLPWithPrior nests the main MLP under "main_mlp" in TensorDictParams
+		# Zero-init output layers for reward and value heads
 		reward_output_layer_key = str(num_reward_layers)
 		v_output_layer_key = str(num_value_layers)
 		init.zero_([
-			self._Rs.params["main_mlp", reward_output_layer_key, "weight"],
+			self._Rs.params[reward_output_layer_key, "weight"],
 			self._Vs.params["main_mlp", v_output_layer_key, "weight"],
 		])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
-		self.init()
+		self._init_target_networks()
 
 	def _autocast_context(self):
 		dtype = self.autocast_dtype
@@ -187,76 +119,48 @@ class WorldModel(nn.Module):
 			return nullcontext()
 		return autocast(device_type=device.type, dtype=dtype)
 
-	def init(self):
-		# Create params
+	def _init_target_networks(self):
+		"""Create target and detach V-networks, and optionally target policy."""
+		# Target/detach V-networks
 		self._detach_Vs_params = TensorDictParams(self._Vs.params.data, no_convert=True)
 		self._target_Vs_params = TensorDictParams(self._Vs.params.data.clone(), no_convert=True)
-  
+
 		with self._detach_Vs_params.data.to("meta").to_module(self._Vs.module):
 			self._detach_Vs = deepcopy(self._Vs)
 			self._target_Vs = deepcopy(self._Vs)
 
-		# Assign params to modules
-		# We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
 		delattr(self._detach_Vs, "params")
 		self._detach_Vs.__dict__["params"] = self._detach_Vs_params
 		delattr(self._target_Vs, "params")
 		self._target_Vs.__dict__["params"] = self._target_Vs_params
 
-		# Auxiliary heads (non-ensemble): vectorized param buffers + target/detach clones
-		if self._aux_joint_Vs is not None:
-			# Initialize parameter vectors as buffers once
-			if not hasattr(self, 'aux_joint_target_vec'):
-				vec = parameters_to_vector(self._aux_joint_Vs.parameters()).detach().clone()
-				self.register_buffer('aux_joint_target_vec', vec)
-				self.register_buffer('aux_joint_detach_vec', vec.clone())
-			# Create frozen clones and load vectors
-			self._target_aux_joint_Vs = deepcopy(self._aux_joint_Vs)
-			self._detach_aux_joint_Vs = deepcopy(self._aux_joint_Vs)
-			for p in self._target_aux_joint_Vs.parameters():
-				p.requires_grad_(False)
-			for p in self._detach_aux_joint_Vs.parameters():
-				p.requires_grad_(False)
-			vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Vs.parameters())
-			vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Vs.parameters())
-		elif self._aux_separate_Vs is not None:
-			# Build concatenated vectors and size map once
-			if not hasattr(self, 'aux_separate_sizes'):
-				self.aux_separate_sizes = [sum(p.numel() for p in h.parameters()) for h in self._aux_separate_Vs]
-				vecs = [parameters_to_vector(h.parameters()).detach().clone() for h in self._aux_separate_Vs]
-				full = torch.cat(vecs, dim=0)
-				self.register_buffer('aux_separate_target_vec', full)
-				self.register_buffer('aux_separate_detach_vec', full.clone())
-			# Create frozen clones and load
-			self._target_aux_separate_Vs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Vs])
-			self._detach_aux_separate_Vs = nn.ModuleList([deepcopy(h) for h in self._aux_separate_Vs])
-			for head in list(self._target_aux_separate_Vs) + list(self._detach_aux_separate_Vs):
-				for p in head.parameters():
+		# Target policy for TD target imagination (if EMA policy used)
+		need_target_pi = self.cfg.td_target_use_ema_policy
+		if need_target_pi:
+			if not hasattr(self, '_target_pi') or self._target_pi is None:
+				self._target_pi = deepcopy(self._pi)
+				for p in self._target_pi.parameters():
 					p.requires_grad_(False)
-			offset = 0
-			for h, sz in zip(self._target_aux_separate_Vs, self.aux_separate_sizes):
-				vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
-				offset += sz
-			offset = 0
-			for h, sz in zip(self._detach_aux_separate_Vs, self.aux_separate_sizes):
-				vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
-				offset += sz
-   
+			if self.cfg.dual_policy_enabled and self._pi_optimistic is not None:
+				if not hasattr(self, '_target_pi_optimistic') or self._target_pi_optimistic is None:
+					self._target_pi_optimistic = deepcopy(self._pi_optimistic)
+					for p in self._target_pi_optimistic.parameters():
+						p.requires_grad_(False)
+			else:
+				self._target_pi_optimistic = None
+		else:
+			self._target_pi = None
+			self._target_pi_optimistic = None
 
 	def __repr__(self):
-		repr = 'TD-MPC2 World Model\n'
+		repr_str = 'TD-MPC2 World Model\n'
 		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', 'V-functions']
-		# Optionally append auxiliary V ensembles to representation
-		aux_modules = []
-		if self._num_aux_gamma > 0:
-			modules.append('Aux V-functions')
-			aux_modules = [self._aux_joint_Vs if self._aux_joint_Vs is not None else self._aux_separate_Vs]
-		for i, m in enumerate([self._encoder, self._dynamics, self._Rs, self._termination, self._pi, self._Vs] + aux_modules):
+		for i, m in enumerate([self._encoder, self._dynamics, self._Rs, self._termination, self._pi, self._Vs]):
 			if m == self._termination and not self.cfg.episodic:
 				continue
-			repr += f"{modules[i]}: {m}\n"
-		repr += "Learnable parameters: {:,}".format(self.total_params)
-		return repr
+			repr_str += f"{modules[i]}: {m}\n"
+		repr_str += "Learnable parameters: {:,}".format(self.total_params)
+		return repr_str
 
 	@property
 	def total_params(self):
@@ -264,99 +168,45 @@ class WorldModel(nn.Module):
 
 	def to(self, *args, **kwargs):
 		super().to(*args, **kwargs)
-		self.init()
+		self._init_target_networks()
 		return self
 
 	def train(self, mode=True):
-		"""
-		Overriding `train` method to keep target V-networks in eval mode.
-		"""
+		"""Override train to keep target V-networks in eval mode."""
 		super().train(mode)
 		self._target_Vs.train(False)
-		if self._target_aux_joint_Vs is not None:
-			self._target_aux_joint_Vs.train(False)
-		if getattr(self, '_detach_aux_joint_Vs', None) is not None:
-			self._detach_aux_joint_Vs.train(False)
-		if getattr(self, '_target_aux_separate_Vs', None) is not None:
-			for h in self._target_aux_separate_Vs:
-				h.train(False)
-		if getattr(self, '_detach_aux_separate_Vs', None) is not None:
-			for h in self._detach_aux_separate_Vs:
-				h.train(False)
 		return self
 
 	def soft_update_target_V(self):
-		"""
-		Soft-update target V-networks using Polyak averaging.
-		"""
+		"""Soft-update target V-networks using Polyak averaging."""
 		with maybe_range('WM/soft_update_target_V', self.cfg):
 			self._target_Vs_params.lerp_(self._detach_Vs_params, self.cfg.tau)
-			# Vectorized EMA for aux heads; emit debug checks if enabled
-			if getattr(self, '_aux_joint_Vs', None) is not None:
-				with torch.no_grad():
-					online = parameters_to_vector(self._aux_joint_Vs.parameters()).detach()
-					prev = self.aux_joint_target_vec.detach().clone()
-					self.aux_joint_target_vec.lerp_(online, self.cfg.tau)
-					vector_to_parameters(self.aux_joint_target_vec, self._target_aux_joint_Vs.parameters())
-					# Detach mirrors online snapshot
-					self.aux_joint_detach_vec.copy_(online)
-					vector_to_parameters(self.aux_joint_detach_vec, self._detach_aux_joint_Vs.parameters())
-					
-	
-			elif getattr(self, '_aux_separate_Vs', None) is not None:
-				with torch.no_grad():
-					vecs = [parameters_to_vector(h.parameters()).detach() for h in self._aux_separate_Vs]
-					online = torch.cat(vecs, dim=0)
-					prev = self.aux_separate_target_vec.detach().clone()
-					self.aux_separate_target_vec.lerp_(online, self.cfg.tau)
-					# Assign to target heads
-					offset = 0
-					for h, sz in zip(self._target_aux_separate_Vs, self.aux_separate_sizes):
-						vector_to_parameters(self.aux_separate_target_vec[offset:offset+sz], h.parameters())
-						offset += sz
-					# Detach mirrors online
-					self.aux_separate_detach_vec.copy_(online)
-					offset = 0
-					for h, sz in zip(self._detach_aux_separate_Vs, self.aux_separate_sizes):
-						vector_to_parameters(self.aux_separate_detach_vec[offset:offset+sz], h.parameters())
-						offset += sz
 
 	def _soft_update_module(self, target_module, source_module, tau):
+		"""Generic EMA update from source → target."""
 		with torch.no_grad():
-			target_params = list(target_module.parameters())
-			source_params = list(source_module.parameters())
-			if len(target_params) != len(source_params):
-				raise RuntimeError('Source/target parameter count mismatch during EMA update')
-			for target, source in zip(target_params, source_params):
+			for target, source in zip(target_module.parameters(), source_module.parameters()):
 				target.data.lerp_(source.data, tau)
-			online_vec = parameters_to_vector(source_params).detach()
-			target_vec = parameters_to_vector(target_params).detach()
-			return torch.max(torch.abs(online_vec - target_vec))
-				
-	def task_emb(self, x, task):
-		"""
-		Continuous task embedding for multi-task experiments.
-		Retrieves the task embedding for a given task ID `task`
-		and concatenates it to the input `x`.
-		"""
-		if isinstance(task, int):
-			task = torch.tensor([task], device=x.device)
-		emb = self._task_emb(task.long())
-		if x.ndim == 3:
-			emb = emb.unsqueeze(0).repeat(x.shape[0], 1, 1)
-		elif emb.shape[0] == 1:
-			emb = emb.repeat(x.shape[0], 1)
-		return torch.cat([x, emb], dim=-1)
 
-	def encode(self, obs, task):
-		"""
-		Encodes an observation into its latent representation.
-		This implementation assumes a single state-based observation.
+	def soft_update_target_pi(self):
+		"""Soft-update target policy networks."""
+		if self._target_pi is None:
+			return
+		self._soft_update_module(self._target_pi, self._pi, self.cfg.policy_ema_tau)
+		if self._target_pi_optimistic is not None:
+			self._soft_update_module(self._target_pi_optimistic, self._pi_optimistic, self.cfg.policy_ema_tau)
+
+	def encode(self, obs):
+		"""Encode observation to latent representation.
+
+		Args:
+			obs (Tensor[..., *obs_shape]): Observation.
+
+		Returns:
+			Tensor[..., L]: Latent embedding.
 		"""
 		with maybe_range('WM/encode', self.cfg):
 			encoder = self._encoder
-			if self.cfg.multitask:
-				obs = self.task_emb(obs, task)
 			if self.cfg.obs == 'rgb' and obs.ndim == 5:
 				with self._autocast_context():
 					encoded = [encoder[self.cfg.obs](o) for o in obs]
@@ -365,245 +215,157 @@ class WorldModel(nn.Module):
 				out = encoder[self.cfg.obs](obs)
 			return out.float()
 
-	def next(self, z, a, task, head_mode=None):
-		"""Predict next latent(s) for one step.
+	def next(self, z, a, split_data=False):
+		"""Predict next latent(s) using all dynamics heads in one vectorized call.
 
 		Args:
-			z (Tensor[B, L]): Current latent.
-			a (Tensor[B, A]): Current action.
-			task: Optional task id for multitask (passed to task_emb when enabled).
-			head_mode (str|None): If None, returns Tensor[B,L] using head 0 (legacy path).
-				If 'single', returns Tensor[1,B,L] using head 0.
-				If 'random', returns Tensor[1,B,L] using a random head per call.
-				If 'all', returns Tensor[H,B,L] stacked over all dynamics heads.
+			z: Broadcast (split_data=False): Tensor[B, L]. Split (split_data=True): Tensor[H, B, L].
+			a: Shape mirrors z (with A instead of L).
+			split_data: If True, z and a have a leading H dim sliced per-head.
 
 		Returns:
-			Tensor[..., B, L]: Next latent(s) with optional head dimension leading.
+			Tensor[H, B, L]: Next latent(s) with leading head dimension.
 		"""
 		with maybe_range('WM/dynamics', self.cfg):
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
-			H = len(self._dynamics_heads)
-			if head_mode is None:
-				# Legacy behavior: single head (0), no head dimension in output
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float()
-			if head_mode == 'single':
-				with self._autocast_context():
-					out = self._dynamics_heads[0](za)
-				return out.float().unsqueeze(0)
-			elif head_mode == 'all':
-				outs = []
-				with self._autocast_context():
-					for head in self._dynamics_heads:
-						outs.append(head(za)) 
-				return torch.stack([o.float() for o in outs], dim=0)  # [H,B,L]
-			else:
-				raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single' or 'all'.")
+			with self._autocast_context():
+				out = self._dynamics_heads(za, split_data=split_data)  # float32[H, B, L]
+			return out.float()
 
-	def reward(self, z, a, task, head_mode='single'):
-		"""
-		Predicts instantaneous (single-step) reward logits.
+	def reward(self, z, a, head_mode='single'):
+		"""Predict instantaneous reward logits.
 
 		Args:
 			z (Tensor[..., L]): Latent states.
 			a (Tensor[..., A]): Actions.
-			task: Task index for multitask setup.
-			head_mode (str): 'single' returns logits from head 0 [1, ..., K],
-				'all' returns logits from all heads [R, ..., K].
+			head_mode (str): 'single' → head 0 only, 'all' → all R heads.
 
 		Returns:
-			Tensor[R, ..., K] where R=1 if head_mode='single', R=num_heads if 'all'.
+			Tensor[R, ..., K]: Reward logits.
 		"""
 		with maybe_range('WM/reward', self.cfg):
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
 			za = torch.cat([z, a], dim=-1)
 			with self._autocast_context():
-				# Ensemble forward returns [num_heads, ..., K] via vmap
 				out = self._Rs(za)
 			out = out.float()
 			if head_mode == 'single':
-				return out[:1]  # Keep leading dim, take first head only
+				return out[:1]
 			elif head_mode == 'all':
 				return out
 			else:
-				raise ValueError(f"Unsupported head_mode for reward: {head_mode}. Use 'single' or 'all'.")
-	
-	def termination(self, z, task, unnormalized=False):
+				raise ValueError(f"Unsupported head_mode: {head_mode}")
+
+	def termination(self, z, unnormalized=False):
+		"""Predict termination signal.
+
+		Args:
+			z (Tensor[..., L]): Latent states.
+			unnormalized (bool): If True, return raw logits.
+
+		Returns:
+			Tensor[..., 1]: Termination probability or logits.
 		"""
-		Predicts termination signal.
-		"""
-		assert task is None
-		if self.cfg.multitask:
-			z = self.task_emb(z, task)
 		with self._autocast_context():
 			logits = self._termination(z)
 		logits = logits.float()
 		if unnormalized:
 			return logits
 		return torch.sigmoid(logits)
-		
 
-	def pi(self, z, task, search_noise=False, optimistic=False):
-		"""
-		Samples an action from the policy prior.
-		The policy prior is a Gaussian distribution with
-		mean and (log) std predicted by a neural network.
-		
+	def pi(self, z, optimistic=False, target=False):
+		"""Sample action from the policy prior (Gaussian with squash).
+
 		Args:
-			z: Latent state tensor.
-			task: Task identifier for multitask setup.
-			search_noise: Unused (legacy parameter).
-			optimistic: If True and dual_policy_enabled, use optimistic policy.
+			z (Tensor[..., L]): Latent state.
+			optimistic (bool): Use optimistic policy (dual_policy mode).
+			target (bool): Use EMA target policy.
+
+		Returns:
+			Tuple[Tensor[..., A], TensorDict]: Sampled action and info dict.
 		"""
 		with maybe_range('WM/pi', self.cfg):
-			if optimistic and self.cfg.dual_policy_enabled:
-				module = self._pi_optimistic
+			# Select correct policy module
+			if target:
+				if optimistic and self.cfg.dual_policy_enabled:
+					module = self._target_pi_optimistic
+				else:
+					module = self._target_pi
+				if module is None:
+					module = self._pi_optimistic if (optimistic and self.cfg.dual_policy_enabled) else self._pi
 			else:
-				module = self._pi
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
+				if optimistic and self.cfg.dual_policy_enabled:
+					module = self._pi_optimistic
+				else:
+					module = self._pi
+
 			with self._autocast_context():
 				raw = module(z)
 			mean, log_std = raw.float().chunk(2, dim=-1)
 			log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
 			eps = torch.randn_like(mean, device=mean.device)
 
-			if self.cfg.multitask:
-				mean = mean * self._action_masks[task]
-				log_std = log_std * self._action_masks[task]
-				eps = eps * self._action_masks[task]
-				action_dims = self._action_masks.sum(-1)[task].unsqueeze(-1)
-			else:
-				action_dims = None
-
-			# Compute Gaussian log prob before squashing
 			log_prob_presquash = math.gaussian_logprob(eps, log_std)  # float32[..., 1]
-			action_dim = eps.shape[-1] if action_dims is None else action_dims
-			
-			# Sample action using either BMPC-style or standard squash parameterization
+			action_dim = eps.shape[-1]
+			presquash_mean = mean
+
 			if self.cfg.bmpc_policy_parameterization:
-				# BMPC-style: squash mean first, then add noise with clamp
-				# mean = tanh(mean_raw), action = (mean + eps * std).clamp(-1, 1)
-				# No Jacobian correction needed since we don't squash the full sample
-				mean = torch.tanh(mean)
-				presquash_mean = mean  # Already squashed
+				# BMPC-style: squash mean only, add noise with clamp
+				mean = torch.tanh(presquash_mean)
 				action = (mean + eps * log_std.exp()).clamp(-1, 1)
-				log_prob = log_prob_presquash  # No Jacobian correction
+				true_log_prob = log_prob_presquash
+				maximized_log_prob = log_prob_presquash
 			else:
-				# Standard squashed Gaussian: action = tanh(mean + eps * std)
-				# jacobian_correction_scale controls how much we penalize action saturation:
-				#   1.0 = correct entropy (full Jacobian penalty near ±1)
-				#   0.0 = legacy TD-MPC2 behavior (no Jacobian penalty)
-				action = mean + eps * log_std.exp()
-				presquash_mean = mean
+				presquash_action = presquash_mean + eps * log_std.exp()
+				# True entropy: full Jacobian (scale=1.0)
+				mean, action, true_log_prob = math.squash(
+					presquash_mean, presquash_action, log_prob_presquash, jacobian_scale=1.0
+				)
+				# Maximized entropy: configured Jacobian scale
 				jacobian_scale = float(self.cfg.jacobian_correction_scale)
-				mean, action, log_prob = math.squash(mean, action, log_prob_presquash, jacobian_scale=jacobian_scale)
-			
-			# Entropy and scaled_entropy for policy loss
-			# When jacobian_scale=0, log_prob=log_prob_presquash (legacy behavior)
-			# When jacobian_scale=1, log_prob includes full Jacobian correction (correct)
-			entropy = -log_prob
+				_, _, maximized_log_prob = math.squash(
+					presquash_mean, presquash_action, log_prob_presquash, jacobian_scale=jacobian_scale
+				)
+
 			entropy_multiplier = torch.tensor(
-				action_dim, dtype=log_prob.dtype, device=log_prob.device
+				action_dim, dtype=true_log_prob.dtype, device=true_log_prob.device
 			).pow(self.cfg.entropy_action_dim_power)
-			scaled_entropy = entropy * entropy_multiplier
-			
+
+			true_entropy = -true_log_prob
+			true_scaled_entropy = true_entropy * entropy_multiplier
+			maximized_entropy = -maximized_log_prob
+			maximized_scaled_entropy = maximized_entropy * entropy_multiplier
+
 			info = TensorDict({
 				"presquash_mean": presquash_mean,
 				"mean": mean,
 				"log_std": log_std,
 				"action_prob": 1.,
-				"entropy": entropy,
-				"scaled_entropy": scaled_entropy,
+				"entropy": maximized_entropy,
+				"scaled_entropy": maximized_scaled_entropy,
+				"true_entropy": true_entropy,
+				"true_scaled_entropy": true_scaled_entropy,
 				"entropy_multiplier": entropy_multiplier,
 			}, device=z.device, non_blocking=True)
 			return action, info
 
-	def V_aux(self, z, task, return_type='all', target=False, detach=False):
-		"""
-		Compute auxiliary state-value predictions for multiple discount factors.
-		
-		Args:
-			z (Tensor[T, B, L]): Latent state embeddings.
-			task: Task identifier for multitask setup.
-			return_type (str): 'all' returns logits, 'min'/'avg' return scalar values.
-			target (bool): Use target network.
-			detach (bool): Use detached (non-gradient) network.
-			
-		Returns:
-			Tensor[G_aux, T, B, K] if return_type='all' (logits).
-			Tensor[G_aux, T, B, 1] otherwise (values).
-		"""
-		with maybe_range('WM/V_aux', self.cfg):
-			if self._num_aux_gamma == 0:
-				return None
-			assert return_type in {'all', 'min', 'avg', 'mean'}
+	def V(self, z, return_type='min', target=False, detach=False, split_data=False):
+		"""Compute state-value predictions.
 
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
-			# V-function: input is state only (no action concatenation)
-			if self._aux_joint_Vs is not None:
-				with maybe_range('WM/V_aux/joint', self.cfg):
-					with self._autocast_context():
-						if target:
-							raw = self._target_aux_joint_Vs(z)
-						elif detach:
-							raw = self._detach_aux_joint_Vs(z)
-						else:
-							raw = self._aux_joint_Vs(z)  # (T,B,G_aux*K)
-					out = raw.float()
-					# Reshape joint logits: (T,B,G*K) -> (G,T,B,K)
-					T, B = out.shape[0], out.shape[1]
-					G = self._num_aux_gamma
-					K = self.cfg.num_bins
-					if out.shape[-1] != G * K:
-						raise RuntimeError(f"V_aux joint head expected last dim {G*K}, got {out.shape[-1]}")
-					out = out.view(T, B, G, K).permute(2, 0, 1, 3)  # (G,T,B,K)
-			elif self._aux_separate_Vs is not None:
-				with maybe_range('WM/V_aux/separate', self.cfg):
-					with self._autocast_context():
-						if target:
-							raw_list = [head(z) for head in self._target_aux_separate_Vs]
-						elif detach:
-							raw_list = [head(z) for head in self._detach_aux_separate_Vs]
-						else:
-							raw_list = [head(z) for head in self._aux_separate_Vs]
-					outs = [rl.float() for rl in raw_list]
-					out = torch.stack(outs, dim=0)  # (G_aux,T,B,K)
-	
-			if return_type == 'all':
-				return out
-			vals = math.two_hot_inv(out, self.cfg)  # (G_aux,T,B,1) 
-			return vals  # 'min'/'avg' identical with single head
-
-	def V(self, z, task, return_type='min', target=False, detach=False):
-		"""
-		Compute state-value predictions.
-		
 		Args:
 			z (Tensor[..., L]): Latent state embeddings.
-			task: Task identifier for multitask setup.
-			return_type (str): 'all' returns logits, 'all_values' returns scalar values per head,
-			                   'min'/'max'/'avg'/'mean' return scalar values reduced over heads.
+				Broadcast (split_data=False): all Ve heads see same z.
+				Split (split_data=True): z[Ve, *, L], head i sees z[i].
+			return_type (str): 'all' → logits, 'all_values' → values per head,
+				'min'/'max'/'avg'/'mean' → reduced values.
 			target (bool): Use target network.
-			detach (bool): Use detached (non-gradient) network.
-			
+			detach (bool): Use detached network.
+			split_data (bool): If True, z has leading Ve dim sliced per head.
+
 		Returns:
-			Tensor[num_q, ..., K] if return_type='all' (logits).
-			Tensor[num_q, ..., 1] if return_type='all_values' (scalar values per head).
-			Tensor[..., 1] otherwise (values after two-hot inverse, reduced over all num_q heads).
+			Tensor: Shape depends on return_type.
 		"""
 		assert return_type in {'min', 'avg', 'mean', 'max', 'all', 'all_values'}
-
 		with maybe_range('WM/V', self.cfg):
-			if self.cfg.multitask:
-				z = self.task_emb(z, task)
-
-			# V-function: input is state only (no action concatenation)
 			if target:
 				vnet = self._target_Vs
 			elif detach:
@@ -611,140 +373,210 @@ class WorldModel(nn.Module):
 			else:
 				vnet = self._Vs
 			with self._autocast_context():
-				out = vnet(z)
+				out = vnet(z, split_data=split_data)
 			out = out.float()  # float32[num_q, ..., K]
 
 			if return_type == 'all':
 				return out
-
-			# Use ALL num_q ensemble members for reduction (no subsampling)
 			V = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
-			
 			if return_type == 'all_values':
-				return V  # Return scalar values for all heads without reduction
+				return V
 			if return_type == "min":
 				return torch.amin(V, dim=0)
 			if return_type == "max":
 				return torch.amax(V, dim=0)
-			# 'avg' or 'mean' - compute average over all heads
 			return V.mean(0)
 
-	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None, num_rollouts=None, head_mode='single', task=None, policy_action_noise_std: float = 0.0, use_optimistic_policy: bool = False):
-		"""Roll out latent trajectories vectorized over heads (H), batch (B), and sequences (N).
+	def model_diagnostics(
+		self,
+		z_true: torch.Tensor,
+		z_rollout: torch.Tensor,
+	) -> TensorDict:
+		"""Run diagnostic measurements on the model (called when log_detailed).
+
+		Compares V-function outputs on encoder-derived latents (z_true) vs
+		dynamics-derived latents (z_rollout), and reports distributional entropy
+		of the V-function softmax logits.
 
 		Args:
-			z0 (Tensor[L] or Tensor[B,L]): Initial latent(s).
-			actions (Tensor[B,N,T,A], optional): Action sequences when `use_policy=False`.
-			use_policy (bool): If True, ignore `actions` and sample actions from policy using head-0 latents.
-			horizon (int, optional): Number of steps `T` when `use_policy=True`.
-			num_rollouts (int, optional): Number of sequences `N` when `use_policy=True`.
-			head_mode (str): 'single' uses head 0 only; 'all' uses all dynamics heads.
-			task: Optional task id for multitask.
-			policy_action_noise_std (float): Std of Gaussian noise added to policy actions
-				when `use_policy=True`. Ignored when `use_policy=False`.
-			use_optimistic_policy (bool): If True and dual_policy_enabled, use optimistic policy
-				for action sampling. Ignored when `use_policy=False`.
+			z_true (Tensor[T+1, B, L]): Encoder latents (detached).
+			z_rollout (Tensor[T+1, H, B, L]): Dynamics-rollout latents (detached).
 
 		Returns:
-			Tuple[Tensor[H_sel,B,N,T+1,L], Tensor[B,N,T,A]]: Latent trajectories and actions used.
-				H_sel is 1 for 'single', H_total for 'all'.
+			TensorDict with diagnostic statistics.
+		"""
+		info = TensorDict({}, device=z_true.device)
+		info.update(
+			self.rollout_value_diagnostics(z_true, z_rollout),
+			non_blocking=True,
+		)
+		return info
+
+	@torch.no_grad()
+	def rollout_value_diagnostics(
+		self,
+		z_true: torch.Tensor,
+		z_rollout: torch.Tensor,
+	) -> TensorDict:
+		"""Compute per-timestep V(z_true) vs V(z_rollout) diagnostics.
+
+		Logs:
+		  - |E_h[V(z_h)] - V(z_true)| per timestep (dynamics value drift)
+		  - std of V across dynamics heads per timestep (head disagreement)
+		  - Distributional entropy of V at t=0 for encoder and dynamics latents
+
+		Args:
+			z_true (Tensor[T+1, B, L]): Encoder latents.
+			z_rollout (Tensor[T+1, H, B, L]): Dynamics-rollout latents.
+
+		Returns:
+			TensorDict with per-timestep and aggregate diagnostics.
+		"""
+		T_plus_1, B, L = z_true.shape
+		_, H, _, _ = z_rollout.shape
+		info = TensorDict({}, device=z_true.device)
+
+		# --- V values on true latents ---
+		v_true_logits = self.V(
+			z_true.reshape(T_plus_1 * B, L), return_type='all',
+		)  # float32[Ve, T+1*B, K]
+		Ve, _, K = v_true_logits.shape
+		v_true_logits = v_true_logits.view(Ve, T_plus_1, B, K)  # float32[Ve, T+1, B, K]
+
+		v_true_vals = math.two_hot_inv(
+			v_true_logits.reshape(Ve * T_plus_1 * B, K), self.cfg,
+		).view(Ve, T_plus_1, B, 1)  # float32[Ve, T+1, B, 1]
+		v_true_mean = v_true_vals.mean(dim=0).squeeze(-1)  # float32[T+1, B]
+
+		# --- V values on rollout latents ---
+		z_roll_flat = z_rollout.reshape(T_plus_1 * H * B, L)  # float32[T+1*H*B, L]
+		v_roll_logits = self.V(
+			z_roll_flat, return_type='all',
+		)  # float32[Ve, T+1*H*B, K]
+		v_roll_logits = v_roll_logits.view(Ve, T_plus_1, H, B, K)  # float32[Ve, T+1, H, B, K]
+
+		v_roll_vals = math.two_hot_inv(
+			v_roll_logits.reshape(Ve * T_plus_1 * H * B, K), self.cfg,
+		).view(Ve, T_plus_1, H, B, 1)  # float32[Ve, T+1, H, B, 1]
+		v_roll_mean = v_roll_vals.mean(dim=(0, 2)).squeeze(-1)  # float32[T+1, B]
+
+		# Per-head values for std computation: float32[T+1, H, B]
+		v_per_head = v_roll_vals.mean(dim=0).squeeze(-1)  # float32[T+1, H, B]
+
+		# --- V(mean_z): value of head-averaged latent ---
+		z_roll_avg = z_rollout.mean(dim=1)  # float32[T+1, B, L]
+		v_avg_z_logits = self.V(
+			z_roll_avg.reshape(T_plus_1 * B, L), return_type='all',
+		)  # float32[Ve, T+1*B, K]
+		v_avg_z_vals = math.two_hot_inv(
+			v_avg_z_logits.reshape(Ve * T_plus_1 * B, K), self.cfg,
+		).view(Ve, T_plus_1, B, 1)  # float32[Ve, T+1, B, 1]
+		v_avg_latent = v_avg_z_vals.mean(dim=0).squeeze(-1)  # float32[T+1, B]
+
+		# --- Per-timestep logging ---
+		for t in range(T_plus_1):
+			diff_t = v_roll_mean[t] - v_true_mean[t]  # float32[B]
+			diff_avg_t = v_avg_latent[t] - v_true_mean[t]  # float32[B]
+			info.update({
+				# |E_h[V(z_h)] - V(z_true)|  (dynamics value drift)
+				f'v_diag/mean_V_heads_minus_V_encoder/step{t}': diff_t.abs().mean(),
+				# |V(E_h[z_h]) - V(z_true)|  (avg-latent value drift)
+				f'v_diag/V_avg_latent_minus_V_encoder/step{t}': diff_avg_t.abs().mean(),
+				# Std of V across dynamics heads (head disagreement)
+				# Guard: unbiased=False when H=1 to avoid NaN from division by zero
+				f'v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0, unbiased=(H > 1)).mean(),
+			}, non_blocking=True)
+
+		# --- Bin entropy at t=0 only ---
+		v_true_probs_0 = torch.softmax(v_true_logits[:, 0], dim=-1)  # float32[Ve, B, K]
+		v_true_entropy_0 = -(v_true_probs_0 * torch.log(v_true_probs_0 + 1e-8)).sum(dim=-1)  # float32[Ve, B]
+
+		v_roll_probs_0 = torch.softmax(v_roll_logits[:, 0], dim=-1)  # float32[Ve, H, B, K]
+		v_roll_entropy_0 = -(v_roll_probs_0 * torch.log(v_roll_probs_0 + 1e-8)).sum(dim=-1)  # float32[Ve, H, B]
+
+		info.update({
+			'v_diag/bin_entropy_V_encoder_z/step0': v_true_entropy_0.mean(),
+			'v_diag/bin_entropy_V_dyn_z/step0': v_roll_entropy_0.mean(),
+		}, non_blocking=True)
+
+		# --- Aggregate metrics (averaged over all timesteps and batch) ---
+		all_diff = v_roll_mean - v_true_mean  # float32[T+1, B]
+		all_diff_avg = v_avg_latent - v_true_mean  # float32[T+1, B]
+		info.update({
+			'v_diag/mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
+			'v_diag/V_avg_latent_minus_V_encoder': all_diff_avg.abs().mean(),
+			# Guard: unbiased=False when H=1 to avoid NaN from division by zero
+			'v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1, unbiased=(H > 1)).mean(),
+		}, non_blocking=True)
+
+		return info
+
+	def rollout_latents(self, z0, actions=None, use_policy=False, horizon=None,
+						num_rollouts=None, policy_action_noise_std=0.0,
+						use_optimistic_policy=False, use_target_policy=False):
+		"""Roll out latent trajectories vectorized over all H dynamics heads.
+
+		Args:
+			z0 (Tensor[B, L]): Initial latent(s).
+			actions (Tensor[B, N, T, A], optional): Action sequences when use_policy=False.
+			use_policy (bool): If True, sample from policy instead of using actions.
+			horizon (int, optional): Steps T when use_policy=True.
+			num_rollouts (int, optional): Sequences N when use_policy=True.
+			policy_action_noise_std (float): Noise std for policy actions.
+			use_optimistic_policy (bool): Use optimistic policy if dual_policy enabled.
+			use_target_policy (bool): Use EMA target policy.
+
+		Returns:
+			Tuple[Tensor[H, B, N, T+1, L], Tensor[B, N, T, A]]:
+				Latent trajectories and actions used.
 		"""
 		if use_policy:
-			if actions is not None:
-				raise ValueError('Provide either actions or use_policy=True, not both.')
-			if horizon is None or num_rollouts is None:
-				raise ValueError('horizon and num_rollouts required when use_policy=True.')
-			T = int(horizon)  # steps
-			N = int(num_rollouts)  # sequences
+			assert actions is None, 'Provide either actions or use_policy=True, not both.'
+			assert horizon is not None and num_rollouts is not None
+			T = int(horizon)
+			N = int(num_rollouts)
 		else:
-			if actions is None:
-				raise ValueError('actions must be provided when use_policy=False.')
-			if actions.ndim != 4:
-				raise ValueError(f'actions must be [B,N,T,A], got shape {tuple(actions.shape)}')
-			B, N, T, A = actions.shape  # actions: float32[B,N,T,A]
-			if horizon is not None and horizon != T:
-				raise ValueError('Provided horizon does not match actions.shape[2].')
+			assert actions is not None and actions.ndim == 4
+			B, N, T, A = actions.shape
 
-		device = next(self.parameters()).device
-		# Normalize z0 to [B,L]
 		if z0.ndim == 1:
-			z0 = z0.unsqueeze(0)  # [1,L] -> [B=1,L]
+			z0 = z0.unsqueeze(0)
 		B = z0.shape[0]
 		L = z0.shape[-1]
+		H = len(self._dynamics_heads)
+		A = actions.shape[-1] if not use_policy else self.cfg.action_dim
 
-		H_total = len(self._dynamics_heads)
-		if head_mode == 'single':
-			H_sel = 1
-			head_indices = [0]
-		elif head_mode == 'all':
-			H_sel = H_total
-			head_indices = list(range(H_total))
-		elif head_mode == 'random':
-			# Randomly select one dynamics head per update (for single-head imagination)
-			H_sel = 1
-			head_indices = [torch.randint(0, H_total, (1,)).item()]
-		else:
-			raise ValueError(f"Unsupported head_mode: {head_mode}. Use 'single', 'all', or 'random'.")
-
-		# Determine action dim
-		if not use_policy:
-			A = actions.shape[-1]
-		else:
-			A = self.cfg.action_dim
-
-		# Build per-step lists to avoid in-place writes on graph tensors
-		# t=0 state for all heads: broadcast z0 over N, then tile over heads
-		z0_bn = z0.unsqueeze(1).expand(B, N, L)  # float32[B,N,L]
-		z0_hbn = torch.stack([z0_bn for _ in range(H_sel)], dim=0)  # float32[H_sel,B,N,L]
+		# t=0 state for all heads
+		z0_bn = z0.unsqueeze(1).expand(B, N, L)
+		z0_hbn = z0_bn.unsqueeze(0).expand(H, B, N, L)
 		latents_steps = [z0_hbn]
-		actions_steps = []  # each entry: float32[B,N,A]
+		actions_steps = []
 
 		with maybe_range('WM/rollout_latents', self.cfg):
-			# Time loop over T
 			for t in range(T):
 				with maybe_range('WM/rollout_latents/step_loop', self.cfg):
-					# Select actions at time t
 					if use_policy:
 						with maybe_range('WM/rollout_latents/policy_action', self.cfg):
-							# Use head-0 latents for policy sampling
-							z_for_pi = latents_steps[t][0].view(B * N, L)  # float32[B*N,L]
-							a_flat, _ = self.pi(z_for_pi, task, optimistic=use_optimistic_policy)
-							a_t = a_flat.view(B, N, A).detach()  # float32[B,N,A]
+							z_for_pi = latents_steps[t][0].reshape(B * N, L)
+							a_flat, _ = self.pi(z_for_pi, optimistic=use_optimistic_policy, target=use_target_policy)
+							a_t = a_flat.reshape(B, N, A).detach()
 							if policy_action_noise_std > 0.0:
 								noise = torch.randn_like(a_t) * float(policy_action_noise_std)
 								a_t = (a_t + noise).clamp(-1.0, 1.0)
 					else:
-						a_t = actions[:, :, t, :]  # float32[B,N,A]
+						a_t = actions[:, :, t, :]
 					actions_steps.append(a_t)
 
-					# Advance each selected head independently
-					next_heads = []  # will hold float32[B,N,L] per head
-					for h in range(H_sel):
-						# h indexes into latents_steps (0..H_sel-1)
-						# head_indices[h] gives the actual dynamics head to use
-						with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
-							z_curr = latents_steps[t][h].view(B * N, L)  # float32[B*N,L]
-							a_curr = a_t.contiguous().view(B * N, A)  # float32[B*N,A]
-							if self.cfg.multitask:
-								z_cat = self.task_emb(z_curr, task)  # float32[B*N, L+T]
-							else:
-								z_cat = z_curr
-							za = torch.cat([z_cat, a_curr], dim=-1)  # float32[B*N, L(+T)+A]
-							with self._autocast_context():
-								next_flat = self._dynamics_heads[head_indices[h]](za)  # float32[B*N,L]
-							next_bn = next_flat.float().view(B, N, L)  # float32[B,N,L]
-							next_heads.append(next_bn)
-
-					# Aggregate heads for next timestep
-					next_hbn = torch.stack(next_heads, dim=0)  # float32[H_sel,B,N,L]
+					with maybe_range('WM/rollout_latents/dynamics_head', self.cfg):
+						z_all = latents_steps[t].reshape(H, B * N, L)
+						a_all = a_t.contiguous().reshape(B * N, A)
+						a_all = a_all.unsqueeze(0).expand(H, -1, -1)
+						next_all = self.next(z_all, a_all, split_data=True)
+						next_hbn = next_all.reshape(H, B, N, L)
 					latents_steps.append(next_hbn)
 
-		# Stack over time to produce final outputs
 		with maybe_range('WM/rollout_latents/finalize', self.cfg):
-			latents = torch.stack(latents_steps, dim=3).contiguous()  # float32[H_sel,B,N,T+1,L]
-			actions_out = torch.stack(actions_steps, dim=2).contiguous()  # float32[B,N,T,A]
+			latents = torch.stack(latents_steps, dim=3).contiguous()
+			actions_out = torch.stack(actions_steps, dim=2).contiguous()
 
-		# Cheap sanity: ensure contiguity for downstream views
-		assert latents.is_contiguous(), "latents expected contiguous"
-		assert actions_out.is_contiguous(), "actions_out expected contiguous"
 		return latents, actions_out

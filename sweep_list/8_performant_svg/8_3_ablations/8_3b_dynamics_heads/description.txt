@@ -1,0 +1,14 @@
+Sweep 8.3b: Dynamics Heads Ablation
+====================================
+
+Purpose:
+Test the number of dynamics ensemble heads. More heads provide better uncertainty
+quantification (important for optimistic exploration and pessimistic evaluation)
+but cost more compute. The baseline uses 4 heads. This sweep checks if 2 or 1
+(original TD-MPC2) are sufficient.
+
+Ablated parameter: planner_num_dynamics_heads
+  Baseline: 4 (not run)
+  Ablate:   2, 1
+
+Total runs: 2 configs × 6 tasks × 2 seeds = 24

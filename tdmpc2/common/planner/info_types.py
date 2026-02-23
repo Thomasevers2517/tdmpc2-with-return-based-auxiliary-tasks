@@ -5,7 +5,7 @@ from .scoring import compute_values, compute_disagreement, combine_scores
 import torch._dynamo as dynamo
 
 
-def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, head_mode: str, value_std_coef: float, task, lambda_latent: float, use_ema_value: bool = False, discount: float = 0.99):
+def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Tensor, value_std_coef: float, lambda_latent: float, use_ema_value: bool = False):
     """Core kernel to roll out a single noisy sequence and score it.
 
     Returns (value_scaled: Tensor[1], latent_disagreement: Optional[Tensor[1]], 
@@ -15,25 +15,20 @@ def _post_noise_effects_impl(world_model, z0: torch.Tensor, noisy_seq: torch.Ten
         z0,
         actions=noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         use_policy=False,
-        head_mode=head_mode,
-        task=task,
     )  # [H,1,1,T+1,L]
-    lat_all = lat_all[:, 0]            # [H,1,T+1,L]
-    # compute_values expects latents_all [H,E,T+1,L] and actions [E,T,A]; here E=1
-    vals_unscaled, vals_scaled, vals_std, val_dis = compute_values(
+    # compute_values expects latents_all [H,B,N,T+1,L] and actions [B,N,T,A]; here B=1, N=1
+    vals_unscaled, vals_scaled, vals_std, val_dis, _ = compute_values(
         lat_all,
-        noisy_seq.unsqueeze(0),
+        noisy_seq.unsqueeze(0).unsqueeze(0),  # [1,1,T,A]
         world_model,
-        task,
         value_std_coef=value_std_coef,
         use_ema_value=use_ema_value,
-        discount=discount,
     )
     latent_dis = None
     if lat_all.shape[0] > 1:
-        final_all = lat_all[:, 0, -1, :]  # [H,L]
-        # Compute disagreement with E=1; returns shape [1]
-        latent_dis = compute_disagreement(final_all.unsqueeze(1))
+        final_all = lat_all[:, 0, 0, -1, :]  # [H,L] - index B=0, N=0, t=-1
+        # Compute disagreement expects [H,B,N,L]; here B=1, N=1 → unsqueeze twice
+        latent_dis = compute_disagreement(final_all.unsqueeze(1).unsqueeze(1))
     score = combine_scores(vals_scaled, latent_dis, lambda_latent)
     return vals_scaled, latent_dis, val_dis, score
 
@@ -62,6 +57,10 @@ class PlannerBasicInfo:
         scores_all: Combined scores for all candidates; Tensor[E].
         values_scaled_all: Scaled values for all candidates; Tensor[E].
         weighted_latent_disagreements_all: Weighted latent disagreements for all candidates; Tensor[E].
+        v_std_across_value_heads: Scalar std of bootstrap V across value ensemble heads.
+        v_std_across_dynamics_heads: Scalar std of bootstrap V across dynamics heads.
+        v_std_across_candidates: Scalar std of bootstrap V across candidate action sequences.
+        policy_seed_elite_counts: int64[I] count of policy-seeded elites per planning iteration.
     """
     value_chosen: torch.Tensor  # 0-dim tensor
     latent_disagreement_chosen: Optional[torch.Tensor]
@@ -82,6 +81,13 @@ class PlannerBasicInfo:
     scores_all: torch.Tensor  # (E,)
     values_scaled_all: torch.Tensor  # (E,)
     weighted_latent_disagreements_all: Optional[torch.Tensor]  # (E,)
+    v_std_across_value_heads: Optional[torch.Tensor]  # 0-dim - std of V across value ensemble heads
+    v_std_across_dynamics_heads: Optional[torch.Tensor]  # 0-dim - std of V across dynamics heads
+    v_std_across_candidates: Optional[torch.Tensor]  # 0-dim - std of V across candidate action sequences
+    policy_seed_elite_counts: Optional[torch.Tensor]  # int64[I] - policy-seeded elite count per iteration
+    z0: Optional[torch.Tensor]  # float32[L] — encoded observation used for planning
+    warm_start_mean: Optional[torch.Tensor]  # float32[T, A] — shifted prev_mean before refinement
+    plan_drift: Optional[torch.Tensor]  # 0-dim — mean|final_mean - warm_start| over overlapping horizon
 
 
 @dataclass
@@ -117,14 +123,11 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
     action_seq_chosen: torch.Tensor  # (T,A)
     action_noise: Optional[torch.Tensor]  # (A,) applied at t=0; None if no noise
     std_first_action: torch.Tensor  # (A,)
-    z0: torch.Tensor  # (L,)
     task: Optional[torch.Tensor]
     lambda_latent: float
-    head_mode: str
     value_std_coef: float
     T: int
     use_ema_value: bool = False  # Whether to use EMA target network for V in planning
-    discount: float = 0.99  # Discount factor for compute_values
 
     # Outputs of post-noise analysis (set by compute_post_noise_effects)
     value_chosen_post_noise: Optional[torch.Tensor] = None
@@ -153,7 +156,6 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
         if z0.dim() != 1:
             z0 = z0.view(-1)
         z0 = z0.to(device)
-        task = self.task
         # Use compiled helper when available/desired
         impl = _post_noise_effects_impl
         try:
@@ -162,7 +164,7 @@ class PlannerAdvancedInfo(PlannerBasicInfo):
                 impl = torch.compile(_post_noise_effects_impl, mode=getattr(cfg, 'compile_type', 'reduce-overhead'), fullgraph=False)
         except Exception:
             pass
-        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.head_mode, self.value_std_coef, task, float(self.lambda_latent), self.use_ema_value, self.discount)
+        vals_scaled, latent_dis, val_dis, score = impl(world_model, z0, noisy_seq, self.value_std_coef, float(self.lambda_latent), self.use_ema_value)
 
         # Store 0-dim tensors
         self.value_chosen_post_noise = vals_scaled.squeeze(0)

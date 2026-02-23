@@ -72,21 +72,17 @@ def make_env(cfg):
 	Make an environment for TD-MPC2 experiments.
 	"""
 	gym.logger.set_level(40)
-	if cfg.multitask:
-		env = make_multitask_env(cfg)
-
-	else:
-		env = None
-		for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env, make_humanoid_env]:
-			try:
-				log.info('Trying to make environment with %s', fn.__module__)
-				env = fn(cfg)
-				log.info('Making environment with %s', fn.__module__)
-			except ValueError:
-				pass
-		if env is None:
-			raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')
-		env = TensorWrapper(env)
+	env = None
+	for fn in [make_distracting_control_env, make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env, make_humanoid_env]:
+		try:
+			log.info('Trying to make environment with %s', fn.__module__)
+			env = fn(cfg)
+			log.info('Making environment with %s', fn.__module__)
+		except ValueError:
+			pass
+	if env is None:
+		raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')
+	env = TensorWrapper(env)
 	try: # Dict
 		cfg.obs_shape = {k: v.shape for k, v in env.observation_space.spaces.items()}
 		log.info('Observation spaces: %s', cfg.obs_shape)

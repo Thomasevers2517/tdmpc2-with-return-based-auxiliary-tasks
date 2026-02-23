@@ -1,0 +1,175 @@
+# Sweep 14.1: Full sweep-162 match on hopper-hop
+#
+# Goal: Exactly reproduce the configuration that produced great
+# hopper-hop performance in sweep 162. Every parameter that differed
+# from the current default is set to the 162 value.
+#
+# {hopper-hop, dog-run} × 5 seeds = 10 runs
+#
+# Differences from current defaults set here:
+#   dual_policy_enabled: true (default: false)
+#   critic_target_source: replay_rollout (default: replay_true)
+#   num_pi_trajs: 512 (default: 24)
+#   num_rollouts: 4 (default: 1)
+#   consistency_coef: 20 (default: 10)
+#   td_target_std_coef: -1 (default: 0)
+#   final_rho: 0.125 (default: -1)
+#   ema_value_planning: true (default: false)
+#   num_reward_heads: 2 (default: 1)
+#   num_reward_layers: 1 (default: 2)
+#   reward_dim_div: 32 (default: 1)
+#   num_samples: 1024 (default: 512)
+#   max_std: 1 (default: 2)
+#   dropout: 0 (default: 0.01)
+#   log_std_min: -10 (default: -5)
+#   log_std_max: 2 (default: 1)
+#   planner_value_std_coef_train: 0.3 (default: 0)
+#   planner_value_std_coef_eval: -1 (default: 0)
+#   enc_lr_step_scale: 0 (default: 1)
+#   eval_mean_head_reduce: true (default: false)
+#
+# Kept at current default (different from 162):
+#   dynamics_prior_scale: 0 (162 had prior_scale: 0.1)
+#   value_prior_scale: 0
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [hopper-hop, dog-run]
+  seed:
+    values: [1, 2, 3, 4, 5]
+
+  #############################################
+  # DUAL POLICY
+  #############################################
+  dual_policy_enabled:
+    value: true
+  optimistic_policy_value_std_coef:
+    value: 1
+  optimistic_entropy_mult:
+    value: 1
+
+  #############################################
+  # CRITIC TARGET / VALUE
+  #############################################
+  critic_target_source:
+    value: replay_rollout
+  td_target_std_coef:
+    value: -1
+  td_target_dynamics_reduction:
+    value: mean
+  local_td_bootstrap:
+    value: true
+  final_rho:
+    value: 0.125
+  ema_value_planning:
+    value: true
+  num_rollouts:
+    value: 4
+
+  #############################################
+  # LOSS COEFS
+  #############################################
+  consistency_coef:
+    value: 20
+
+  #############################################
+  # ARCHITECTURE (from 162)
+  #############################################
+  num_reward_heads:
+    value: 2
+  num_reward_layers:
+    value: 1
+  reward_dim_div:
+    value: 32
+  num_enc_layers:
+    value: 2
+  num_value_layers:
+    value: 2
+  num_q:
+    value: 8
+  dropout:
+    value: 0
+
+  #############################################
+  # POLICY (from 162)
+  #############################################
+  policy_value_std_coef:
+    value: 0
+  log_std_min:
+    value: -10
+  log_std_max:
+    value: 2
+
+  #############################################
+  # PLANNER (from 162)
+  #############################################
+  num_pi_trajs:
+    value: 512
+  num_samples:
+    value: 1024
+  max_std:
+    value: 1
+  planner_value_std_coef_train:
+    value: 0.3
+  planner_value_std_coef_eval:
+    value: -1
+  iterations:
+    value: 6
+  num_elites:
+    value: 64
+
+  #############################################
+  # ENCODER LR (from 162)
+  #############################################
+  enc_lr_step_ratio:
+    value: 0.5
+  enc_lr_step_scale:
+    value: 0
+
+  #############################################
+  # PRIORS (keep at 0, not matching 162)
+  #############################################
+  dynamics_prior_scale:
+    value: 0
+  value_prior_scale:
+    value: 0
+
+  #############################################
+  # TRAINING
+  #############################################
+  planner_num_dynamics_heads:
+    value: 4
+  steps:
+    value: 100000
+  eval_freq:
+    value: 10000
+  utd_ratio:
+    value: 4
+  value_update_freq:
+    value: 2
+  pi_update_freq:
+    value: 1
+  eval_mean_head_reduce:
+    value: true
+
+  #############################################
+  # LOGGING
+  #############################################
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

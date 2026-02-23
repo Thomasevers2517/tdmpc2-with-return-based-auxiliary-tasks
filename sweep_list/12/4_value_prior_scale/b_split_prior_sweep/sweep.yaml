@@ -1,0 +1,57 @@
+# Sweep 12.4b: Value prior scale with split head strategy
+# 3 tasks × 1 seed × 2 value_prior_scale = 6 runs
+#
+# Tests split strategy (each dynamics head gets a batch chunk) with value prior scale.
+# vpd=false, rollout_head_strategy=split.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - hopper-hop
+      - dog-run
+      - quadruped-walk
+
+  seed:
+    values: [1]
+
+  # --- Swept parameter ---
+  value_prior_scale:
+    values: [0.01, 0]
+
+  # --- Fixed parameters ---
+  value_per_dynamics:
+    value: false
+  rollout_head_strategy:
+    value: split
+  td_target_std_coef:
+    value: 0
+  num_reward_heads:
+    value: 2
+  num_q:
+    value: 8
+  planner_num_dynamics_heads:
+    value: 4
+  steps:
+    value: 100000
+  num_rollouts:
+    value: 1
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

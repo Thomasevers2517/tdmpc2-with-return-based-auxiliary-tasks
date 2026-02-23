@@ -1,0 +1,66 @@
+# Sweep 13.7: pi_num_rollouts=4 (more policy rollouts for SVG)
+# 3 tasks × 4 seeds = 12 runs
+#
+# Policy sees 4 rollouts instead of 1, averaging out action-sampling noise
+# in the SVG gradient. num_rollouts stays at 1 (TD targets use 1 rollout).
+# Tests whether reducing SVG gradient variance helps policy learning.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - hopper-hop
+      - dog-run
+      - quadruped-walk
+
+  seed:
+    values: [1, 2, 3, 4]
+
+  # --- Changed from baseline ---
+  pi_num_rollouts:
+    value: 4
+
+  # --- Baseline parameters ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
+  value_per_dynamics:
+    value: false
+  dynamics_prior_scale:
+    value: 0
+  value_prior_scale:
+    value: 0
+  planner_value_std_coef_train:
+    value: 0
+  planner_value_std_coef_eval:
+    value: 0
+  policy_value_std_coef:
+    value: 0
+  td_target_std_coef:
+    value: 0
+  local_td_bootstrap:
+    value: true
+  jacobian_correction_scale:
+    value: 1.0
+  steps:
+    value: 100000
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

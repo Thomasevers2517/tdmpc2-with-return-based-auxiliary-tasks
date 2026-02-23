@@ -1,0 +1,16 @@
+Sweep 8.3i: Dual Policy Ablation
+=================================
+
+Purpose:
+Test enabling a second "optimistic" policy alongside the main (pessimistic) policy.
+The dual policy creates an additional policy network that is trained with an
+optimistic value objective (seeking uncertain states). During planning, the
+optimistic policy seeds exploratory trajectories while the main policy provides
+exploitation. This is a form of directed exploration at the policy level.
+
+Ablated parameter: dual_policy_enabled
+  Baseline: false (not run)
+  Ablate:   true
+  Also set: optimistic_policy_value_std_coef = 0.3 (so optimistic policy seeks uncertainty)
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

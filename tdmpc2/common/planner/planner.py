@@ -19,7 +19,7 @@ class Planner(torch.nn.Module):
     All operations support batch dimension B. Shapes are always [B, ...] throughout.
     """
 
-    def __init__(self, cfg, world_model, scale=None, discount=None):
+    def __init__(self, cfg, world_model, scale=None):
         super().__init__()
         self.cfg = cfg
         self.world_model = world_model
@@ -27,14 +27,6 @@ class Planner(torch.nn.Module):
         T, A = cfg.horizon, cfg.action_dim
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.register_buffer('prev_mean', torch.zeros(T, A, device=device))  # float32[T,A]
-        # Store discount for compute_values (can be scalar or tensor for multitask)
-        if discount is not None:
-            if isinstance(discount, torch.Tensor):
-                self.register_buffer('discount', discount.clone())
-            else:
-                self.register_buffer('discount', torch.tensor(discount, device=device))
-        else:
-            self.register_buffer('discount', torch.tensor(0.99, device=device))
 
     def reset_warm_start(self) -> None:
         self.prev_mean.zero_()
@@ -61,14 +53,12 @@ class Planner(torch.nn.Module):
     def plan(
         self,
         z0: torch.Tensor,
-        task: Optional[torch.Tensor] = None,
         eval_mode: bool = False,
         log_detailed: bool = False,
         train_noise_multiplier: Optional[float] = None,
         value_std_coef_override: Optional[float] = None,
         use_warm_start: bool = True,
         update_warm_start: bool = True,
-        reanalyze: bool = False,
     ) -> Tuple[torch.Tensor, Optional[PlannerBasicInfo], torch.Tensor, torch.Tensor]:
         """Plan action sequences and return the first action for each batch element.
         
@@ -77,13 +67,11 @@ class Planner(torch.nn.Module):
 
         Args:
             z0 (Tensor[B, L] or Tensor[L]): Initial latent states.
-            task: Optional multitask id (unsupported; asserted off).
             eval_mode: If True, use value-only scoring, single head, argmax selection.
             log_detailed: If True, return PlannerAdvancedInfo with full iteration history.
             value_std_coef_override: Override default value_std_coef for this call.
             use_warm_start: If True, initialize mean from shifted prev_mean (only for B=1).
             update_warm_start: If True, update prev_mean after planning (only for B=1).
-            reanalyze: If True, use reanalyze-specific config (reanalyze_num_pi_trajs, etc.).
 
         Returns:
             Tuple of:
@@ -92,8 +80,6 @@ class Planner(torch.nn.Module):
                 - Tensor[B, T, A]: Final mean action sequences.
                 - Tensor[B, T, A]: Final std action sequences.
         """
-        assert not getattr(self.cfg, 'multitask', False), 'Planner currently does not support multitask.'
-        
         # Ensure z0 has batch dimension: [L] -> [1, L]
         if z0.dim() == 1:
             z0 = z0.unsqueeze(0)  # float32[1, L]
@@ -103,21 +89,9 @@ class Planner(torch.nn.Module):
         dtype = self.prev_mean.dtype
         _, A = self.prev_mean.shape
 
-        # Planning mode config: reanalyze vs eval vs train
-        if reanalyze:
-            # Reanalyze mode: use reanalyze-specific config
-            T = int(self.cfg.reanalyze_horizon)
-            iterations = int(self.cfg.reanalyze_iterations)
-            N = int(self.cfg.reanalyze_num_samples)
-            S = int(self.cfg.reanalyze_num_pi_trajs)
-            K = int(self.cfg.reanalyze_num_elites)
-            temp = float(self.cfg.reanalyze_temperature)
-            lambda_latent = 0.0  # No exploration bonus during reanalyze
-            head_mode = 'all'
-            reward_head_mode = 'all'
-            value_std_coef = float(self.cfg.reanalyze_value_std_coef)
-        elif eval_mode:
-            # Eval mode: value-only scoring, optionally single head
+        # Planning mode config: eval vs train
+        if eval_mode:
+            # Eval mode: all heads, value-only scoring
             T = int(self.cfg.horizon)
             iterations = int(self.cfg.iterations)
             N = int(self.cfg.num_samples)
@@ -125,10 +99,7 @@ class Planner(torch.nn.Module):
             K = int(self.cfg.num_elites)
             temp = float(self.cfg.temperature)
             lambda_latent = 0.0
-            use_all_heads_eval = bool(self.cfg.planner_use_all_heads_eval)
-            head_mode = 'all' if use_all_heads_eval else 'single'
-            reward_head_mode = head_mode
-            value_std_coef = float(self.cfg.planner_value_std_coef_eval) if use_all_heads_eval else 0.0
+            value_std_coef = float(self.cfg.planner_value_std_coef_eval)
         else:
             # Training mode: full ensemble with exploration bonus
             T = int(self.cfg.horizon)
@@ -138,8 +109,6 @@ class Planner(torch.nn.Module):
             K = int(self.cfg.num_elites)
             temp = float(self.cfg.temperature)
             lambda_latent = float(self.cfg.planner_lambda_disagreement)
-            head_mode = 'all'
-            reward_head_mode = 'all'
             value_std_coef = float(self.cfg.planner_value_std_coef_train)
 
         # Allow explicit override (rare, mostly for testing)
@@ -148,6 +117,7 @@ class Planner(torch.nn.Module):
 
         use_ema_value = bool(self.cfg.ema_value_planning)
         policy_elites_first_iter_only = bool(self.cfg.planner_policy_elites_first_iter_only)
+        aggregate_horizon = bool(self.cfg.planner_aggregate_value)
 
         # Initialize mean/std with batch dimension [B, T, A]
         if use_warm_start and B == 1:
@@ -166,21 +136,17 @@ class Planner(torch.nn.Module):
                 use_policy=True,
                 horizon=T,
                 num_rollouts=S,
-                head_mode=head_mode,
-                task=task,
                 policy_action_noise_std=float(self.cfg.policy_seed_noise_std),
                 use_optimistic_policy=use_optimistic,
             )
             # Shapes: latents_p [H, B, S, T+1, L], actions_p [B, S, T, A]
-            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p = compute_values(
+            vals_unscaled_p, vals_scaled_p, vals_std_p, val_dis_p, _ = compute_values(
                 latents_p,     # [H, B, S, T+1, L]
                 actions_p,     # [B, S, T, A]
                 self.world_model,
-                task,
                 value_std_coef=value_std_coef,
-                reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
+                aggregate_horizon=aggregate_horizon,
             )
             # vals_*: [B, S]
             latent_dis_p = None
@@ -203,6 +169,8 @@ class Planner(torch.nn.Module):
 
         # Containers for per-iteration histories (for advanced logging, only for B=1)
         enable_detailed_logging = (B == 1)
+        # Snapshot warm-start mean before refinement for plan-drift diagnostic
+        warm_start_for_info = mean[0].detach().clone() if B == 1 else None  # float32[T, A]
         actions_hist = [] if enable_detailed_logging else None
         latents_hist = [] if enable_detailed_logging else None
         values_unscaled_hist = [] if enable_detailed_logging else None
@@ -212,6 +180,8 @@ class Planner(torch.nn.Module):
         scores_hist = [] if enable_detailed_logging else None
         mean_hist = [] if enable_detailed_logging else None
         std_hist = [] if enable_detailed_logging else None
+        policy_seed_elite_counts = []
+        value_diagnostics = {}  # populated by last iteration's compute_values
 
         # Iterative refinement
         for it in range(iterations):
@@ -222,20 +192,18 @@ class Planner(torch.nn.Module):
             # World model rollout: z0 [B, L], actions [B, N, T, A]
             # Returns latents [H, B, N, T+1, L], actions [B, N, T, A]
             latents_s, actions_s = self.world_model.rollout_latents(
-                z0, actions=actions_s, use_policy=False, head_mode=head_mode, task=task
+                z0, actions=actions_s, use_policy=False
             )
             # latents_s: [H, B, N, T+1, L], actions_s: [B, N, T, A]
 
             # Values for sampled trajectories
-            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s = compute_values(
+            vals_unscaled_s, vals_scaled_s, vals_std_s, val_dis_s, value_diagnostics = compute_values(
                 latents_s,   # [H, B, N, T+1, L]
                 actions_s,   # [B, N, T, A]
                 self.world_model,
-                task,
                 value_std_coef=value_std_coef,
-                reward_head_mode=reward_head_mode,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
+                aggregate_horizon=aggregate_horizon,
             )
             # vals_*: [B, N]
             
@@ -297,9 +265,21 @@ class Planner(torch.nn.Module):
 
             # Elite selection per batch element: [B, E] -> [B, K]
             elite_scores, elite_indices = torch.topk(scores, K, dim=1, largest=True, sorted=True)  # [B, K]
+
+            # Track how many elites came from policy seeds
+            if include_policy:
+                policy_seed_elite_counts.append((elite_indices < S).sum(dim=1))  # int64[B]
+            else:
+                policy_seed_elite_counts.append(torch.zeros(B, device=elite_indices.device, dtype=torch.long))
             
-            # Softmax weights over elite scores per batch
-            w = torch.softmax(elite_scores / max(temp, 1e-8), dim=1)  # [B, K]
+            # Compute weights over elite scores per batch (BMPC-style: subtract max, scale by temp)
+            max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
+            score_delta = elite_scores - max_elite  # [B, K]
+            if bool(self.cfg.mult_by_temp):
+                w = torch.exp(temp * score_delta)  # [B, K] - multiply: higher temp = softer
+            else:
+                w = torch.exp(score_delta / temp)  # [B, K] - divide: higher temp = softer
+            w = w / (w.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             
             # Gather elite actions: [B, E, T, A] -> [B, K, T, A]
             elite_indices_expanded = elite_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, T, A)  # [B, K, T, A]
@@ -331,7 +311,14 @@ class Planner(torch.nn.Module):
         if use_greedy:
             chosen_idx = scores.argmax(dim=1, keepdim=True)  # [B, 1]
         else:
-            probs = torch.softmax(elite_scores / max(temp, 1e-8), dim=1)  # [B, K]
+            # BMPC-style: subtract max, scale by temp
+            max_elite = elite_scores.max(dim=1, keepdim=True).values  # [B, 1]
+            score_delta = elite_scores - max_elite  # [B, K]
+            if bool(self.cfg.mult_by_temp):
+                probs = torch.exp(temp * score_delta)  # [B, K] - multiply: higher temp = softer
+            else:
+                probs = torch.exp(score_delta / temp)  # [B, K] - divide: higher temp = softer
+            probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-9)  # [B, K]
             elite_pick = torch.multinomial(probs, 1)  # [B, 1]
             chosen_idx = elite_indices.gather(1, elite_pick)  # [B, 1]
         
@@ -362,6 +349,11 @@ class Planner(torch.nn.Module):
         # Build info (only for B=1)
         info_basic = None
         if B == 1:
+            # Plan drift: mean|final_mean - warm_start| over overlapping T-1 steps
+            plan_drift_val = None
+            if warm_start_for_info is not None and T > 1:
+                plan_drift_val = (mean[0, :-1] - warm_start_for_info[:-1]).abs().mean().detach()
+
             elite_scores_b0 = elite_scores[0]  # [K]
             value_elite_mean = elite_scores_b0.mean()
             value_elite_std = elite_scores_b0.std(unbiased=False) if K > 1 else elite_scores_b0.new_zeros(())
@@ -415,6 +407,16 @@ class Planner(torch.nn.Module):
                 scores_all=scores_b0,
                 values_scaled_all=vals_scaled_b0,
                 weighted_latent_disagreements_all=weighted_latent_dis_b0,
+                v_std_across_value_heads=value_diagnostics.get('v_std_across_value_heads'),
+                v_std_across_dynamics_heads=value_diagnostics.get('v_std_across_dynamics_heads'),
+                v_std_across_candidates=value_diagnostics.get('v_std_across_candidates'),
+                policy_seed_elite_counts=(
+                    torch.stack(policy_seed_elite_counts, dim=0).squeeze(-1)
+                    if len(policy_seed_elite_counts) > 0 else None
+                ),  # int64[I]
+                z0=z0[0].detach().clone(),
+                warm_start_mean=warm_start_for_info,
+                plan_drift=plan_drift_val,
             )
 
         # Detailed logging: upgrade info_basic to info_adv if requested (only for B=1)
@@ -444,14 +446,11 @@ class Planner(torch.nn.Module):
                 action_seq_chosen=chosen_seq[0].detach(),  # [T, A]
                 action_noise=(noise_vec_first[0].detach() if noise_vec_first is not None else None),
                 std_first_action=std_first[0].detach(),
-                z0=z0[0].detach(),
-                task=task.detach() if (task is not None and torch.is_tensor(task)) else task,
+                task=None,
                 lambda_latent=float(self.cfg.planner_lambda_disagreement) if not eval_mode else 0.0,
-                head_mode=head_mode,
                 value_std_coef=value_std_coef,
                 T=T,
                 use_ema_value=use_ema_value,
-                discount=float(self.discount),
             )
             with torch.no_grad():
                 info_out.compute_post_noise_effects(self.world_model)

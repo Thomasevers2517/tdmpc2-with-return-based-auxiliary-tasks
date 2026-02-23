@@ -37,6 +37,7 @@ Usage: run_sweep.sh \
   [--max-parallel N]         # optional throttle for array concurrency\
   [--mail-user EMAIL]        # optional email for notifications
   [--wandb-entity NAME]      # W&B entity (default: thomasevers9); project inferred from project.txt when needed
+  [--persistent-cache]       # store compilation cache in repo .compilation_files/ instead of scratch
 END_USAGE
 }
 
@@ -50,11 +51,12 @@ CPUS="9"
 MEM="80G"
 ACCOUNT="tdsei8531"
 JOB_NAME="weather-tdmpc2-sweep"
-CONDA_ENV="/projects/0/prjs0951/conda_envs/tdmpc2-new"
+CONDA_ENV="/home/tevers/.conda/envs/bmpc"
 MAX_PARALLEL=""
 MAIL_USER="t.evers-2@student.tudelft.nl"
 WANDB_ENTITY="thomasevers9"
 WANDB_PROJECT=""
+PERSISTENT_CACHE="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --max-parallel) MAX_PARALLEL="$2"; shift 2;;
     --mail-user) MAIL_USER="$2"; shift 2;;
     --wandb-entity) WANDB_ENTITY="$2"; shift 2;;
+    --persistent-cache) PERSISTENT_CACHE="1"; shift;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2;;
   esac
@@ -156,6 +159,11 @@ echo "  Time          : $TIME_LIMIT"
 echo "  Account       : $ACCOUNT"
 echo "  Job name      : $JOB_NAME"
 echo "  Conda env     : $CONDA_ENV"
+if [[ "$PERSISTENT_CACHE" == "1" ]]; then
+  echo "  Cache         : persistent (${REPO_ROOT}/.compilation_files/)"
+else
+  echo "  Cache         : scratch (per-task TMPDIR)"
+fi
 
 # Build optional mail args
 MAIL_ARGS=()
@@ -239,8 +247,14 @@ SRUN_OUT_DIR="${OUT_DIR:-/tmp}"
 srun --output="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.out" \
      --error="${SRUN_OUT_DIR}/srun_%x_%A_%a_%t.err" \
      bash -c '
-       # Per-task cache directories on local scratch to avoid disk space issues and corruption
-       TASK_CACHE="${TMPDIR:-/tmp}/compile_cache_task_${SLURM_PROCID}"
+       # Set up compilation cache directory
+       if [[ "${PERSISTENT_CACHE:-0}" == "1" ]]; then
+         # Persistent cache in repo directory (reused across jobs)
+         TASK_CACHE="${REPO_ROOT}/.compilation_files/job_${SLURM_JOB_ID}/task_${SLURM_PROCID}"
+       else
+         # Per-task cache on local scratch (fast but ephemeral)
+         TASK_CACHE="${TMPDIR:-/tmp}/compile_cache_task_${SLURM_PROCID}"
+       fi
        mkdir -p "${TASK_CACHE}/inductor" "${TASK_CACHE}/triton" "${TASK_CACHE}/cuda"
        export TORCHINDUCTOR_CACHE_DIR="${TASK_CACHE}/inductor"
        export TRITON_CACHE_DIR="${TASK_CACHE}/triton"
@@ -266,7 +280,7 @@ CMD=( sbatch
   -o "$OUT_DIR/%x_%A_%a.out"
   -e "$OUT_DIR/%x_%A_%a.err"
   --array "$ARRAY_RANGE"
-  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT,CONDA_ENV=$CONDA_ENV,OUT_DIR=$OUT_DIR"
+  --export "ALL,SWEEP_ID=$SWEEP_ID,RUNS_PER_JOB=$RUNS_PER_JOB,KEY_FILE=$KEY_FILE,WANDB_ENTITY=$WANDB_ENTITY,WANDB_PROJECT=$WANDB_PROJECT,CONDA_ENV=$CONDA_ENV,OUT_DIR=$OUT_DIR,PERSISTENT_CACHE=$PERSISTENT_CACHE,REPO_ROOT=$REPO_ROOT"
   "${MAIL_ARGS[@]:-}"
   "$BATCH_SCRIPT"
 )

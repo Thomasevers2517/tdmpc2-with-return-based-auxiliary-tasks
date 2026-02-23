@@ -14,6 +14,11 @@ import sys
 import os
 from pathlib import Path
 
+# Set WANDB_DIR to /tmp before importing wandb to avoid permission issues
+# with debug logs in shared filesystems
+if 'WANDB_DIR' not in os.environ:
+    os.environ['WANDB_DIR'] = '/tmp'
+
 
 def parse_args(argv):
     if len(argv) < 2:

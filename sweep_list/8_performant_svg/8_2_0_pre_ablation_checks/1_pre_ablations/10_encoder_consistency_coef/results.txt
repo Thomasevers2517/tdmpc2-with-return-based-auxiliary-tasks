@@ -1,0 +1,22 @@
+Pre-ablation 10: Encoder Consistency Coefficient
+==================================================
+Sweep ID: 51019801
+Config:  encoder_consistency_coef in {0.1, 1.0} (baseline=0)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 2 seeds | 100k steps
+
+Results:
+- Quadruped-walk:  Higher is better. 1.0 > 0.1 > 0 (baseline).
+                   Clear benefit from encoder consistency loss.
+- Dog-run:         0.1 seems good. 1.0 breaks performance — too strong.
+                   (Note: with consistency_coef=10, adding encoder_consistency_coef=1
+                    is a large additional constraint on the encoder.)
+- Hopper-hop:      0.1 leads to about average performance (comparable to baseline).
+
+Conclusion:
+  Setting encoder_consistency_coef=0.1 is a safe, broadly beneficial choice.
+  - Helps quadruped-walk and dog-run.
+  - Doesn't hurt hopper-hop.
+  - 1.0 is too aggressive (breaks dog-run, likely because combined with
+    consistency_coef=10 it over-constrains the encoder).
+
+  Worth further investigation to confirm benefit at scale / on more tasks.

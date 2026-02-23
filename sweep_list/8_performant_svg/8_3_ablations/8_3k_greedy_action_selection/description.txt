@@ -1,0 +1,16 @@
+Sweep 8.3k: Greedy Action Selection Ablation
+=============================================
+
+Purpose:
+Test greedy (argmax) vs softmax sampling for action selection from the planner
+during training. The baseline uses softmax sampling from elites (stochastic),
+which provides additional exploration through sampling randomness. With greedy
+selection (argmax), the planner always picks the single best trajectory — more
+deterministic, relying entirely on optimistic scoring for exploration rather
+than sampling noise.
+
+Ablated parameter: greedy_train_action_selection
+  Baseline: false (not run)
+  Ablate:   true
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

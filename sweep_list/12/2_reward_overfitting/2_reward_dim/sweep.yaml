@@ -1,0 +1,59 @@
+# Sweep 12.2b: Reward overfitting — smaller reward heads
+# 2 tasks × 3 seeds × 3 reward_dim_div = 18 runs
+#
+# Sweeps reward_dim_div to reduce reward head capacity:
+#   1 = full size (baseline, reward_hidden = mlp_dim)
+#   2 = half size
+#   4 = quarter size
+# Smaller heads may reduce overfitting but risk making the encoder
+# over-specialize its latent representation toward reward prediction.
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values:
+      - hopper-hop
+      - dog-run
+
+  seed:
+    values: [1, 2, 3]
+
+  # --- Key change: sweep reward head size ---
+  reward_dim_div:
+    values: [8, 32]
+
+  # --- Fixed (optimistic TD + modest prior, matching 12.1 baseline) ---
+  td_target_std_coef:
+    value: 1
+  value_prior_scale:
+    value: 0.1
+  num_reward_heads:
+    value: 2
+
+  num_q:
+    value: 5
+  steps:
+    value: 100000
+  rollout_head_strategy:
+    value: single
+  num_rollouts:
+    value: 1
+
+  # Logging
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  compile:
+    value: true
+  save_video:
+    value: false

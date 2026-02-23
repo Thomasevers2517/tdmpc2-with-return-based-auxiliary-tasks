@@ -1,0 +1,14 @@
+Sweep 8.3g: Num TD Rollouts Ablation
+=====================================
+
+Purpose:
+Test the number of parallel imagination rollouts per starting state for TD target
+computation. More rollouts reduce variance in value estimates by averaging over
+multiple imagined trajectories, but cost more compute. The baseline uses 4 rollouts.
+This sweep checks if 1 rollout (original TD-MPC2 default) is sufficient.
+
+Ablated parameter: num_rollouts
+  Baseline: 4 (not run)
+  Ablate:   1
+
+Total runs: 1 config × 6 tasks × 2 seeds = 12

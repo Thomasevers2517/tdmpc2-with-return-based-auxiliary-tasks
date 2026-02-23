@@ -1,0 +1,14 @@
+Pre-ablation 8: Greedy Action Selection
+========================================
+Sweep ID: iw4nfzu5
+Config:  greedy_train_action_selection=true (baseline=false)
+Tasks:   hopper-hop, quadruped-walk, dog-run | 3 seeds | 100k steps
+
+Results:
+- Generally positive effect across all tasks.
+- Reduces noise in the training signal by selecting the best action
+  deterministically rather than sampling.
+
+Conclusion:
+  Definitely enable greedy_train_action_selection=true.
+  Clear benefit, reduces noise. Keep this on.

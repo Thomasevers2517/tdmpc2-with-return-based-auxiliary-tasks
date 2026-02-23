@@ -1,0 +1,37 @@
+# Sweep: parallel dynamics (vmap Ensemble) validation
+# Purpose: Verify the parallel dynamics refactoring (Ensemble + split_data vmap)
+#          produces identical learning performance to the sequential baseline.
+# 2 tasks × 2 seeds = 4 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  # --- Swept parameters ---
+  task:
+    values: [reacher-easy, quadruped-walk]
+  seed:
+    values: [1, 2]
+
+  # --- Fixed training config ---
+  steps:
+    value: 100000
+  planner_num_dynamics_heads:
+    value: 4
+  compile:
+    value: true
+
+  # --- Fixed logging config ---
+  enable_wandb:
+    value: true
+  wandb_project:
+    value: tdmpc2-tdmpc2
+  wandb_entity:
+    value: thomasevers9
+  save_video:
+    value: false
