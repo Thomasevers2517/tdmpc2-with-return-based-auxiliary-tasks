@@ -1,6 +1,7 @@
-# Sweep 18.7b: All contributions + UTD 4 — hard DMC tasks (300k)
-# Diff from baseline: all contributions + utd_ratio=4
-# 1 task × 8 seeds = 8 runs
+# Sweep 18.7e: All contributions + exploration (1 dynamics head) — hard DMC tasks (300k)
+# Diff from baseline: buffer_update_interval=1, jacobian_correction_scale=1,
+#   local_td_bootstrap=true, planner_num_dynamics_heads=1, planner_value_std_coef_train=1
+# 3 tasks × 8 seeds = 24 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -20,7 +21,7 @@ parameters:
   steps:
     value: 300000
 
-  # --- Sweep-specific: all contributions + UTD 4 ---
+  # --- Sweep-specific: all contributions + exploration (1 dynamics head) ---
   buffer_update_interval:
     value: 1
   jacobian_correction_scale:
@@ -28,9 +29,11 @@ parameters:
   local_td_bootstrap:
     value: true
   planner_num_dynamics_heads:
-    value: 4
+    value: 1
+  planner_value_std_coef_train:
+    value: 1
   utd_ratio:
-    value: 4
+    value: 1
   value_update_freq:
     value: 1
   num_q:
@@ -55,8 +58,6 @@ parameters:
     value: 0
   value_prior_scale:
     value: 0
-  planner_value_std_coef_train:
-    value: 1
   planner_value_std_coef_eval:
     value: 0
   policy_value_std_coef:

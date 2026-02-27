@@ -1,6 +1,6 @@
-# Sweep 18.7b: All contributions + UTD 4 — hard DMC tasks (300k)
-# Diff from baseline: all contributions + utd_ratio=4
-# 1 task × 8 seeds = 8 runs
+# Sweep 18.3b_b: Jacobian fix + no entropy dim scaling — hard DMC tasks (300k)
+# Diff from baseline: jacobian_correction_scale=1, entropy_action_dim_power=0, start_entropy_coeff swept
+# 3 tasks × 2 coeff × 4 seeds = 24 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -16,22 +16,22 @@ parameters:
   task:
     values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
   seed:
-    values: [1, 2, 3, 4, 5, 6, 7, 8]
+    values: [1, 2, 3, 4]
   steps:
     value: 300000
 
-  # --- Sweep-specific: all contributions + UTD 4 ---
-  buffer_update_interval:
-    value: 1
+  # --- Sweep-specific: jacobian fix + no entropy dim scaling ---
   jacobian_correction_scale:
     value: 1
-  local_td_bootstrap:
-    value: true
-  planner_num_dynamics_heads:
-    value: 4
+  start_entropy_coeff:
+    values: [1e-4, 3e-4]
+  entropy_action_dim_power:
+    value: 0
   utd_ratio:
-    value: 4
+    value: 1
   value_update_freq:
+    value: 1
+  planner_num_dynamics_heads:
     value: 1
   num_q:
     value: 5
@@ -39,8 +39,10 @@ parameters:
     value: 0.01
   consistency_coef:
     value: 20
-  start_entropy_coeff:
-    value: 3e-5
+  buffer_update_interval:
+    value: -1
+  local_td_bootstrap:
+    value: false
 
   # --- Standard defaults ---
   rollout_head_strategy:
@@ -56,7 +58,7 @@ parameters:
   value_prior_scale:
     value: 0
   planner_value_std_coef_train:
-    value: 1
+    value: 0
   planner_value_std_coef_eval:
     value: 0
   policy_value_std_coef:

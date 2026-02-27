@@ -56,7 +56,7 @@ parameters:
   value_prior_scale:
     value: 0
   planner_value_std_coef_train:
-    value: 0
+    value: 1
   planner_value_std_coef_eval:
     value: 0
   policy_value_std_coef:

@@ -1,7 +1,6 @@
-# Sweep 18.8b: All contributions + all hyperparams — hard DMC tasks (300k)
-# Diff from baseline: all contributions + utd_ratio=4, value_update_freq=2,
-#   num_q=8, tau=0.003, consistency_coef=10
-# 1 task × 8 seeds = 8 runs
+# Sweep 18.7c: All contributions + no entropy dim scaling — hard DMC tasks (300k)
+# Diff from baseline: all contributions + start_entropy_coeff=1e-4 + entropy_action_dim_power=0
+# 2 tasks × 4 seeds = 8 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -15,13 +14,13 @@ parameters:
   label:
     value: "initial ablations 20 feb"
   task:
-    values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
+    values: [dog-run, humanoid-walk]
   seed:
-    values: [1, 2, 3, 4, 5, 6, 7, 8]
+    values: [1, 2, 3, 4]
   steps:
     value: 300000
 
-  # --- Sweep-specific: all contributions + all hyperparams ---
+  # --- Sweep-specific: all contributions + no entropy dim scaling ---
   buffer_update_interval:
     value: 1
   jacobian_correction_scale:
@@ -30,18 +29,22 @@ parameters:
     value: true
   planner_num_dynamics_heads:
     value: 4
-  utd_ratio:
-    value: 4
-  value_update_freq:
-    value: 2
-  num_q:
-    value: 8
-  tau:
-    value: 0.003
-  consistency_coef:
-    value: 10
+  planner_value_std_coef_train:
+    value: 1
   start_entropy_coeff:
-    value: 3e-5
+    value: 1e-4
+  entropy_action_dim_power:
+    value: 0
+  utd_ratio:
+    value: 1
+  value_update_freq:
+    value: 1
+  num_q:
+    value: 5
+  tau:
+    value: 0.01
+  consistency_coef:
+    value: 20
 
   # --- Standard defaults ---
   rollout_head_strategy:
@@ -55,8 +58,6 @@ parameters:
   dynamics_prior_scale:
     value: 0
   value_prior_scale:
-    value: 0
-  planner_value_std_coef_train:
     value: 0
   planner_value_std_coef_eval:
     value: 0
@@ -83,9 +84,9 @@ parameters:
   compile:
     value: true
   save_video:
-    value: false
+    value: true
   save_train_video:
-    value: false
+    value: true
   best_eval:
     value: false
   train_act_std_coeff:

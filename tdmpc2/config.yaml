@@ -118,6 +118,7 @@ termination_coef: 1
 encoder_consistency_coef: 0
 encoder_consistency_warmup_ratio: 0.0
 imagine_value_loss_coef_mult: 1
+consistency_loss_type: mse  # 'mse' | 'simplicial_ce'
 
 # ===========================================================================
 #  7. Policy (SVG / Entropy)
@@ -185,6 +186,10 @@ checkpoint: ???
 eval_episodes: 5
 eval_freq: 10000
 eval_mean_head_reduce: false
+# Target steps per eval episode for episodic tasks.  When > 0 and episodic=true,
+# the eval loop runs episodes until total steps >= eval_target_episode_length * eval_episodes.
+# -1 = disabled (use fixed eval_episodes count).
+eval_target_episode_length: -1
 best_eval: true
 
 # ===========================================================================

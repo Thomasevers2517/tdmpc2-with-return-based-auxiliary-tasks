@@ -1,6 +1,8 @@
-# Sweep 18.7b: All contributions + UTD 4 — hard DMC tasks (300k)
-# Diff from baseline: all contributions + utd_ratio=4
-# 1 task × 8 seeds = 8 runs
+# Sweep 19.3: Simplicial-group CE with exploration settings
+# Uses the 18.7a "all contributions + exploration" defaults.
+# Tasks: quadruped-walk, hopper-hop, dog-run
+# Seeds: 1-8
+# Total runs: 3 * 8 = 24
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -12,15 +14,24 @@ command:
   - ${args_no_hyphens}
 parameters:
   label:
-    value: "initial ablations 20 feb"
+    value: "19.3 simplicial ce exploration"
+
   task:
-    values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
+    values: [quadruped-walk, hopper-hop, dog-run]
+
   seed:
     values: [1, 2, 3, 4, 5, 6, 7, 8]
-  steps:
-    value: 300000
 
-  # --- Sweep-specific: all contributions + UTD 4 ---
+  consistency_loss_type:
+    value: simplicial_ce
+
+  consistency_coef:
+    value: 20
+
+  steps:
+    value: 100000
+
+  # --- Best config from 18.7a ---
   buffer_update_interval:
     value: 1
   jacobian_correction_scale:
@@ -29,20 +40,20 @@ parameters:
     value: true
   planner_num_dynamics_heads:
     value: 4
+  planner_value_std_coef_train:
+    value: 1
   utd_ratio:
-    value: 4
+    value: 1
   value_update_freq:
     value: 1
   num_q:
     value: 5
   tau:
     value: 0.01
-  consistency_coef:
-    value: 20
   start_entropy_coeff:
     value: 3e-5
 
-  # --- Standard defaults ---
+  # --- Standard defaults used in 18.7a ---
   rollout_head_strategy:
     value: split
   num_rollouts:
@@ -55,8 +66,6 @@ parameters:
     value: 0
   value_prior_scale:
     value: 0
-  planner_value_std_coef_train:
-    value: 1
   planner_value_std_coef_eval:
     value: 0
   policy_value_std_coef:
@@ -73,19 +82,19 @@ parameters:
     value: 2
   end_entropy_coeff:
     value: 0
+  best_eval:
+    value: false
+  train_act_std_coeff:
+    value: 1
+
   enable_wandb:
     value: true
   wandb_project:
     value: tdmpc2-tdmpc2
   wandb_entity:
     value: thomasevers9
-  compile:
-    value: true
+
   save_video:
     value: false
   save_train_video:
     value: false
-  best_eval:
-    value: false
-  train_act_std_coeff:
-    value: 1

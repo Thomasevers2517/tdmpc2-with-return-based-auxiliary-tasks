@@ -1,6 +1,6 @@
-# Sweep 18.7b: All contributions + UTD 4 — hard DMC tasks (300k)
-# Diff from baseline: all contributions + utd_ratio=4
-# 1 task × 8 seeds = 8 runs
+# Sweep 18.7d: All contributions + exploration + smaller value heads — easy DMC tasks (100k)
+# Diff from sweep 7: value_dim_div=2 (halved value head hidden dim)
+# 4 tasks × 3 seeds = 12 runs
 
 program: tdmpc2/train.py
 project: tdmpc2-tdmpc2
@@ -14,13 +14,13 @@ parameters:
   label:
     value: "initial ablations 20 feb"
   task:
-    values: [dog-run, humanoid-walk, humanoid_h1-slide-v0]
+    values: [hopper-hop, quadruped-walk, cheetah-run, finger-turn_hard]
   seed:
-    values: [1, 2, 3, 4, 5, 6, 7, 8]
+    values: [1, 2, 3]
   steps:
-    value: 300000
+    value: 100000
 
-  # --- Sweep-specific: all contributions + UTD 4 ---
+  # --- Sweep-specific: all contributions + exploration + smaller value heads ---
   buffer_update_interval:
     value: 1
   jacobian_correction_scale:
@@ -29,8 +29,12 @@ parameters:
     value: true
   planner_num_dynamics_heads:
     value: 4
+  planner_value_std_coef_train:
+    value: 1
+  value_dim_div:
+    value: 2
   utd_ratio:
-    value: 4
+    value: 1
   value_update_freq:
     value: 1
   num_q:
@@ -55,8 +59,6 @@ parameters:
     value: 0
   value_prior_scale:
     value: 0
-  planner_value_std_coef_train:
-    value: 1
   planner_value_std_coef_eval:
     value: 0
   policy_value_std_coef:
