@@ -442,45 +442,6 @@ class WorldModel(nn.Module):
 				return torch.amax(Q_val, dim=0)
 			return Q_val.mean(0)
 
-	def eval_critic_vpd(self, z_h, action_h=None, return_type='all_values',
-						target=False, detach=False):
-		"""Evaluate critic with value-per-dynamics grouping.
-
-		Expands H→Ve via repeat_interleave, calls the active critic (V or Q)
-		with split_data=True, then groups outputs into H dynamics-head groups
-		of G value heads each.
-
-		Args:
-			z_h (Tensor[H, M, L]): Latents, one row per dynamics head.
-			action_h (Tensor[H, M, A] | None): Actions per dynamics head.
-				Required when critic_type is 'Q'.
-			return_type (str): Forwarded to V()/Q().
-			target (bool): Use target network.
-			detach (bool): Use detached (no-grad) network.
-
-		Returns:
-			Tuple[Tensor[Ve, M, D], Tensor[H, M, D], Tensor[H, M, D]]:
-				(raw_ve, mean_per_h, std_per_h) where D depends on return_type.
-		"""
-		H = z_h.shape[0]
-		M = z_h.shape[1]
-		Ve = self.cfg.num_q
-		G = Ve // H
-		z_ve = z_h.repeat_interleave(G, dim=0)  # float32[Ve, M, L]
-		if self.cfg.critic_type == 'Q':
-			assert action_h is not None, "action_h required for Q critic"
-			a_ve = action_h.repeat_interleave(G, dim=0)  # float32[Ve, M, A]
-			raw = self.Q(z_ve, a_ve, return_type=return_type, target=target,
-						detach=detach, split_data=True)
-		else:
-			raw = self.V(z_ve, return_type=return_type, target=target,
-						detach=detach, split_data=True)
-		# raw: float32[Ve, M, D]
-		grouped = raw.view(H, G, M, *raw.shape[2:])
-		mean_per_h = grouped.mean(dim=1)                # float32[H, M, D]
-		std_per_h = grouped.std(dim=1, unbiased=(G > 1))
-		return raw, mean_per_h, std_per_h
-
 	def model_diagnostics(
 		self,
 		z_true: torch.Tensor,

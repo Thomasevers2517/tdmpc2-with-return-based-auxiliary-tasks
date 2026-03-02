@@ -336,29 +336,18 @@ class TDMPC2(torch.nn.Module):
 			A = action.shape[-1]
 			Ve = self.cfg.num_q
 			use_q = self.cfg.critic_type == 'Q'
-			vpd = self.cfg.value_per_dynamics
 			# critic_extra: optional per-head uncertainty & auxiliary stats for logging
 			critic_extra = {}
 
 			# ---- Evaluate critic: produces q_mean, q_std [T*B_eff*N, 1] ----
 			if use_q:
 				# Q path: direct Q(z_tgt, a) — no dynamics or reward model
-				if vpd:
-					z_tgt_h = z_tgt_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
-					a_h = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
-					_, q_mean_per_h, q_std_per_h = self.model.eval_critic_vpd(
-						z_tgt_h, action_h=a_h, return_type='all_values', detach=True)
-					# q_mean_per_h, q_std_per_h: float32[H, T*B*N, 1]
-					q_mean = q_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-					q_std = q_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-					critic_extra["pi_critic_std_per_dyn"] = q_std_per_h.mean()
-				else:
-					z_tgt_q_flat = z_tgt_expanded.view(T * B_eff * N, L)
-					a_q_flat = action.view(T * B_eff * N, A)
-					q_all = self.model.Q(z_tgt_q_flat, a_q_flat, return_type='all_values', detach=True)
-					# q_all: float32[Ve, T*B_eff*N, 1] — no reorder needed, T already varies slowest
-					q_mean = q_all.mean(dim=0)                           # float32[T*B_eff*N, 1]
-					q_std = q_all.std(dim=0, unbiased=(Ve > 1))
+				z_tgt_q_flat = z_tgt_expanded.view(T * B_eff * N, L)
+				a_q_flat = action.view(T * B_eff * N, A)
+				q_all = self.model.Q(z_tgt_q_flat, a_q_flat, return_type='all_values', detach=True)
+				# q_all: float32[Ve, T*B_eff*N, 1] — no reorder needed, T already varies slowest
+				q_mean = q_all.mean(dim=0)                           # float32[T*B_eff*N, 1]
+				q_std = q_all.std(dim=0, unbiased=(Ve > 1))
 			else:
 				# V path: r̂(z, a) + γ · V(dynamics(z, a))
 				gamma = self.discount
@@ -375,43 +364,26 @@ class TDMPC2(torch.nn.Module):
 				a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
 				next_z_all = self.model.next(z_for_dyn, a_for_dyn, split_data=True)  # float32[H, T*B*N, L]
 
-				if vpd:
-					v_next_raw, v_mean_per_h, v_std_per_h = self.model.eval_critic_vpd(
-						next_z_all, return_type='all_values', detach=True)
-					# v_next_raw: float32[Ve, T*B*N, 1], v_mean/std_per_h: float32[H, T*B*N, 1]
+				next_z_flat = next_z_all.reshape(H * T * B * N, L)
+				v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
+				v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
+				v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
 
-					reward_per_rh = reward_all.view(R, T, H, B * N, 1)
-					r_mean_per_h = reward_per_rh.mean(dim=0)              # float32[T, H, B*N, 1]
-					r_std_per_h = reward_per_rh.std(dim=0, unbiased=(R > 1))
+				v_mean = v_next_reord.mean(dim=0)                     # float32[T*H*B*N, 1]
+				v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))
 
-					v_mean = v_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-					v_std = v_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-					reward_mean = r_mean_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-					reward_std = r_std_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+				reward_mean = reward_all.mean(dim=0)                  # float32[T*H*B*N, 1]
+				reward_std = reward_all.std(dim=0, unbiased=(R > 1))
 
-					critic_extra["pi_critic_std_per_dyn"] = v_std_per_h.mean()
-					critic_extra["pi_r_std_per_dyn"] = r_std_per_h.mean()
-				else:
-					next_z_flat = next_z_all.reshape(H * T * B * N, L)
-					v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-					v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
-					v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
-
-					v_mean = v_next_reord.mean(dim=0)                     # float32[T*H*B*N, 1]
-					v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))
-
-					reward_mean = reward_all.mean(dim=0)                  # float32[T*H*B*N, 1]
-					reward_std = reward_all.std(dim=0, unbiased=(R > 1))
-
-					# Per-dyn-head value uncertainty (std over Ve for each H)
-					v_std_per_sample = v_next_per_h.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
-					critic_extra["pi_critic_std_per_dyn"] = v_std_per_sample.mean()
-					critic_extra["pi_r_std_per_dyn"] = reward_all.view(R, T, H, B * N, 1).std(dim=0, unbiased=(R > 1)).mean()
+				# Per-dyn-head value uncertainty (std over Ve for each H)
+				v_std_per_sample = v_next_per_h.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
+				critic_extra["pi_critic_std_per_dyn"] = v_std_per_sample.mean()
+				critic_extra["pi_r_std_per_dyn"] = reward_all.view(R, T, H, B * N, 1).std(dim=0, unbiased=(R > 1)).mean()
 
 				q_mean = reward_mean + gamma * v_mean
 				q_std = reward_std + gamma * v_std
 				critic_extra["pi_reward_mean"] = reward_all.mean()
-				critic_extra["pi_v_next_mean"] = v_next_raw.mean() if vpd else v_next_flat.mean()
+				critic_extra["pi_v_next_mean"] = v_next_flat.mean()
 
 			# ---- Q estimate with pessimism/optimism, scaling, and loss ----
 			q_estimate_flat = q_mean + value_std_coef * q_std
@@ -549,9 +521,7 @@ class TDMPC2(torch.nn.Module):
 	def _td_target(self, next_z, reward, terminated):
 		"""Compute TD-target: r + γ * (1 - terminated) * V(next_z).
 
-		Handles per-head dynamics and reward/value ensemble uncertainty.
-		When value_per_dynamics=True, each value head group bootstraps only
-		from its linked dynamics head (no cross-head dynamics reduction).
+		Handles dynamics-head and reward/value ensemble uncertainty.
 
 		Args:
 			next_z (Tensor[T, H, B, L]): Latent states at following time steps.
@@ -568,111 +538,62 @@ class TDMPC2(torch.nn.Module):
 		discount = self.discount
 		std_coef = float(self.cfg.td_target_std_coef)
 
-		if self.cfg.value_per_dynamics:
-			G = Ve // H  # value heads per dynamics head
+		# All Ve heads see all H dynamics heads' latents
+		next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
+		v_logits_flat = self.model.V(next_z_flat, return_type='all', target=True)  # float32[Ve, T, H*B, K]
+		v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
+		v_values = v_values_flat.view(Ve, T, H, B, 1)
 
-			# Expand H → Ve so each value head maps to its dynamics head
-			next_z_ve = next_z.repeat_interleave(G, dim=1)         # float32[T, Ve, B, L]
-			reward_ve = reward.repeat_interleave(G, dim=2)         # float32[T, R, Ve, B, 1]
-			terminated_ve = terminated.repeat_interleave(G, dim=1) # float32[T, Ve, B, 1]
+		if self.cfg.local_td_bootstrap:
+			# LOCAL: Each Ve head bootstraps itself
+			r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
+			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
+			terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
+			r_mean_exp = r_mean_per_h.unsqueeze(0)
 
-			# V bootstrap: each value head only sees its dynamics head's next_z
-			next_z_flat = next_z_ve.permute(1, 0, 2, 3).contiguous().view(Ve, T * B, L)
-			v_logits = self.model.V(next_z_flat, return_type='all', target=True, split_data=True)
-			# v_logits: float32[Ve, T*B, K]
-			v_values = math.two_hot_inv(v_logits, self.cfg).view(Ve, T, B, 1)
+			td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
+			td_std_exp = r_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
+			td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp
 
-			# Reward stats per value head (across R reward heads)
-			r_mean_ve = reward_ve.mean(dim=1)                    # float32[T, Ve, B, 1]
-			r_std_ve = reward_ve.std(dim=1, unbiased=(R > 1))    # float32[T, Ve, B, 1]
+			dyn_reduction = self.cfg.td_target_dynamics_reduction
+			if dyn_reduction == "from_std_coef":
+				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
 
-			if self.cfg.local_td_bootstrap:
-				# Each Ve head bootstraps from its own V(next_z_from_its_dyn)
-				td_targets = (
-					r_mean_ve.permute(1, 0, 2, 3)
-					+ discount * (1 - terminated_ve.permute(1, 0, 2, 3)) * v_values
-					+ std_coef * r_std_ve.permute(1, 0, 2, 3)
-				)  # float32[Ve, T, B, 1]
+			if dyn_reduction == "max":
+				td_targets, _ = td_per_ve_h.max(dim=2)
+			elif dyn_reduction == "min":
+				td_targets, _ = td_per_ve_h.min(dim=2)
 			else:
-				# Global within each dynamics group: average G heads, broadcast back
-				v_grouped = v_values.view(H, G, T, B, 1)
-				v_mean_group = v_grouped.mean(dim=1)                     # float32[H, T, B, 1]
-				v_std_group = v_grouped.std(dim=1, unbiased=(G > 1))
+				td_targets = td_per_ve_h.mean(dim=2)
 
-				# Rewards are identical within a group; take one representative per H
-				r_mean_h = r_mean_ve[:, ::G]                             # float32[T, H, B, 1]
-				r_std_h = r_std_ve[:, ::G]
-				terminated_h = terminated_ve[:, ::G]                     # float32[T, H, B, 1]
-
-				td_h = (
-					r_mean_h.permute(1, 0, 2, 3)
-					+ discount * (1 - terminated_h.permute(1, 0, 2, 3)) * v_mean_group
-					+ std_coef * (r_std_h.permute(1, 0, 2, 3) + discount * v_std_group)
-				)  # float32[H, T, B, 1]
-
-				# Expand back to Ve (all G heads in a group get same target)
-				td_targets = td_h.unsqueeze(1).expand(H, G, T, B, 1).reshape(Ve, T, B, 1)
-
-			td_mean_log = (r_mean_ve.permute(1, 0, 2, 3) + discount * v_values).mean(dim=0)
-			td_std_log = r_std_ve.mean(dim=1)  # float32[T, B, 1]
+			td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
+			td_std_log = r_std_per_h.mean(dim=1)
 
 		else:
-			# Original path: all Ve heads see all H dynamics heads' latents
-			next_z_flat = next_z.view(T, H * B, L)  # float32[T, H*B, L]
-			v_logits_flat = self.model.V(next_z_flat, return_type='all', target=True)  # float32[Ve, T, H*B, K]
-			v_values_flat = math.two_hot_inv(v_logits_flat, self.cfg)  # float32[Ve, T, H*B, 1]
-			v_values = v_values_flat.view(Ve, T, H, B, 1)
+			# GLOBAL: All Ve heads get same target
+			r_mean_per_h = reward.mean(dim=1)
+			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
+			v_mean_per_h = v_values.mean(dim=0)
+			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
 
-			if self.cfg.local_td_bootstrap:
-				# LOCAL: Each Ve head bootstraps itself
-				r_mean_per_h = reward.mean(dim=1)  # float32[T, H, B, 1]
-				r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
-				terminated_exp = terminated.unsqueeze(0)  # float32[1, T, H, B, 1]
-				r_mean_exp = r_mean_per_h.unsqueeze(0)
+			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
+			td_std_per_h = r_std_per_h + discount * v_std_per_h
+			td_per_h = td_mean_per_h + std_coef * td_std_per_h
 
-				td_mean_per_ve_h = r_mean_exp + discount * (1 - terminated_exp) * v_values  # float32[Ve, T, H, B, 1]
-				td_std_exp = r_std_per_h.unsqueeze(0)  # float32[1, T, H, B, 1]
-				td_per_ve_h = td_mean_per_ve_h + std_coef * td_std_exp
+			dyn_reduction = self.cfg.td_target_dynamics_reduction
+			if dyn_reduction == "from_std_coef":
+				dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
 
-				dyn_reduction = self.cfg.td_target_dynamics_reduction
-				if dyn_reduction == "from_std_coef":
-					dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-
-				if dyn_reduction == "max":
-					td_targets, _ = td_per_ve_h.max(dim=2)
-				elif dyn_reduction == "min":
-					td_targets, _ = td_per_ve_h.min(dim=2)
-				else:
-					td_targets = td_per_ve_h.mean(dim=2)
-
-				td_mean_log = td_mean_per_ve_h.mean(dim=(0, 2))  # float32[T, B, 1]
-				td_std_log = r_std_per_h.mean(dim=1)
-
+			if dyn_reduction == "max":
+				td_reduced, _ = td_per_h.max(dim=1)
+			elif dyn_reduction == "min":
+				td_reduced, _ = td_per_h.min(dim=1)
 			else:
-				# GLOBAL: All Ve heads get same target
-				r_mean_per_h = reward.mean(dim=1)
-				r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
-				v_mean_per_h = v_values.mean(dim=0)
-				v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
+				td_reduced = td_per_h.mean(dim=1)
 
-				td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
-				td_std_per_h = r_std_per_h + discount * v_std_per_h
-				td_per_h = td_mean_per_h + std_coef * td_std_per_h
-
-				dyn_reduction = self.cfg.td_target_dynamics_reduction
-				if dyn_reduction == "from_std_coef":
-					dyn_reduction = "max" if std_coef > 0 else ("min" if std_coef < 0 else "mean")
-
-				if dyn_reduction == "max":
-					td_reduced, _ = td_per_h.max(dim=1)
-				elif dyn_reduction == "min":
-					td_reduced, _ = td_per_h.min(dim=1)
-				else:
-					td_reduced = td_per_h.mean(dim=1)
-
-				td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)
-				td_mean_log = td_mean_per_h.mean(dim=1)
-				td_std_log = td_std_per_h.mean(dim=1)
+			td_targets = td_reduced.unsqueeze(0).expand(Ve, T, B, 1)
+			td_mean_log = td_mean_per_h.mean(dim=1)
+			td_std_log = td_std_per_h.mean(dim=1)
 
 		return td_targets, td_mean_log, td_std_log
 
@@ -927,9 +848,7 @@ class TDMPC2(torch.nn.Module):
 		S_full, B, L = z_true.shape
 		device, dtype = z_true.device, z_true.dtype
 		K, Ve = self.cfg.num_bins, self.cfg.num_q
-		vpd = self.cfg.value_per_dynamics
 		use_q = self.cfg.critic_type == 'Q'
-		use_vpd_split = vpd and self.cfg.critic_source == 'replay_rollout'
 		critic_extra = {}
 
 		# ---- Critic predictions & TD targets ----
@@ -947,30 +866,20 @@ class TDMPC2(torch.nn.Module):
 			z_rollout_s = z_rollout[:-1]  # float32[S, H, B, L]
 			z_true_s = z_true[:-1]        # float32[S, B, L]
 
-			if use_vpd_split:
-				H_rollout = z_rollout_s.shape[1]
-				G = Ve // H_rollout
-				z_for_q_ve = z_rollout_s.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
-				z_flat = z_for_q_ve.permute(1, 0, 2, 3).contiguous().view(Ve, S * B, L)
-				a_flat = action.unsqueeze(0).expand(Ve, S, B, A).contiguous().view(Ve, S * B, A)
-				qs_logits = self.model.Q(z_flat, a_flat, return_type='all', split_data=True)
-				critic_logits = qs_logits.view(Ve, S, B, K)
-				B_q = B
+			if self.cfg.critic_source == 'replay_rollout':
+				z_for_q = self._apply_head_strategy(z_rollout_s)
 			else:
-				if self.cfg.critic_source == 'replay_rollout':
-					z_for_q = self._apply_head_strategy(z_rollout_s)
-				else:
-					z_for_q = z_true_s
-				B_q = z_for_q.shape[1]
-				if B_q != B:
-					H_mult = B_q // B
-					action_tiled = action.unsqueeze(1).expand(S, H_mult, B, A).reshape(S, B_q, A)
-				else:
-					action_tiled = action
-				z_flat = z_for_q.reshape(S * B_q, L)
-				a_flat = action_tiled.reshape(S * B_q, A)
-				qs_logits = self.model.Q(z_flat, a_flat, return_type='all')
-				critic_logits = qs_logits.view(Ve, S, B_q, K)
+				z_for_q = z_true_s
+			B_q = z_for_q.shape[1]
+			if B_q != B:
+				H_mult = B_q // B
+				action_tiled = action.unsqueeze(1).expand(S, H_mult, B, A).reshape(S, B_q, A)
+			else:
+				action_tiled = action
+			z_flat = z_for_q.reshape(S * B_q, L)
+			a_flat = action_tiled.reshape(S * B_q, A)
+			qs_logits = self.model.Q(z_flat, a_flat, return_type='all')
+			critic_logits = qs_logits.view(Ve, S, B_q, K)
 
 			# TD targets from replay buffer
 			with maybe_range('Value/td_target', self.cfg):
@@ -1009,12 +918,11 @@ class TDMPC2(torch.nn.Module):
 			T_imag = int(self.cfg.imagination_horizon)
 
 			# Select latents for V predictions
-			if not use_vpd_split:
-				if self.cfg.critic_source == 'replay_rollout':
-					z_for_v = self._apply_head_strategy(z_rollout)
-				else:
-					z_for_v = z_true
-				B_v = z_for_v.shape[1]
+			if self.cfg.critic_source == 'replay_rollout':
+				z_for_v = self._apply_head_strategy(z_rollout)
+			else:
+				z_for_v = z_true
+			B_v = z_for_v.shape[1]
 
 			# Imagination rollout for TD targets
 			if self.cfg.critic_target_source == 'replay_true':
@@ -1033,22 +941,11 @@ class TDMPC2(torch.nn.Module):
 			terminated_imag = imagined['terminated'].view(T_imag, H, S, B, N, 1).detach()
 
 			# V predictions on critic_source states
-			if use_vpd_split:
-				H_rollout = z_rollout.shape[1]
-				G = Ve // H_rollout
-				z_for_v_ve = z_rollout.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
-				z_exp = z_for_v_ve.unsqueeze(0).unsqueeze(4).expand(T_imag, S, Ve, B, N, L)
-				z_flat = z_exp.permute(2, 0, 1, 3, 4, 5).contiguous().view(Ve, T_imag * S * B * N, L)
-				vs_flat = self.model.V(z_flat, return_type='all', split_data=True)
-				B_v = B
-				BN_v = BN
-				vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
-			else:
-				BN_v = B_v * N
-				z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
-				z_for_v_flat = z_for_v_expanded.reshape(T_imag * S * BN_v, L)
-				vs_flat = self.model.V(z_for_v_flat, return_type='all')
-				vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
+			BN_v = B_v * N
+			z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
+			z_for_v_flat = z_for_v_expanded.reshape(T_imag * S * BN_v, L)
+			vs_flat = self.model.V(z_for_v_flat, return_type='all')
+			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
 
 			# TD targets from imagined next states
 			with maybe_range('Value/td_target', self.cfg):
@@ -1063,7 +960,7 @@ class TDMPC2(torch.nn.Module):
 					td_mean = td_mean_4d.view(T_imag, S, BN, 1)
 					td_std = td_std_4d.view(T_imag, S, BN, 1)
 
-					# Tile if B_v > B (concat strategy without vpd)
+					# Tile if B_v > B (concat head strategy)
 					if BN_v != BN:
 						H_mult = BN_v // BN
 						td_targets_4d = td_targets_4d.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)
