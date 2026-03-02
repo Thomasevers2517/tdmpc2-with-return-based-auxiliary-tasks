@@ -12,10 +12,10 @@ from tensordict.nn import TensorDictParams
 
 
 class WorldModel(nn.Module):
-	"""TD-MPC2 implicit world model architecture (single-task, V-function only).
+	"""TD-MPC2 implicit world model architecture (single-task).
 
 	Modules: encoder, dynamics (multi-head ensemble), reward (multi-head ensemble),
-	termination (optional), policy, V-function (ensemble).
+	termination (optional), policy, critic ensemble (V or Q depending on cfg.critic_type).
 	"""
 
 	def __init__(self, cfg):
@@ -79,13 +79,14 @@ class WorldModel(nn.Module):
 			cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim
 		) if cfg.dual_policy_enabled else None
 
-		# V-function ensemble (input is latent only)
-		v_mlp_dim = cfg.mlp_dim // cfg.value_dim_div
+		# Critic ensemble — V(z) or Q(z,a) depending on critic_type
+		critic_mlp_dim = cfg.mlp_dim // cfg.value_dim_div
 		num_value_layers = cfg.num_value_layers
-		v_mlps = [
+		critic_in_dim = cfg.latent_dim if cfg.critic_type == 'V' else cfg.latent_dim + cfg.action_dim
+		critic_mlps = [
 			layers.MLPWithPrior(
-				in_dim=cfg.latent_dim,
-				hidden_dims=num_value_layers * [v_mlp_dim],
+				in_dim=critic_in_dim,
+				hidden_dims=num_value_layers * [critic_mlp_dim],
 				out_dim=max(cfg.num_bins, 1),
 				prior_hidden_div=prior_hidden_div,
 				prior_scale=value_prior_scale,
@@ -95,20 +96,31 @@ class WorldModel(nn.Module):
 			)
 			for _ in range(cfg.num_q)
 		]
-		self._Vs = layers.Ensemble(v_mlps)
+		if cfg.critic_type == 'V':
+			self._Vs = layers.Ensemble(critic_mlps)
+		elif cfg.critic_type == 'Q':
+			self._Qs = layers.Ensemble(critic_mlps)
+		else:
+			raise ValueError(f"Unknown critic_type: {cfg.critic_type!r}. Expected 'V' or 'Q'.")
 
 		self.apply(init.weight_init)
-		# Zero-init output layers for reward and value heads
+		# Zero-init output layers for reward and critic heads
 		reward_output_layer_key = str(num_reward_layers)
-		v_output_layer_key = str(num_value_layers)
+		critic_output_layer_key = str(num_value_layers)
+		critic_ensemble = self._Vs if cfg.critic_type == 'V' else self._Qs
 		init.zero_([
 			self._Rs.params[reward_output_layer_key, "weight"],
-			self._Vs.params["main_mlp", v_output_layer_key, "weight"],
+			critic_ensemble.params["main_mlp", critic_output_layer_key, "weight"],
 		])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
 		self.register_buffer("log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min)
 		self._init_target_networks()
+
+	@property
+	def _critic(self):
+		"""Return the active critic ensemble (_Vs or _Qs)."""
+		return self._Vs if self.cfg.critic_type == 'V' else self._Qs
 
 	def _autocast_context(self):
 		dtype = self.autocast_dtype
@@ -120,19 +132,20 @@ class WorldModel(nn.Module):
 		return autocast(device_type=device.type, dtype=dtype)
 
 	def _init_target_networks(self):
-		"""Create target and detach V-networks, and optionally target policy."""
-		# Target/detach V-networks
-		self._detach_Vs_params = TensorDictParams(self._Vs.params.data, no_convert=True)
-		self._target_Vs_params = TensorDictParams(self._Vs.params.data.clone(), no_convert=True)
+		"""Create target and detach critic networks, and optionally target policy."""
+		# Target/detach critic networks (V or Q)
+		critic_ensemble = self._Vs if self.cfg.critic_type == 'V' else self._Qs
+		self._detach_critic_params = TensorDictParams(critic_ensemble.params.data, no_convert=True)
+		self._target_critic_params = TensorDictParams(critic_ensemble.params.data.clone(), no_convert=True)
 
-		with self._detach_Vs_params.data.to("meta").to_module(self._Vs.module):
-			self._detach_Vs = deepcopy(self._Vs)
-			self._target_Vs = deepcopy(self._Vs)
+		with self._detach_critic_params.data.to("meta").to_module(critic_ensemble.module):
+			self._detach_critic = deepcopy(critic_ensemble)
+			self._target_critic = deepcopy(critic_ensemble)
 
-		delattr(self._detach_Vs, "params")
-		self._detach_Vs.__dict__["params"] = self._detach_Vs_params
-		delattr(self._target_Vs, "params")
-		self._target_Vs.__dict__["params"] = self._target_Vs_params
+		delattr(self._detach_critic, "params")
+		self._detach_critic.__dict__["params"] = self._detach_critic_params
+		delattr(self._target_critic, "params")
+		self._target_critic.__dict__["params"] = self._target_critic_params
 
 		# Target policy for TD target imagination (if EMA policy used)
 		need_target_pi = self.cfg.td_target_use_ema_policy
@@ -154,8 +167,10 @@ class WorldModel(nn.Module):
 
 	def __repr__(self):
 		repr_str = 'TD-MPC2 World Model\n'
-		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', 'V-functions']
-		for i, m in enumerate([self._encoder, self._dynamics, self._Rs, self._termination, self._pi, self._Vs]):
+		critic_ensemble = self._Vs if self.cfg.critic_type == 'V' else self._Qs
+		critic_label = 'V-functions' if self.cfg.critic_type == 'V' else 'Q-functions'
+		modules = ['Encoder', 'Dynamics', 'Reward', 'Termination', 'Policy prior', critic_label]
+		for i, m in enumerate([self._encoder, self._dynamics, self._Rs, self._termination, self._pi, critic_ensemble]):
 			if m == self._termination and not self.cfg.episodic:
 				continue
 			repr_str += f"{modules[i]}: {m}\n"
@@ -172,15 +187,15 @@ class WorldModel(nn.Module):
 		return self
 
 	def train(self, mode=True):
-		"""Override train to keep target V-networks in eval mode."""
+		"""Override train to keep target critic networks in eval mode."""
 		super().train(mode)
-		self._target_Vs.train(False)
+		self._target_critic.train(False)
 		return self
 
-	def soft_update_target_V(self):
-		"""Soft-update target V-networks using Polyak averaging."""
-		with maybe_range('WM/soft_update_target_V', self.cfg):
-			self._target_Vs_params.lerp_(self._detach_Vs_params, self.cfg.tau)
+	def soft_update_target_critic(self):
+		"""Soft-update target critic networks (V or Q) using Polyak averaging."""
+		with maybe_range('WM/soft_update_target_critic', self.cfg):
+			self._target_critic_params.lerp_(self._detach_critic_params, self.cfg.tau)
 
 	def _soft_update_module(self, target_module, source_module, tau):
 		"""Generic EMA update from source → target."""
@@ -367,9 +382,9 @@ class WorldModel(nn.Module):
 		assert return_type in {'min', 'avg', 'mean', 'max', 'all', 'all_values'}
 		with maybe_range('WM/V', self.cfg):
 			if target:
-				vnet = self._target_Vs
+				vnet = self._target_critic
 			elif detach:
-				vnet = self._detach_Vs
+				vnet = self._detach_critic
 			else:
 				vnet = self._Vs
 			with self._autocast_context():
@@ -387,27 +402,114 @@ class WorldModel(nn.Module):
 				return torch.amax(V, dim=0)
 			return V.mean(0)
 
+	def Q(self, z, a, return_type='min', target=False, detach=False, split_data=False):
+		"""Compute action-value predictions Q(z, a).
+
+		Args:
+			z (Tensor[..., L]): Latent state embeddings.
+			a (Tensor[..., A]): Actions (same leading dims as z).
+			return_type (str): 'all' → logits, 'all_values' → values per head,
+				'min'/'max'/'avg'/'mean' → reduced values.
+			target (bool): Use target network.
+			detach (bool): Use detached network.
+			split_data (bool): If True, z has leading Ve dim sliced per head.
+
+		Returns:
+			Tensor: Shape depends on return_type.
+		"""
+		assert self.cfg.critic_type == 'Q', f"Q() called but critic_type={self.cfg.critic_type!r}"
+		assert return_type in {'min', 'avg', 'mean', 'max', 'all', 'all_values'}
+		with maybe_range('WM/Q', self.cfg):
+			if target:
+				qnet = self._target_critic
+			elif detach:
+				qnet = self._detach_critic
+			else:
+				qnet = self._Qs
+			za = torch.cat([z, a], dim=-1)  # float32[..., L+A]
+			with self._autocast_context():
+				out = qnet(za, split_data=split_data)
+			out = out.float()  # float32[num_q, ..., K]
+
+			if return_type == 'all':
+				return out
+			Q_val = math.two_hot_inv(out, self.cfg)  # float32[num_q, ..., 1]
+			if return_type == 'all_values':
+				return Q_val
+			if return_type == "min":
+				return torch.amin(Q_val, dim=0)
+			if return_type == "max":
+				return torch.amax(Q_val, dim=0)
+			return Q_val.mean(0)
+
+	def eval_critic_vpd(self, z_h, action_h=None, return_type='all_values',
+						target=False, detach=False):
+		"""Evaluate critic with value-per-dynamics grouping.
+
+		Expands H→Ve via repeat_interleave, calls the active critic (V or Q)
+		with split_data=True, then groups outputs into H dynamics-head groups
+		of G value heads each.
+
+		Args:
+			z_h (Tensor[H, M, L]): Latents, one row per dynamics head.
+			action_h (Tensor[H, M, A] | None): Actions per dynamics head.
+				Required when critic_type is 'Q'.
+			return_type (str): Forwarded to V()/Q().
+			target (bool): Use target network.
+			detach (bool): Use detached (no-grad) network.
+
+		Returns:
+			Tuple[Tensor[Ve, M, D], Tensor[H, M, D], Tensor[H, M, D]]:
+				(raw_ve, mean_per_h, std_per_h) where D depends on return_type.
+		"""
+		H = z_h.shape[0]
+		M = z_h.shape[1]
+		Ve = self.cfg.num_q
+		G = Ve // H
+		z_ve = z_h.repeat_interleave(G, dim=0)  # float32[Ve, M, L]
+		if self.cfg.critic_type == 'Q':
+			assert action_h is not None, "action_h required for Q critic"
+			a_ve = action_h.repeat_interleave(G, dim=0)  # float32[Ve, M, A]
+			raw = self.Q(z_ve, a_ve, return_type=return_type, target=target,
+						detach=detach, split_data=True)
+		else:
+			raw = self.V(z_ve, return_type=return_type, target=target,
+						detach=detach, split_data=True)
+		# raw: float32[Ve, M, D]
+		grouped = raw.view(H, G, M, *raw.shape[2:])
+		mean_per_h = grouped.mean(dim=1)                # float32[H, M, D]
+		std_per_h = grouped.std(dim=1, unbiased=(G > 1))
+		return raw, mean_per_h, std_per_h
+
 	def model_diagnostics(
 		self,
 		z_true: torch.Tensor,
 		z_rollout: torch.Tensor,
+		action: torch.Tensor,
 	) -> TensorDict:
 		"""Run diagnostic measurements on the model (called when log_detailed).
 
-		Compares V-function outputs on encoder-derived latents (z_true) vs
+		Compares critic outputs on encoder-derived latents (z_true) vs
 		dynamics-derived latents (z_rollout), and reports distributional entropy
-		of the V-function softmax logits.
+		of the critic softmax logits.
 
 		Args:
 			z_true (Tensor[T+1, B, L]): Encoder latents (detached).
 			z_rollout (Tensor[T+1, H, B, L]): Dynamics-rollout latents (detached).
+			action (Tensor[T, B, A]): Replay buffer actions (detached).
 
 		Returns:
 			TensorDict with diagnostic statistics.
 		"""
 		info = TensorDict({}, device=z_true.device)
+		if self.cfg.critic_type == 'V':
+			info.update(
+				self.rollout_value_diagnostics(z_true, z_rollout),
+				non_blocking=True,
+			)
+		# OOD action diagnostics (both V and Q)
 		info.update(
-			self.rollout_value_diagnostics(z_true, z_rollout),
+			self.ood_action_diagnostics(z_true[0], action[0]),
 			non_blocking=True,
 		)
 		return info
@@ -479,12 +581,12 @@ class WorldModel(nn.Module):
 			diff_avg_t = v_avg_latent[t] - v_true_mean[t]  # float32[B]
 			info.update({
 				# |E_h[V(z_h)] - V(z_true)|  (dynamics value drift)
-				f'v_diag/mean_V_heads_minus_V_encoder/step{t}': diff_t.abs().mean(),
+				f'model_diagnostics/v_diag/mean_V_heads_minus_V_encoder/step{t}': diff_t.abs().mean(),
 				# |V(E_h[z_h]) - V(z_true)|  (avg-latent value drift)
-				f'v_diag/V_avg_latent_minus_V_encoder/step{t}': diff_avg_t.abs().mean(),
+				f'model_diagnostics/v_diag/V_avg_latent_minus_V_encoder/step{t}': diff_avg_t.abs().mean(),
 				# Std of V across dynamics heads (head disagreement)
 				# Guard: unbiased=False when H=1 to avoid NaN from division by zero
-				f'v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0, unbiased=(H > 1)).mean(),
+				f'model_diagnostics/v_diag/std_V_across_dyn_heads/step{t}': v_per_head[t].std(dim=0, unbiased=(H > 1)).mean(),
 			}, non_blocking=True)
 
 		# --- Bin entropy at t=0 only ---
@@ -495,19 +597,91 @@ class WorldModel(nn.Module):
 		v_roll_entropy_0 = -(v_roll_probs_0 * torch.log(v_roll_probs_0 + 1e-8)).sum(dim=-1)  # float32[Ve, H, B]
 
 		info.update({
-			'v_diag/bin_entropy_V_encoder_z/step0': v_true_entropy_0.mean(),
-			'v_diag/bin_entropy_V_dyn_z/step0': v_roll_entropy_0.mean(),
+			'model_diagnostics/v_diag/bin_entropy_V_encoder_z/step0': v_true_entropy_0.mean(),
+			'model_diagnostics/v_diag/bin_entropy_V_dyn_z/step0': v_roll_entropy_0.mean(),
 		}, non_blocking=True)
 
 		# --- Aggregate metrics (averaged over all timesteps and batch) ---
 		all_diff = v_roll_mean - v_true_mean  # float32[T+1, B]
 		all_diff_avg = v_avg_latent - v_true_mean  # float32[T+1, B]
 		info.update({
-			'v_diag/mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
-			'v_diag/V_avg_latent_minus_V_encoder': all_diff_avg.abs().mean(),
+			'model_diagnostics/v_diag/mean_V_heads_minus_V_encoder': all_diff.abs().mean(),
+			'model_diagnostics/v_diag/V_avg_latent_minus_V_encoder': all_diff_avg.abs().mean(),
 			# Guard: unbiased=False when H=1 to avoid NaN from division by zero
-			'v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1, unbiased=(H > 1)).mean(),
+			'model_diagnostics/v_diag/std_V_across_dyn_heads': v_per_head.std(dim=1, unbiased=(H > 1)).mean(),
 		}, non_blocking=True)
+
+		return info
+
+	@torch.no_grad()
+	def ood_action_diagnostics(self, z: torch.Tensor, buffer_action: torch.Tensor) -> TensorDict:
+		"""Evaluate critic on policy actions vs fixed-magnitude fills.
+
+		Logs value mean and std for each action probe to diagnose OOD
+		behavior. For V-mode, values come from V(f(z,a)) where f is the
+		dynamics model; for Q-mode, values come from Q(z,a) directly.
+
+		Args:
+			z (Tensor[B, L]): Encoder latent at t=0.
+			buffer_action (Tensor[B, A]): Replay buffer actions at t=0.
+
+		Returns:
+			TensorDict with ood/* diagnostic statistics.
+		"""
+		B, L = z.shape
+		A = self.cfg.action_dim
+		device = z.device
+		info = TensorDict({}, device=device)
+
+		# --- Build action probes ---
+		pi_action, _ = self.pi(z)  # float32[B, A]
+		MAGNITUDES = [0.0, 0.1, 0.3, 1.0, 1.01, 1.1, 1.3, 1.5, 2.0, 5.0]
+		actions = [pi_action, buffer_action]
+		labels = ['pi', 'buffer']
+		for mag in MAGNITUDES:
+			actions.append(torch.full((B, A), mag, device=device))
+			labels.append(f'fill_{mag}')
+			if mag != 0.0:
+				actions.append(torch.full((B, A), -mag, device=device))
+				labels.append(f'fill_neg_{mag}')
+
+		use_q = self.cfg.critic_type == 'Q'
+
+		for action, label in zip(actions, labels):
+			if use_q:
+				# Q(z, a): float32[Ve, B, 1]
+				vals = self.Q(z, action, return_type='all_values')  # float32[Ve, B, 1]
+				vals = vals.squeeze(-1)  # float32[Ve, B]
+				Ve = vals.shape[0]
+				std_ve = vals.std(dim=0, unbiased=(Ve > 1)).mean()  # scalar
+				info.update({
+					f'model_diagnostics/ood/value_mean/{label}': vals.mean(),
+					f'model_diagnostics/ood/value_std_ve/{label}': std_ve,
+					f'model_diagnostics/ood/value_std_all/{label}': std_ve,  # Q has no dynamics axis
+				}, non_blocking=True)
+			else:
+				# V(f(z, a)): dynamics → value
+				z_next = self.next(z, action)  # float32[H, B, L]
+				H = z_next.shape[0]
+				z_next_flat = z_next.reshape(H * B, L)  # float32[H*B, L]
+				vals = self.V(z_next_flat, return_type='all_values')  # float32[Ve, H*B, 1]
+				Ve = vals.shape[0]
+				vals = vals.squeeze(-1).view(Ve, H, B)  # float32[Ve, H, B]
+
+				# std across value heads (dim=0), mean over H, B
+				std_ve = vals.std(dim=0, unbiased=(Ve > 1)).mean()  # scalar
+				# std across dynamics heads (dim=1), mean over Ve, B
+				std_h = vals.std(dim=1, unbiased=(H > 1)).mean()  # scalar
+				# std across all Ve*H combinations
+				vals_flat = vals.reshape(Ve * H, B)  # float32[Ve*H, B]
+				std_all = vals_flat.std(dim=0, unbiased=(Ve * H > 1)).mean()  # scalar
+
+				info.update({
+					f'model_diagnostics/ood/value_mean/{label}': vals.mean(),
+					f'model_diagnostics/ood/value_std_ve/{label}': std_ve,
+					f'model_diagnostics/ood/value_std_h/{label}': std_h,
+					f'model_diagnostics/ood/value_std_all/{label}': std_all,
+				}, non_blocking=True)
 
 		return info
 

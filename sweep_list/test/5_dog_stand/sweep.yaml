@@ -1,0 +1,50 @@
+# Sweep test/5: critic_type × local_td on dog-stand
+# 1 task × 2 critic types × 2 local_td × 2 seeds = 8 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    value: dog-stand
+  seed:
+    values: [1, 2]
+  steps:
+    value: 100000
+
+  # --- Sweep axes ---
+  critic_type:
+    values: ['V', 'Q']
+  local_td_bootstrap:
+    values: [true, false]
+
+  # --- Fixed settings (matching 18.1 baseline) ---
+  utd_ratio:
+    value: 1
+  value_update_freq:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 1
+  num_q:
+    value: 5
+  tau:
+    value: 0.01
+  consistency_coef:
+    value: 20
+  jacobian_correction_scale:
+    value: 0
+  buffer_update_interval:
+    value: -1
+  start_entropy_coeff:
+    value: 1e-4
+
+  # --- Standard defaults ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1

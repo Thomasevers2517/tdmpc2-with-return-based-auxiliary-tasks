@@ -72,7 +72,7 @@ class TDMPC2(torch.nn.Module):
 			{'params': self.model._dynamics_heads.parameters(), 'lr': lr_dynamics},
 			{'params': self.model._Rs.parameters(), 'lr': lr_reward},
 			{'params': self.model._termination.parameters() if self.cfg.episodic else [], 'lr': self.cfg.lr},
-			{'params': self.model._Vs.parameters(), 'lr': lr_value},
+			{'params': self.model._critic.parameters(), 'lr': lr_value},
 		]
 
 		log.info('Effective learning rates (ensemble_lr_scaling=%s):', ensemble_lr_scaling)
@@ -268,7 +268,7 @@ class TDMPC2(torch.nn.Module):
 		groups["reward"] = list(self.model._Rs.parameters())
 		if self.cfg.episodic:
 			groups["termination"] = list(self.model._termination.parameters())
-		groups["Vs"] = list(self.model._Vs.parameters())
+		groups["critic"] = list(self.model._critic.parameters())
 		groups["policy"] = list(self.model._pi.parameters())
 		return groups
 
@@ -290,10 +290,11 @@ class TDMPC2(torch.nn.Module):
 		return torch.sqrt(accum)
 
 	def calc_pi_losses(self, z_source, z_target, optimistic=False):
-		"""Compute SVG policy loss using V(s) with per-head dynamics.
+		"""Compute policy loss by maximizing critic estimate + entropy bonus.
 
-		Maximizes: r(z_target, a) + γ * V(next(z_target, a)) + entropy_bonus
-		where the action a is sampled from pi(z_source).
+		V path: critic_estimate = r̂(z, a) + γ · V(dynamics(z, a))
+		Q path: critic_estimate = Q(z, a)
+		Action a is sampled from π(z_source) in both cases.
 
 		Args:
 			z_source (Tensor[T+1, H, B, L]): Latents fed to the policy.
@@ -333,68 +334,89 @@ class TDMPC2(torch.nn.Module):
 
 			action, info = self.model.pi(z_src_expanded, optimistic=optimistic)  # float32[T, H*B*N, A]
 			A = action.shape[-1]
-			gamma = self.discount
-			gamma_scalar = float(self.discount)
-
-			# Reward r(z_target, a) from ALL R reward heads
-			z_rew_flat = z_tgt_expanded.view(T * B_eff * N, L)
-			a_rew_flat = action.view(T * B_eff * N, A)
-			reward_logits_all = self.model.reward(z_rew_flat, a_rew_flat, head_mode='all')  # float32[R, T*H*B*N, K]
-			R = reward_logits_all.shape[0]
-			reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H*B*N, 1]
-
-			# Dynamics with split_data=True — uses z_target
-			z_for_dyn = z_tgt_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
-			a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
-			next_z_all = self.model.next(z_for_dyn, a_for_dyn, split_data=True)  # float32[H, T*B*N, L]
-
-			# V(z') and reward/value stats for Q estimate
 			Ve = self.cfg.num_q
-			if self.cfg.value_per_dynamics:
-				G = Ve // H  # value heads per dynamics head
+			use_q = self.cfg.critic_type == 'Q'
+			vpd = self.cfg.value_per_dynamics
+			# critic_extra: optional per-head uncertainty & auxiliary stats for logging
+			critic_extra = {}
 
-				# Values: each Ve head sees its linked dynamics head's next_z
-				next_z_ve = next_z_all.repeat_interleave(G, dim=0)  # float32[Ve, T*B*N, L]
-				v_next_raw = self.model.V(next_z_ve, return_type='all_values', detach=True, split_data=True)
-				# v_next_raw: float32[Ve, T*B*N, 1]
-				v_next_flat = v_next_raw  # alias for logging
-
-				# Group by dynamics head: [Ve, T*B*N, 1] → [H, G, T*B*N, 1]
-				# Mean/std over G value heads only (pure value uncertainty per dynamics group)
-				v_grouped = v_next_raw.view(H, G, T * B * N, 1)               # float32[H, G, T*B*N, 1]
-				v_mean_per_h = v_grouped.mean(dim=1)                           # float32[H, T*B*N, 1]
-				v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))           # float32[H, T*B*N, 1]
-
-				# Rewards: mean/std over R reward heads only (per dynamics head)
-				reward_per_rh = reward_all.view(R, T, H, B * N, 1)              # float32[R, T, H, B*N, 1]
-				r_mean_per_h = reward_per_rh.mean(dim=0)                        # float32[T, H, B*N, 1]
-				r_std_per_h = reward_per_rh.std(dim=0, unbiased=(R > 1))        # float32[T, H, B*N, 1]
-
-				# Reshape [H, T*B*N, 1] → [T, H, B*N, 1] → [T*B_eff*N, 1]
-				v_mean = v_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-				v_std = v_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
-				reward_mean = r_mean_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
-				reward_std = r_std_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+			# ---- Evaluate critic: produces q_mean, q_std [T*B_eff*N, 1] ----
+			if use_q:
+				# Q path: direct Q(z_tgt, a) — no dynamics or reward model
+				if vpd:
+					z_tgt_h = z_tgt_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
+					a_h = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
+					_, q_mean_per_h, q_std_per_h = self.model.eval_critic_vpd(
+						z_tgt_h, action_h=a_h, return_type='all_values', detach=True)
+					# q_mean_per_h, q_std_per_h: float32[H, T*B*N, 1]
+					q_mean = q_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+					q_std = q_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+					critic_extra["pi_critic_std_per_dyn"] = q_std_per_h.mean()
+				else:
+					z_tgt_q_flat = z_tgt_expanded.view(T * B_eff * N, L)
+					a_q_flat = action.view(T * B_eff * N, A)
+					q_all = self.model.Q(z_tgt_q_flat, a_q_flat, return_type='all_values', detach=True)
+					# q_all: float32[Ve, T*B_eff*N, 1] — no reorder needed, T already varies slowest
+					q_mean = q_all.mean(dim=0)                           # float32[T*B_eff*N, 1]
+					q_std = q_all.std(dim=0, unbiased=(Ve > 1))
 			else:
-				next_z_flat = next_z_all.reshape(H * T * B * N, L)
-				v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
-				Ve = v_next_flat.shape[0]
-				v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
-				v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+				# V path: r̂(z, a) + γ · V(dynamics(z, a))
+				gamma = self.discount
 
-				v_mean = v_next_reord.mean(dim=0)                            # float32[T*H*B*N, 1]
-				v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))           # float32[T*H*B*N, 1]
+				# Reward from ALL R heads
+				z_rew_flat = z_tgt_expanded.view(T * B_eff * N, L)
+				a_rew_flat = action.view(T * B_eff * N, A)
+				reward_logits_all = self.model.reward(z_rew_flat, a_rew_flat, head_mode='all')  # float32[R, T*H*B*N, K]
+				R = reward_logits_all.shape[0]
+				reward_all = math.two_hot_inv(reward_logits_all, self.cfg)  # float32[R, T*H*B*N, 1]
 
-				reward_mean = reward_all.mean(dim=0)                         # float32[T*H*B*N, 1]
-				reward_std = reward_all.std(dim=0, unbiased=(R > 1))
+				# Dynamics: next_z per dynamics head
+				z_for_dyn = z_tgt_expanded.view(T, H, B * N, L).permute(1, 0, 2, 3).reshape(H, T * B * N, L)
+				a_for_dyn = action.view(T, H, B * N, A).permute(1, 0, 2, 3).reshape(H, T * B * N, A)
+				next_z_all = self.model.next(z_for_dyn, a_for_dyn, split_data=True)  # float32[H, T*B*N, L]
 
-			# Q estimate per sample
-			q_mean = reward_mean + gamma * v_mean
-			q_std = reward_std + gamma_scalar * v_std
+				if vpd:
+					v_next_raw, v_mean_per_h, v_std_per_h = self.model.eval_critic_vpd(
+						next_z_all, return_type='all_values', detach=True)
+					# v_next_raw: float32[Ve, T*B*N, 1], v_mean/std_per_h: float32[H, T*B*N, 1]
+
+					reward_per_rh = reward_all.view(R, T, H, B * N, 1)
+					r_mean_per_h = reward_per_rh.mean(dim=0)              # float32[T, H, B*N, 1]
+					r_std_per_h = reward_per_rh.std(dim=0, unbiased=(R > 1))
+
+					v_mean = v_mean_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+					v_std = v_std_per_h.view(H, T, B * N, 1).permute(1, 0, 2, 3).contiguous().view(T * B_eff * N, 1)
+					reward_mean = r_mean_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+					reward_std = r_std_per_h.view(T, H, B * N, 1).contiguous().view(T * B_eff * N, 1)
+
+					critic_extra["pi_critic_std_per_dyn"] = v_std_per_h.mean()
+					critic_extra["pi_r_std_per_dyn"] = r_std_per_h.mean()
+				else:
+					next_z_flat = next_z_all.reshape(H * T * B * N, L)
+					v_next_flat = self.model.V(next_z_flat, return_type='all_values', detach=True)  # float32[Ve, H*T*B*N, 1]
+					v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
+					v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
+
+					v_mean = v_next_reord.mean(dim=0)                     # float32[T*H*B*N, 1]
+					v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))
+
+					reward_mean = reward_all.mean(dim=0)                  # float32[T*H*B*N, 1]
+					reward_std = reward_all.std(dim=0, unbiased=(R > 1))
+
+					# Per-dyn-head value uncertainty (std over Ve for each H)
+					v_std_per_sample = v_next_per_h.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
+					critic_extra["pi_critic_std_per_dyn"] = v_std_per_sample.mean()
+					critic_extra["pi_r_std_per_dyn"] = reward_all.view(R, T, H, B * N, 1).std(dim=0, unbiased=(R > 1)).mean()
+
+				q_mean = reward_mean + gamma * v_mean
+				q_std = reward_std + gamma * v_std
+				critic_extra["pi_reward_mean"] = reward_all.mean()
+				critic_extra["pi_v_next_mean"] = v_next_raw.mean() if vpd else v_next_flat.mean()
+
+			# ---- Q estimate with pessimism/optimism, scaling, and loss ----
 			q_estimate_flat = q_mean + value_std_coef * q_std
 			q_estimate = q_estimate_flat.view(T, B_eff * N, 1)
 
-			# Scale and loss
 			if not optimistic:
 				self.q_scale.update(q_estimate[0])
 			q_scaled = self.q_scale(q_estimate)
@@ -407,7 +429,7 @@ class TDMPC2(torch.nn.Module):
 			objective = q_scaled + entropy_coeff * entropy_term
 			pi_loss = -(objective.mean(dim=(1, 2)) * rho_pows).mean()
 
-			# Logging (average over H and N)
+			# ---- Logging ----
 			info_entropy = info["entropy"].view(T, B_eff, N, 1).mean(dim=2)
 			info_scaled_entropy = info["scaled_entropy"].view(T, B_eff, N, 1).mean(dim=2)
 			info_true_entropy = info["true_entropy"].view(T, B_eff, N, 1).mean(dim=2)
@@ -438,54 +460,25 @@ class TDMPC2(torch.nn.Module):
 				"entropy_coeff": self.dynamic_entropy_coeff,
 				"entropy_coeff_effective": entropy_coeff,
 				"pi_q_estimate_mean": q_estimate_avg.mean(),
-				"pi_reward_mean": reward_all.mean(),
-				"pi_v_next_mean": v_next_flat.mean(),
 				"pi_q_std": q_std.mean(),
 				"pi_num_rollouts": float(N),
 			}, device=self.device)
 
-			# Per-dynamics-head uncertainty logging (value std over heads seeing same z)
-			if self.cfg.value_per_dynamics:
-				# v_std_per_h: per-sample value-head disagreement [H, T*B*N, 1]
-				v_std_struct = v_std_per_h.view(H, T, B, N, 1)              # float32[H, T, B, N, 1]
-				v_std_avg_n = v_std_struct.mean(dim=3)                       # float32[H, T, B, 1]
-				info.update({
-					"pi_v_std_per_dyn": v_std_per_h.mean(),
-					"pi_r_std_per_dyn": r_std_per_h.mean(),
-				})
-			else:
-				# v_next_per_h: float32[Ve, H, T*B*N, 1] — std over Ve per dyn head
-				v_std_per_sample = v_next_per_h.std(dim=0, unbiased=(Ve > 1))  # float32[H, T*B*N, 1]
-				v_std_struct = v_std_per_sample.view(H, T, B, N, 1)            # float32[H, T, B, N, 1]
-				v_std_avg_n = v_std_struct.mean(dim=3)                         # float32[H, T, B, 1]
-				info.update({
-					"pi_v_std_per_dyn": v_std_per_sample.mean(),
-					"pi_r_std_per_dyn": reward_all.view(R, T, H, B * N, 1).std(dim=0, unbiased=(R > 1)).mean(),
-				})
+			# Critic-specific extra stats (reward/value breakdown for V, per-dyn std, etc.)
+			info.update(critic_extra)
 
-			# Distribution of value-head disagreement across sample dimensions
-			# v_std_avg_n: [H, T, B, 1] — per-sample value-head std, averaged over N
+			# Critic estimate variation across batch, time, rollouts
+			q_mean_struct = q_mean.view(T, H, B, N, 1)
+			q_mean_avg_n = q_mean_struct.mean(dim=3)  # float32[T, H, B, 1]
 			info.update({
-				# Std-of-std over batch: concentrated (few high-disagreement samples) vs uniform
-				"pi_v_std_std_across_batch": v_std_avg_n.std(dim=2).mean(),
-				# Coefficient of variation: scale-invariant uncertainty (disagreement / |value|)
-				"pi_v_relative_std": (v_std / (v_mean.abs() + 1e-6)).mean(),
+				"pi_critic_std_across_batch": q_mean_avg_n.std(dim=2).mean(),
+				"pi_critic_std_across_time": q_mean_avg_n.std(dim=0).mean(),
+				"pi_critic_relative_std": (q_std / (q_mean.abs() + 1e-6)).mean(),
 			})
 
-			# Variance across N policy rollouts (action sampling uncertainty)
 			if N > 1:
-				q_with_n = q_estimate.view(T, H * B, N, 1)  # float32[T, H*B, N, 1]
-				info.update({
-					"pi_q_std_across_rollouts": q_with_n.std(dim=2).mean(),
-				})
-
-			# Value variation across batch and time dimensions
-			v_mean_struct = v_mean.view(T, H, B, N, 1)  # float32[T, H, B, N, 1]
-			v_mean_avg_n = v_mean_struct.mean(dim=3)     # float32[T, H, B, 1] — avg over N
-			info.update({
-				"pi_v_std_across_batch": v_mean_avg_n.std(dim=2).mean(),  # std over B, avg over T,H
-				"pi_v_std_across_time": v_mean_avg_n.std(dim=0).mean(),   # std over T, avg over H,B
-			})
+				q_with_n = q_estimate.view(T, H * B, N, 1)
+				info["pi_q_std_across_rollouts"] = q_with_n.std(dim=2).mean()
 
 			return pi_loss, info
 
@@ -573,7 +566,6 @@ class TDMPC2(torch.nn.Module):
 		R = reward.shape[1]
 		Ve = self.cfg.num_q
 		discount = self.discount
-		discount_scalar = float(self.discount)
 		std_coef = float(self.cfg.td_target_std_coef)
 
 		if self.cfg.value_per_dynamics:
@@ -615,7 +607,7 @@ class TDMPC2(torch.nn.Module):
 				td_h = (
 					r_mean_h.permute(1, 0, 2, 3)
 					+ discount * (1 - terminated_h.permute(1, 0, 2, 3)) * v_mean_group
-					+ std_coef * (r_std_h.permute(1, 0, 2, 3) + discount_scalar * v_std_group)
+					+ std_coef * (r_std_h.permute(1, 0, 2, 3) + discount * v_std_group)
 				)  # float32[H, T, B, 1]
 
 				# Expand back to Ve (all G heads in a group get same target)
@@ -664,7 +656,7 @@ class TDMPC2(torch.nn.Module):
 				v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
 
 				td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
-				td_std_per_h = r_std_per_h + discount_scalar * v_std_per_h
+				td_std_per_h = r_std_per_h + discount * v_std_per_h
 				td_per_h = td_mean_per_h + std_coef * td_std_per_h
 
 				dyn_reduction = self.cfg.td_target_dynamics_reduction
@@ -910,126 +902,205 @@ class TDMPC2(torch.nn.Module):
 			'termination_logits': term_logits.detach(),
 		}
 
-	def calculate_value_loss(self, z_true, z_rollout):
-		"""Compute primary critic loss with proper rho weighting.
+	def calculate_value_loss(self, z_true, z_rollout, action=None, reward=None, terminated=None):
+		"""Compute critic loss (V or Q) with rho weighting over replay steps.
 
-		critic_source selects latents for V predictions; critic_target_source selects
-		the starting latents for the imagined TD-target rollout.
+		V path: V predictions on critic_source states; TD targets from imagined
+		rollouts starting at critic_target_source states.
+		Q path: Q predictions on critic_source states paired with buffer actions;
+		TD targets from replay buffer transitions with Q_target bootstrap.
+
+		Both branches produce critic_logits [Ve, S, M, K] and td_targets
+		[Ve, S, M, 1], where M folds any extra dimensions (T_imag*BN for V,
+		B_q for Q). The shared tail computes soft_ce loss and logging.
 
 		Args:
-			z_true (Tensor[S, B, L]): True encoded states from encoder.
-			z_rollout (Tensor[S, H, B, L]): Dynamics rollout from all H heads.
+			z_true (Tensor[S_full, B, L]): True encoded states from encoder.
+			z_rollout (Tensor[S_full, H, B, L]): Dynamics rollout from all H heads.
+			action (Tensor[S_full-1, B, A], optional): Replay buffer actions (Q only).
+			reward (Tensor[S_full-1, B, 1], optional): Replay buffer rewards (Q only).
+			terminated (Tensor[S_full-1, B, 1], optional): Replay buffer terminations (Q only).
 
 		Returns:
-			Tuple[Tensor, TensorDict, dict]: (loss, info, imagined_data).
+			Tuple[Tensor, TensorDict]: (loss, info).
 		"""
-		S, B, L = z_true.shape
-		device = z_true.device
-		dtype = z_true.dtype
-		K = self.cfg.num_bins
-		N = int(self.cfg.num_rollouts)
-		R = int(self.cfg.num_reward_heads)
-		T_imag = int(self.cfg.imagination_horizon)
+		S_full, B, L = z_true.shape
+		device, dtype = z_true.device, z_true.dtype
+		K, Ve = self.cfg.num_bins, self.cfg.num_q
+		vpd = self.cfg.value_per_dynamics
+		use_q = self.cfg.critic_type == 'Q'
+		use_vpd_split = vpd and self.cfg.critic_source == 'replay_rollout'
+		critic_extra = {}
 
+		# ---- Critic predictions & TD targets ----
+		# Both branches produce:
+		#   critic_logits [Ve, S, M, K]  — distributional logits
+		#   td_targets    [Ve, S, M, 1]  — TD target values
+		#   td_mean, td_std              — for logging (any shape, .mean() reduces)
+
+		if use_q:
+			# Q path: replay buffer TD targets, no imagination
+			S = S_full - 1  # number of transitions
+			A = action.shape[-1]
+
+			# Q predictions on critic_source states paired with buffer actions
+			z_rollout_s = z_rollout[:-1]  # float32[S, H, B, L]
+			z_true_s = z_true[:-1]        # float32[S, B, L]
+
+			if use_vpd_split:
+				H_rollout = z_rollout_s.shape[1]
+				G = Ve // H_rollout
+				z_for_q_ve = z_rollout_s.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
+				z_flat = z_for_q_ve.permute(1, 0, 2, 3).contiguous().view(Ve, S * B, L)
+				a_flat = action.unsqueeze(0).expand(Ve, S, B, A).contiguous().view(Ve, S * B, A)
+				qs_logits = self.model.Q(z_flat, a_flat, return_type='all', split_data=True)
+				critic_logits = qs_logits.view(Ve, S, B, K)
+				B_q = B
+			else:
+				if self.cfg.critic_source == 'replay_rollout':
+					z_for_q = self._apply_head_strategy(z_rollout_s)
+				else:
+					z_for_q = z_true_s
+				B_q = z_for_q.shape[1]
+				if B_q != B:
+					H_mult = B_q // B
+					action_tiled = action.unsqueeze(1).expand(S, H_mult, B, A).reshape(S, B_q, A)
+				else:
+					action_tiled = action
+				z_flat = z_for_q.reshape(S * B_q, L)
+				a_flat = action_tiled.reshape(S * B_q, A)
+				qs_logits = self.model.Q(z_flat, a_flat, return_type='all')
+				critic_logits = qs_logits.view(Ve, S, B_q, K)
+
+			# TD targets from replay buffer
+			with maybe_range('Value/td_target', self.cfg):
+				with torch.no_grad():
+					next_z = z_true[1:].detach()  # float32[S, B, L]
+					next_z_flat = next_z.reshape(S * B, L)
+					next_a, _ = self.model.pi(next_z_flat, target=self.cfg.td_target_use_ema_policy)
+					q_boot_logits = self.model.Q(next_z_flat, next_a, return_type='all', target=True)
+					q_boot = math.two_hot_inv(q_boot_logits, self.cfg).view(Ve, S, B, 1)
+
+					discount = self.discount
+					std_coef = float(self.cfg.td_target_std_coef)
+					if self.cfg.local_td_bootstrap:
+						td_targets = reward.unsqueeze(0) + discount * (1 - terminated.unsqueeze(0)) * q_boot
+					else:
+						q_boot_mean = q_boot.mean(dim=0)
+						q_boot_std = q_boot.std(dim=0, unbiased=(Ve > 1))
+						td_scalar = reward + discount * (1 - terminated) * (q_boot_mean + std_coef * q_boot_std)
+						td_targets = td_scalar.unsqueeze(0).expand(Ve, S, B, 1)
+
+					td_mean = td_targets.mean(dim=0)  # float32[S, B, 1]
+					td_std = td_targets.std(dim=0, unbiased=(Ve > 1))
+
+					# Tile targets if B_q > B (concat head strategy)
+					if B_q != B:
+						H_mult = B_q // B
+						td_targets = td_targets.unsqueeze(2).expand(Ve, S, H_mult, B, 1).reshape(Ve, S, B_q, 1)
+						td_mean = td_mean.unsqueeze(1).expand(S, H_mult, B, 1).reshape(S, B_q, 1)
+						td_std = td_std.unsqueeze(1).expand(S, H_mult, B, 1).reshape(S, B_q, 1)
+
+		else:
+			# V path: imagined rollout TD targets
+			S = S_full  # V predictions at all S states
+			N = int(self.cfg.num_rollouts)
+			R = int(self.cfg.num_reward_heads)
+			T_imag = int(self.cfg.imagination_horizon)
+
+			# Select latents for V predictions
+			if not use_vpd_split:
+				if self.cfg.critic_source == 'replay_rollout':
+					z_for_v = self._apply_head_strategy(z_rollout)
+				else:
+					z_for_v = z_true
+				B_v = z_for_v.shape[1]
+
+			# Imagination rollout for TD targets
+			if self.cfg.critic_target_source == 'replay_true':
+				start_z = z_true.detach()
+			else:
+				raise NotImplementedError("critic_target_source='replay_rollout' is not implemented yet.")
+
+			imagined = self.imagined_rollout(
+				start_z, rollout_len=T_imag,
+				use_target_policy=self.cfg.td_target_use_ema_policy,
+			)
+			H = imagined['z_seq'].shape[1]
+			BN = B * N
+			z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B, N, L)
+			rewards_imag = imagined['rewards'].view(T_imag, R, H, S, B, N, 1).detach()
+			terminated_imag = imagined['terminated'].view(T_imag, H, S, B, N, 1).detach()
+
+			# V predictions on critic_source states
+			if use_vpd_split:
+				H_rollout = z_rollout.shape[1]
+				G = Ve // H_rollout
+				z_for_v_ve = z_rollout.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
+				z_exp = z_for_v_ve.unsqueeze(0).unsqueeze(4).expand(T_imag, S, Ve, B, N, L)
+				z_flat = z_exp.permute(2, 0, 1, 3, 4, 5).contiguous().view(Ve, T_imag * S * B * N, L)
+				vs_flat = self.model.V(z_flat, return_type='all', split_data=True)
+				B_v = B
+				BN_v = BN
+				vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
+			else:
+				BN_v = B_v * N
+				z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
+				z_for_v_flat = z_for_v_expanded.reshape(T_imag * S * BN_v, L)
+				vs_flat = self.model.V(z_for_v_flat, return_type='all')
+				vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
+
+			# TD targets from imagined next states
+			with maybe_range('Value/td_target', self.cfg):
+				with torch.no_grad():
+					next_z = z_seq[1:]
+					next_z_flat = next_z.view(T_imag, H, S * BN, L)
+					rewards_flat = rewards_imag.view(T_imag, R, H, S * BN, 1)
+					terminated_flat = terminated_imag.view(T_imag, H, S * BN, 1)
+
+					td_targets_4d, td_mean_4d, td_std_4d = self._td_target(next_z_flat, rewards_flat, terminated_flat)
+					td_targets_4d = td_targets_4d.view(Ve, T_imag, S, BN, 1)
+					td_mean = td_mean_4d.view(T_imag, S, BN, 1)
+					td_std = td_std_4d.view(T_imag, S, BN, 1)
+
+					# Tile if B_v > B (concat strategy without vpd)
+					if BN_v != BN:
+						H_mult = BN_v // BN
+						td_targets_4d = td_targets_4d.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)
+						td_mean = td_mean.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
+						td_std = td_std.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
+
+			# V-specific logging before reshaping (needs N dimension)
+			if self.log_detailed:
+				td_with_n = td_targets_4d.view(Ve, T_imag, S, B_v, N, 1)
+				critic_extra['td_target_std_across_rollouts'] = td_with_n.std(dim=4).mean()
+
+			# Reshape [Ve, T_imag, S, BN_v, ...] → [Ve, S, T_imag*BN_v, ...] to match Q contract
+			critic_logits = vs.permute(0, 2, 1, 3, 4).contiguous().view(Ve, S, T_imag * BN_v, K)
+			td_targets = td_targets_4d.permute(0, 2, 1, 3, 4).contiguous().view(Ve, S, T_imag * BN_v, 1)
+
+
+		# ---- Cross-entropy loss ----
 		rho_pows = torch.pow(self.cfg.rho, torch.arange(S, device=device, dtype=dtype))
 		if self.cfg.normalize_rho_weights:
 			rho_pows = rho_pows / rho_pows.sum()
 
-		vpd = self.cfg.value_per_dynamics
-		Ve = self.cfg.num_q
-
-		# Select latents for V predictions based on critic_source
-		# When value_per_dynamics + replay_rollout, each Ve head sees its dynamics head's latent
-		use_vpd_split = vpd and self.cfg.critic_source == 'replay_rollout'
-
-		if not use_vpd_split:
-			if self.cfg.critic_source == 'replay_rollout':
-				z_for_v = self._apply_head_strategy(z_rollout)  # float32[S, B_v, L]
-			else:  # replay_true
-				z_for_v = z_true  # float32[S, B, L]
-			B_v = z_for_v.shape[1]
-
-		# Select starting latents for TD-target imagination
-		if self.cfg.critic_target_source == 'replay_true':
-			start_z = z_true.detach()
-		else:  # replay_rollout
-			raise NotImplementedError("critic_target_source='replay_rollout' is not implemented yet. Use 'replay_true' or implement rollout-based targets.")
-			start_z = self._apply_head_strategy(z_rollout).detach()
-
-		# Imagination rollout for TD targets
-		imagined = self.imagined_rollout(
-			start_z,
-			rollout_len=T_imag,
-			use_target_policy=self.cfg.td_target_use_ema_policy,
-		)
-
-		H = imagined['z_seq'].shape[1]
-		BN = B * N
-
-		z_seq = imagined['z_seq'].view(T_imag + 1, H, S, B, N, L)
-		rewards = imagined['rewards'].view(T_imag, R, H, S, B, N, 1)
-		terminated = imagined['terminated'].view(T_imag, H, S, B, N, 1)
-		rewards = rewards.detach()
-		terminated = terminated.detach()
-
-		# V predictions on critic_source states
-		if use_vpd_split:
-			# value_per_dynamics: expand z_rollout H→Ve, call V with split_data
-			H_rollout = z_rollout.shape[1]
-			G = Ve // H_rollout  # value heads per dynamics head
-			z_for_v_ve = z_rollout.repeat_interleave(G, dim=1)  # float32[S, Ve, B, L]
-			z_exp = z_for_v_ve.unsqueeze(0).unsqueeze(4).expand(T_imag, S, Ve, B, N, L)
-			# Rearrange to [Ve, T_imag*S*BN, L] for split_data call
-			z_flat = z_exp.permute(2, 0, 1, 3, 4, 5).contiguous().view(Ve, T_imag * S * B * N, L)
-			vs_flat = self.model.V(z_flat, return_type='all', split_data=True)  # float32[Ve, T_imag*S*BN, K]
-			B_v = B
-			BN_v = BN
-			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
-		else:
-			BN_v = B_v * N
-			z_for_v_expanded = z_for_v.unsqueeze(0).unsqueeze(3).expand(T_imag, S, B_v, N, L)
-			z_for_v_merged = z_for_v_expanded.reshape(T_imag, S, BN_v, L)
-			z_for_v_flat = z_for_v_merged.reshape(T_imag * S * BN_v, L)
-			vs_flat = self.model.V(z_for_v_flat, return_type='all')  # float32[Ve, T_imag*S*BN_v, K]
-			vs = vs_flat.view(Ve, T_imag, S, BN_v, K)
-
-		# TD targets from imagined next states
-		with maybe_range('Value/td_target', self.cfg):
-			with torch.no_grad():
-				next_z = z_seq[1:]
-				next_z_flat = next_z.view(T_imag, H, S * BN, L)
-				rewards_flat = rewards.view(T_imag, R, H, S * BN, 1)
-				terminated_flat = terminated.view(T_imag, H, S * BN, 1)
-
-				td_targets_flat, td_mean_flat, td_std_flat = self._td_target(next_z_flat, rewards_flat, terminated_flat)
-				td_targets = td_targets_flat.view(Ve, T_imag, S, BN, 1)
-				td_mean = td_mean_flat.view(T_imag, S, BN, 1)
-				td_std = td_std_flat.view(T_imag, S, BN, 1)
-
-				# When B_v > B (concat strategy without vpd), tile TD targets
-				if BN_v != BN:
-					H_mult = BN_v // BN
-					td_targets = td_targets.unsqueeze(3).expand(Ve, T_imag, S, H_mult, BN, 1).reshape(Ve, T_imag, S, BN_v, 1)
-					td_mean = td_mean.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
-					td_std = td_std.unsqueeze(2).expand(T_imag, S, H_mult, BN, 1).reshape(T_imag, S, BN_v, 1)
-
-		# Cross-entropy loss
+		M = critic_logits.shape[2]
 		with maybe_range('Value/ce', self.cfg):
-			vs_flat_ce = vs.contiguous().view(Ve * T_imag * S * BN_v, K)
-			td_flat_ce = td_targets.contiguous().view(Ve * T_imag * S * BN_v, 1)
-			val_ce_flat = math.soft_ce(vs_flat_ce, td_flat_ce, self.cfg)
-			val_ce = val_ce_flat.view(Ve, T_imag, S, BN_v)
+			critic_flat = critic_logits.reshape(Ve * S * M, K)
+			td_flat = td_targets.reshape(Ve * S * M, 1)
+			val_ce_flat = math.soft_ce(critic_flat, td_flat, self.cfg)
+			val_ce = val_ce_flat.view(Ve, S, M)
 
-		val_ce_per_s = val_ce.mean(dim=(0, 1, 3))
-		weighted = val_ce_per_s * rho_pows
-		loss = weighted.mean()
+		val_ce_per_s = val_ce.mean(dim=(0, 2))  # float32[S]
+		loss = (val_ce_per_s * rho_pows).mean()
 
-		# Logging
+		# ---- Logging ----
 		info = TensorDict({'value_loss': loss}, device=device, non_blocking=True)
 		for s in range(S):
-			info.update({f'value_loss/replay_step{s}': val_ce_per_s[s]}, non_blocking=True)
+			info[f'value_loss/replay_step{s}'] = val_ce_per_s[s]
 
-		value_pred = math.two_hot_inv(vs, self.cfg)
+		value_pred = math.two_hot_inv(critic_logits, self.cfg)  # float32[Ve, S, M, 1]
 		info.update({'td_target_mean': td_mean.mean(), 'td_target_std': td_std.mean()}, non_blocking=True)
 
 		if self.log_detailed:
@@ -1043,23 +1114,17 @@ class TDMPC2(torch.nn.Module):
 				'value_pred_min': value_pred.min(),
 				'value_pred_max': value_pred.max(),
 			}, non_blocking=True)
-			td_targets_with_n = td_targets.view(Ve, T_imag, S, B_v, N, 1)
-			info.update({'td_target_std_across_rollouts': td_targets_with_n.std(dim=4).mean()}, non_blocking=True)
 
-		value_error = value_pred - td_targets
+		value_error = value_pred - td_targets  # float32[Ve, S, M, 1]
 		for s in range(S):
 			info.update({
-				f'value_error_abs_mean/replay_step{s}': value_error[:, :, s].abs().mean(),
-				f'value_error_std/replay_step{s}': value_error[:, :, s].std(),
-				f'value_error_max/replay_step{s}': value_error[:, :, s].abs().max(),
+				f'value_error_abs_mean/replay_step{s}': value_error[:, s].abs().mean(),
+				f'value_error_std/replay_step{s}': value_error[:, s].std(),
+				f'value_error_max/replay_step{s}': value_error[:, s].abs().max(),
 			}, non_blocking=True)
 
-		imagined_data = {
-			'z_seq': z_seq,
-			'rewards': rewards,
-			'terminated': terminated,
-		}
-		return loss, info, imagined_data
+		info.update(critic_extra)
+		return loss, info
 
 	def _apply_head_strategy(self, z_hb):
 		"""Collapse H dim from [S, H, B, L] → [S, B_v, L] per rollout_head_strategy."""
@@ -1122,7 +1187,14 @@ class TDMPC2(torch.nn.Module):
 
 		if update_value:
 			assert z_rollout is not None, "Value loss requires z_rollout (update_world_model must be True when update_value is True)"
-			value_loss, value_info, imagined_data = self.calculate_value_loss(z_true, z_rollout)
+			# Only pass replay buffer tensors for Q — unused tensors in the compiled
+			# graph cause "element 0 does not require grad" in the inductor backend.
+			if self.cfg.critic_type == 'Q':
+				value_loss, value_info = self.calculate_value_loss(
+					z_true, z_rollout, action=action, reward=reward, terminated=terminated,
+				)
+			else:
+				value_loss, value_info = self.calculate_value_loss(z_true, z_rollout)
 		else:
 			value_loss = torch.zeros((), device=device)
 			value_info = TensorDict({}, device=device)
@@ -1130,16 +1202,6 @@ class TDMPC2(torch.nn.Module):
 		info = TensorDict({}, device=device)
 		info.update(wm_info, non_blocking=True)
 		info.update(value_info, non_blocking=True)
-
-		if self.log_detailed:
-			# Model diagnostics: V(z_true) vs V(z_rollout) + distributional entropy
-			info.update(
-				self.model.model_diagnostics(
-					z_true.detach(),     # float32[T+1, B, L]
-					z_rollout.detach(),  # float32[T+1, H, B, L]
-				),
-				non_blocking=True,
-			)
 
 		critic_weighted = self.cfg.value_coef * value_loss * self.cfg.imagine_value_loss_coef_mult
 		total_loss = wm_loss + critic_weighted
@@ -1188,6 +1250,17 @@ class TDMPC2(torch.nn.Module):
 
 			total_loss.backward()
 
+			# Model diagnostics (outside compiled graph to avoid graph breaks)
+			if self.log_detailed:
+				info.update(
+					self.model.model_diagnostics(
+						z_true.detach(),
+						z_rollout.detach(),
+						action.detach(),
+					),
+					non_blocking=True,
+				)
+
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 
 			self.optim_step()
@@ -1217,7 +1290,7 @@ class TDMPC2(torch.nn.Module):
 
 			# Soft updates
 			if update_value:
-				self.model.soft_update_target_V()
+				self.model.soft_update_target_critic()
 			if update_pi:
 				self.model.soft_update_target_pi()
 
