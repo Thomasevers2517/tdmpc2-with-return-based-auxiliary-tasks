@@ -192,4 +192,11 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	if policy_ema_tau_val is None or policy_ema_tau_val == 'None':
 		cfg.policy_ema_tau = cfg.tau
 
+	# ----------------------------------------------------------------------
+	# planner_subsample_value_heads inheritance: if null, inherit from red_q_style_value
+	# ----------------------------------------------------------------------
+	planner_sub_val = cfg.get('planner_subsample_value_heads')
+	if planner_sub_val is None or planner_sub_val == 'None':
+		cfg.planner_subsample_value_heads = cfg.red_q_style_value
+
 	return cfg_to_dataclass(cfg)

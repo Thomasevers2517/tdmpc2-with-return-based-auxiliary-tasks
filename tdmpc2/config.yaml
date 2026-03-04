@@ -32,13 +32,13 @@ dropout: 0.01
 encoder_dropout: 0.0  # When > 0, encodes twice (train + eval mode for stable targets)
 
 # --- Ensemble sizes & per-head architecture ---
-planner_num_dynamics_heads: 4
+planner_num_dynamics_heads: 1
 # How z_rollout uses dynamics heads for value/policy training:
 #   single: head-0 only (legacy, B unchanged)
 #   concat: all H heads concatenated into batch (B_eff = H*B, more data)
 #   split:  batch divided among heads (B_eff = B, each chunk from different head)
 rollout_head_strategy: split
-num_q: 8
+num_q: 5
 num_reward_heads: 1
 dynamics_num_layers: 2
 dynamics_dropout: 0.0
@@ -60,21 +60,21 @@ lr: 3e-4
 optimizer_type: adamw  # 'adam' or 'adamw'
 weight_decay: 0  # Weight decay for AdamW (ignored for Adam)
 grad_clip_norm: 20
-tau: 0.003  # EMA rate for target networks
+tau: 0.01  # EMA rate for target networks
 enc_lr_scale: 0.3
 # Encoder LR step-change schedule:
 #   At (1 - enc_lr_step_ratio) * steps, encoder LR *= enc_lr_step_scale.
 enc_lr_step_ratio: 0.5   # Fraction of training after which to step-change LR
 enc_lr_step_scale: 1      # Multiplier for encoder LR after step (0.0 = freeze)
 pi_lr_scale: 1             # Policy LR = lr * pi_lr_scale
-ensemble_lr_scaling: true  # Scale head LRs by ensemble size to compensate for mean-reduced gradients
+ensemble_lr_scaling: false  # Scale head LRs by ensemble size to compensate for mean-reduced gradients
 
 # ===========================================================================
 #  4. Training Loop (update frequencies)
 # ===========================================================================
 batch_size: 256
-utd_ratio: 4               # World model updates per environment step
-value_update_freq: 2        # Value updates per env step. -1 = same as utd_ratio.
+utd_ratio: 1               # World model updates per environment step
+value_update_freq: 1        # Value updates per env step. -1 = same as utd_ratio.
 pi_update_freq: 1           # Policy updates per env step.
 
 # ===========================================================================
@@ -88,7 +88,7 @@ rho: 0.5
 final_rho: -1  # if >0, overrides rho schedule so end-of-horizon discount = final_rho. -1 = disabled.
 
 # --- Critic type ---
-critic_type: V  # 'V' (state-value) or 'Q' (action-value)
+critic_type: Q  # 'V' (state-value) or 'Q' (action-value)
 planner_q_candidate_action: false  # Q bootstrap: false → Q(z_T, π(z_T)), true → Q(z_{T-1}, a_{T-1}). Only for critic_type=Q.
 critic_source: replay_rollout       # 'replay_rollout' (dynamics-predicted z) or 'replay_true' (encoder z) for V predictions.
 critic_target_source: replay_true    # 'replay_rollout' or 'replay_true' for imagination start states (TD targets).
@@ -96,9 +96,10 @@ actor_source: replay_rollout          # 'replay_rollout' or 'replay_true': which
 actor_rollout_source: replay_rollout  # 'replay_rollout' or 'replay_true': which z the 1-step dynamics starts from in SVG.
 
 # --- TD targets ---
-local_td_bootstrap: true  # Local: each value head bootstraps itself. Global: all heads get same target.
+local_td_bootstrap: false  # Local: each value head bootstraps itself. Global: all heads get same target.
 td_target_std_coef: 0     # TD = mu + std_coef * sigma. Also accepts "opt"/"pess" strings.
 td_target_dynamics_reduction: mean  # "from_std_coef" | "min" | "max" | "mean"
+red_q_style_value: true  # RedQ-style: subsample 2 value heads everywhere. TD target: min-of-2. Planner & policy: avg-of-2.
 td_target_use_ema_policy: false
 value_std_coef_default: 1.0  # Default magnitude for "opt"/"pess" string values of std_coef.
 n_mc_samples_target: 1
@@ -110,7 +111,7 @@ ema_value_planning: false
 # ===========================================================================
 #  6. Loss Coefficients
 # ===========================================================================
-consistency_coef: 10
+consistency_coef: 20
 reward_coef: 0.1
 value_coef: 0.1
 policy_coef: 1
@@ -133,7 +134,7 @@ entropy_action_dim_power: 1.0
 
 # Jacobian correction for tanh squashing:
 #   1.0 = mathematically correct, 0.0 = legacy TD-MPC2 (no Jacobian)
-jacobian_correction_scale: 1.0
+jacobian_correction_scale: 0.0
 
 # Entropy schedule
 dynamic_entropy_schedule: exponential  # linear | exponential
@@ -167,14 +168,15 @@ planner_value_std_coef_train: 0
 planner_value_std_coef_eval: 0
 planner_aggregate_value: false
 planner_lambda_disagreement: 0
+planner_subsample_value_heads: null  # null = inherit from red_q_style_value. true = subsample 2 heads & avg. false = avg all heads.
 planner_policy_elites_first_iter_only: false
 
 # ===========================================================================
 #  9. Exploration & Rollouts
 # ===========================================================================
 num_rollouts: 1
-buffer_update_interval: 1
-train_act_std_coeff: 0
+buffer_update_interval: -1
+train_act_std_coeff: 1
 policy_seed_noise_std: 0.05
 planner_action_noise_std: 0.0
 greedy_train_action_selection: false
@@ -183,7 +185,7 @@ greedy_train_action_selection: false
 # 10. Evaluation
 # ===========================================================================
 checkpoint: ???
-eval_episodes: 5
+eval_episodes: 10
 eval_freq: 10000
 eval_mean_head_reduce: false
 # Target steps per eval episode for episodic tasks.  When > 0 and episodic=true,
@@ -241,7 +243,7 @@ dual_policy_enabled: false
 optimistic_policy_value_std_coef: 1
 optimistic_entropy_mult: 1
 
-normalize_rho_weights: true
+normalize_rho_weights: false
 
 # ===========================================================================
 # 14. Environment-Specific

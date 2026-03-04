@@ -134,8 +134,15 @@ def compute_values(
         v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
         v_all = v_all.view(Ve, H, B, N, T)
 
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T]
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
+        if cfg.planner_subsample_value_heads:
+            # RedQ-style: subsample 2 value heads, take mean
+            idx = torch.randperm(Ve, device=device)[:2]  # int64[2]
+            v_sub = v_all[idx]  # float32[2, H, B, N, T]
+            v_mean_per_h = v_sub.mean(dim=0)  # float32[H, B, N, T]
+            v_std_per_h = v_sub.std(dim=0)  # float32[H, B, N, T]
+        else:
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T]
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
     else:
         # Single horizon: bootstrap at one state
         if q_use_candidate:
@@ -158,8 +165,15 @@ def compute_values(
         v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
         v_all = v_all.view(Ve, H, B, N)
 
-        v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N]
-        v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
+        if cfg.planner_subsample_value_heads:
+            # RedQ-style: subsample 2 value heads, take mean
+            idx = torch.randperm(Ve, device=device)[:2]  # int64[2]
+            v_sub = v_all[idx]  # float32[2, H, B, N]
+            v_mean_per_h = v_sub.mean(dim=0)  # float32[H, B, N]
+            v_std_per_h = v_sub.std(dim=0)  # float32[H, B, N]
+        else:
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N]
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
 
     # =========== STEP 3: Compute returns ===========
     if aggregate_horizon:

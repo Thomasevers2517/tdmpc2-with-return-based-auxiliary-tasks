@@ -345,9 +345,16 @@ class TDMPC2(torch.nn.Module):
 				z_tgt_q_flat = z_tgt_expanded.view(T * B_eff * N, L)
 				a_q_flat = action.view(T * B_eff * N, A)
 				q_all = self.model.Q(z_tgt_q_flat, a_q_flat, return_type='all_values', detach=True)
-				# q_all: float32[Ve, T*B_eff*N, 1] — no reorder needed, T already varies slowest
-				q_mean = q_all.mean(dim=0)                           # float32[T*B_eff*N, 1]
-				q_std = q_all.std(dim=0, unbiased=(Ve > 1))
+				# q_all: float32[Ve, T*B_eff*N, 1]
+				if self.cfg.red_q_style_value:
+					# RedQ-style: subsample 2 Q heads, take mean
+					idx = torch.randperm(Ve, device=q_all.device)[:2]  # int64[2]
+					q_sub = q_all[idx]  # float32[2, T*B_eff*N, 1]
+					q_mean = q_sub.mean(dim=0)  # float32[T*B_eff*N, 1]
+					q_std = q_sub.std(dim=0)  # float32[T*B_eff*N, 1]
+				else:
+					q_mean = q_all.mean(dim=0)                           # float32[T*B_eff*N, 1]
+					q_std = q_all.std(dim=0, unbiased=(Ve > 1))
 			else:
 				# V path: r̂(z, a) + γ · V(dynamics(z, a))
 				gamma = self.discount
@@ -369,8 +376,15 @@ class TDMPC2(torch.nn.Module):
 				v_next_per_h = v_next_flat.view(Ve, H, T * B * N, 1)
 				v_next_reord = v_next_per_h.view(Ve, H, T, B * N, 1).permute(0, 2, 1, 3, 4).reshape(Ve, T * B_eff * N, 1)
 
-				v_mean = v_next_reord.mean(dim=0)                     # float32[T*H*B*N, 1]
-				v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))
+				if self.cfg.red_q_style_value:
+					# RedQ-style: subsample 2 value heads, take mean
+					idx = torch.randperm(Ve, device=v_next_reord.device)[:2]  # int64[2]
+					v_sub = v_next_reord[idx]  # float32[2, T*B_eff*N, 1]
+					v_mean = v_sub.mean(dim=0)  # float32[T*B_eff*N, 1]
+					v_std = v_sub.std(dim=0)  # float32[T*B_eff*N, 1]
+				else:
+					v_mean = v_next_reord.mean(dim=0)                     # float32[T*H*B*N, 1]
+					v_std = v_next_reord.std(dim=0, unbiased=(Ve > 1))
 
 				reward_mean = reward_all.mean(dim=0)                  # float32[T*H*B*N, 1]
 				reward_std = reward_all.std(dim=0, unbiased=(R > 1))
@@ -573,8 +587,16 @@ class TDMPC2(torch.nn.Module):
 			# GLOBAL: All Ve heads get same target
 			r_mean_per_h = reward.mean(dim=1)
 			r_std_per_h = reward.std(dim=1, unbiased=(R > 1))
-			v_mean_per_h = v_values.mean(dim=0)
-			v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
+
+			if self.cfg.red_q_style_value:
+				# RedQ-style: subsample 2 value heads, take min (pessimistic)
+				idx = torch.randperm(Ve, device=next_z.device)[:2]  # int64[2]
+				v_sub = v_values[idx]  # float32[2, T, H, B, 1]
+				v_mean_per_h = v_sub.min(dim=0).values  # float32[T, H, B, 1]
+				v_std_per_h = v_sub.std(dim=0)  # float32[T, H, B, 1]
+			else:
+				v_mean_per_h = v_values.mean(dim=0)
+				v_std_per_h = v_values.std(dim=0, unbiased=(Ve > 1))
 
 			td_mean_per_h = r_mean_per_h + discount * (1 - terminated) * v_mean_per_h
 			td_std_per_h = r_std_per_h + discount * v_std_per_h
@@ -895,9 +917,16 @@ class TDMPC2(torch.nn.Module):
 					if self.cfg.local_td_bootstrap:
 						td_targets = reward.unsqueeze(0) + discount * (1 - terminated.unsqueeze(0)) * q_boot
 					else:
-						q_boot_mean = q_boot.mean(dim=0)
-						q_boot_std = q_boot.std(dim=0, unbiased=(Ve > 1))
-						td_scalar = reward + discount * (1 - terminated) * (q_boot_mean + std_coef * q_boot_std)
+						if self.cfg.red_q_style_value:
+							# RedQ-style: subsample 2 Q heads, take min (pessimistic)
+							idx = torch.randperm(Ve, device=q_boot.device)[:2]  # int64[2]
+							q_sub = q_boot[idx]  # float32[2, S, B, 1]
+							q_boot_agg = q_sub.min(dim=0).values  # float32[S, B, 1]
+							q_boot_std = q_sub.std(dim=0)  # float32[S, B, 1]
+						else:
+							q_boot_agg = q_boot.mean(dim=0)
+							q_boot_std = q_boot.std(dim=0, unbiased=(Ve > 1))
+						td_scalar = reward + discount * (1 - terminated) * (q_boot_agg + std_coef * q_boot_std)
 						td_targets = td_scalar.unsqueeze(0).expand(Ve, S, B, 1)
 
 					td_mean = td_targets.mean(dim=0)  # float32[S, B, 1]

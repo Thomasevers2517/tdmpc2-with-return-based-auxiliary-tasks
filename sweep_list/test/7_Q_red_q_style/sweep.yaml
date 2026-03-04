@@ -1,0 +1,52 @@
+# Sweep test/7: Q with red_q_style_value (subsample-2 everywhere: min-of-2 TD target, avg-of-2 planner & policy)
+# Duplicate of sweep 6 but with updated code that applies subsample-2 to planner and policy too
+# 3 tasks × 3 seeds = 9 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: ['finger-turn_hard', 'dog-stand', 'dog-run']
+  seed:
+    values: [1, 2, 3]
+  steps:
+    value: 100000
+
+  # --- Fixed settings ---
+  critic_type:
+    value: Q
+  local_td_bootstrap:
+    value: false
+  red_q_style_value:
+    value: true
+
+  utd_ratio:
+    value: 1
+  value_update_freq:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 1
+  num_q:
+    value: 5
+  tau:
+    value: 0.01
+  consistency_coef:
+    value: 20
+  jacobian_correction_scale:
+    value: 0
+  buffer_update_interval:
+    value: -1
+  start_entropy_coeff:
+    value: 1e-4
+
+  # --- Standard defaults ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1

@@ -325,7 +325,7 @@ class OnlineTrainer(Trainer):
 					self.logger.log_planner_info(planner_info, self._step, category='train')
 			else:
 				action = self.env.rand_act()
-			obs, reward, done, info = self.env.step(action)
+			obs, reward, done, info = self.env.step(action) 
 			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
 			# Accumulate obs for episode diagnostics (only flat state tensors)
 			if self.cfg.episode_diag_train_freq > 0 and isinstance(obs, torch.Tensor):

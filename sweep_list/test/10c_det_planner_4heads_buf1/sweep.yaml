@@ -1,0 +1,28 @@
+# Sweep 10c: Deterministic planner + 4 dynamics heads + buffer_update_interval=1
+# 3 tasks × 4 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [hopper-hop, quadruped-walk, acrobot-swingup]
+  seed:
+    values: [1, 2, 3, 4]
+  steps:
+    value: 100000
+
+  # --- Ablation changes (vs baseline) ---
+  planner_q_candidate_action:
+    value: true
+  planner_subsample_value_heads:
+    value: false
+  planner_num_dynamics_heads:
+    value: 4
+  buffer_update_interval:
+    value: 1

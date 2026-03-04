@@ -1,0 +1,55 @@
+# Sweep 9d: buffer_update_interval=1 + planner_num_dynamics_heads=4
+# Ablation on original-matching Q baseline
+# 2 tasks × 8 seeds = 16 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: ['quadruped-walk', 'hopper-hop']
+  seed:
+    values: [1, 2, 3, 4, 5, 6, 7, 8]
+  steps:
+    value: 100000
+
+  # --- Ablation changes (vs original-matching baseline) ---
+  buffer_update_interval:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 4
+
+  # --- Original-matching Q base ---
+  critic_type:
+    value: Q
+  red_q_style_value:
+    value: true
+  normalize_rho_weights:
+    value: false
+  utd_ratio:
+    value: 1
+  value_update_freq:
+    value: 1
+  num_q:
+    value: 5
+  tau:
+    value: 0.01
+  consistency_coef:
+    value: 20
+  jacobian_correction_scale:
+    value: 0
+  start_entropy_coeff:
+    value: 1e-4
+  local_td_bootstrap:
+    value: false
+
+  # --- Standard defaults ---
+  rollout_head_strategy:
+    value: split
+  num_rollouts:
+    value: 1
