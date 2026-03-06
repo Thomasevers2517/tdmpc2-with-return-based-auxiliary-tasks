@@ -2,58 +2,25 @@
 """Parse BMPC results from JSON (DM-Control) and ZIP (Humanoid-Bench) into CSV format.
 
 Output format matches existing baselines (e.g., simbav2_parsed):
-    step,reward,seed
-    0,100.5,0
-    100000,200.3,0
+    step,reward,seed,ucb,lcb
+    0,100.5,0,120.3,80.7
+    100000,200.3,0,210.1,190.5
     ...
 
-BMPC stores aggregate stats (mean, ucbs, lcbs) rather than per-seed trajectories.
-We reconstruct pseudo-seeds from confidence bounds assuming normal distribution.
+DM-Control: BMPC reports aggregate stats (mean, ucbs, lcbs) rather than per-seed
+trajectories.  We store the mean directly as reward (single seed=0) and keep
+ucb/lcb as additional columns for honest confidence-band plotting.
+
+Humanoid-Bench: real per-seed runs are available in the ZIP.
 """
 
 import json
 import zipfile
 import pandas as pd
-import numpy as np
 from pathlib import Path
 
 
-def reconstruct_seeds_from_bounds(
-    values: list,  # Mean values per step
-    ucbs: list,    # Upper confidence bounds
-    lcbs: list,    # Lower confidence bounds
-    n_seeds: int = 5,  # Number of pseudo-seeds to generate
-) -> list[dict]:
-    """Reconstruct per-seed values from mean and confidence bounds.
-    
-    BMPC reports mean +/- margin. We assume 5 seeds and compute std from margin.
-    Generate pseudo-seeds with mean ± {-std, -0.5std, 0, +0.5std, +std}.
-    
-    Args:
-        values: List of mean values (one per step).
-        ucbs: List of upper confidence bounds.
-        lcbs: List of lower confidence bounds.
-        n_seeds: Number of pseudo-seeds to generate.
-    
-    Returns:
-        List of dicts with 'step', 'reward', 'seed' for each pseudo-seed.
-    """
-    rows = []
-    # Spread seeds evenly across [-1, 1] std range
-    spread = np.linspace(-1, 1, n_seeds)
-    
-    for i, (mean, ucb, lcb) in enumerate(zip(values, ucbs, lcbs)):
-        # Compute std from confidence bounds (symmetric around mean)
-        margin = (ucb - lcb) / 2
-        std = margin  # Approximate: treat margin as ~1 std
-        
-        for seed_idx, offset in enumerate(spread):
-            rows.append({
-                "reward": mean + offset * std,
-                "seed": seed_idx,
-            })
-    
-    return rows
+
 
 
 def parse_dmcontrol_json(json_path: Path, output_dir: Path) -> None:
@@ -67,39 +34,35 @@ def parse_dmcontrol_json(json_path: Path, output_dir: Path) -> None:
         data = json.load(f)
     
     # Get BMPC results (JSON has "BMPC" and "tdmpc2" keys)
-    bmpc_data = data.get("BMPC", {})
+    bmpc_data = data["BMPC"]
     
     for task_name, task_data in bmpc_data.items():
-        values = task_data.get("values", [])
-        steps = task_data.get("steps", [])
-        ucbs = task_data.get("ucbs", [])
-        lcbs = task_data.get("lcbs", [])
+        values = task_data["values"]
+        steps = task_data["steps"]
+        ucbs = task_data["ucbs"]
+        lcbs = task_data["lcbs"]
         
         if not values or not steps:
             print(f"  Skipping {task_name}: no data")
             continue
         
-        # Build rows for each step and seed
-        rows = []
-        n_seeds = 5  # BMPC typically uses 5 seeds
-        spread = np.linspace(-1, 1, n_seeds)
+        # Store the mean directly — no pseudo-seed fabrication.
+        # ucb/lcb are kept as extra columns for confidence-band plotting.
+        rows = [
+            {
+                "step": int(step),
+                "reward": mean,
+                "seed": 0,
+                "ucb": ucb,
+                "lcb": lcb,
+            }
+            for step, mean, ucb, lcb in zip(steps, values, ucbs, lcbs)
+        ]
         
-        for step, mean, ucb, lcb in zip(steps, values, ucbs, lcbs):
-            margin = (ucb - lcb) / 2
-            std = margin
-            
-            for seed_idx, offset in enumerate(spread):
-                rows.append({
-                    "step": int(step),
-                    "reward": mean + offset * std,
-                    "seed": seed_idx,
-                })
-        
-        # Write CSV
         df = pd.DataFrame(rows)
         csv_path = output_dir / f"{task_name}.csv"
         df.to_csv(csv_path, index=False)
-        print(f"  Wrote {csv_path.name}: {len(df)} rows, {len(steps)} steps, {n_seeds} seeds")
+        print(f"  Wrote {csv_path.name}: {len(df)} rows, {len(steps)} steps")
 
 
 def parse_humanoidbench_zip(zip_path: Path, output_dir: Path) -> None:

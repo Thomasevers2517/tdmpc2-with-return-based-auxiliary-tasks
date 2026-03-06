@@ -6,6 +6,8 @@ from typing import Any, Dict, Iterable, List, Mapping
 
 import pandas as pd
 
+from .naming import action_repeat_for_task
+
 
 class StepMissingError(RuntimeError):
     """Raised when a history row lacks any recognised step key."""
@@ -34,6 +36,9 @@ def runs_history_to_frame(
             for config_key, column in config_to_columns.items()
         }
         config_columns["run_id"] = run["run_id"]
+        # DMC logs decision steps; convert to env steps via action_repeat.
+        task_name = config.get("task", "")
+        step_multiplier = action_repeat_for_task(task_name) if task_name else 1
         for row in rows:
             if metric_key not in row:
                 continue
@@ -43,7 +48,7 @@ def runs_history_to_frame(
             step_value = _select_step(row, ordered_step_keys)
             record = {
                 **config_columns,
-                "step": step_value,
+                "step": step_value * step_multiplier,
                 metric_key: _coerce_float(metric_value, metric_key),
             }
             records.append(record)
@@ -120,3 +125,42 @@ def _coerce_float(value: Any, key: str) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     raise TypeError(f"Metric '{key}' must be numeric, received {type(value)!r}")
+
+
+def compute_ci95_bounds(
+    mean: "pd.Series | np.ndarray",
+    std: "pd.Series | np.ndarray",
+    n_samples: "pd.Series | np.ndarray",
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Compute 95% confidence interval bounds from mean, std, and sample counts.
+
+    Uses the formula: CI = mean ± 1.96 × std / √n.
+
+    For **per-task** plots, ``std`` is the seed standard deviation and ``n_samples``
+    is the number of seeds.
+
+    For **aggregate** (multi-task) plots, ``std`` should be the average per-task
+    seed standard deviation and ``n_samples`` should be ``n_seeds × n_tasks``
+    so that ``CI = mean ± 1.96 × avg_task_std / √(n_seeds × n_tasks)``.
+
+    Args:
+        mean: Mean values.  # float[N]
+        std: Standard deviation values (seed std or avg-task seed std).  # float[N]
+        n_samples: Effective sample count (n_seeds for per-task,
+            n_seeds*n_tasks for aggregate).  # int[N]
+
+    Returns:
+        Tuple of (lower_bound, upper_bound) arrays.  # (float[N], float[N])
+    """
+    import numpy as np
+
+    mean_arr = np.asarray(mean)
+    std_arr = np.nan_to_num(np.asarray(std), nan=0.0)
+    n_arr = np.asarray(n_samples)
+
+    # Standard error of the mean
+    se = std_arr / np.sqrt(np.maximum(n_arr, 1))  # Avoid div-by-zero
+    # 95% CI half-width
+    ci_half = 1.96 * se
+
+    return mean_arr - ci_half, mean_arr + ci_half

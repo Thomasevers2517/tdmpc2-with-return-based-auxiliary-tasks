@@ -3,6 +3,9 @@
 Parse SimbaV2 and EZ2 result files into TDMPC2-style CSV format.
 
 TDMPC2 format: One CSV per task with columns: step,reward,seed
+
+Note: EZ2 reports decision steps for DMC tasks.  DMC uses action_repeat=2,
+so we multiply by DMC_ACTION_REPEAT when writing env steps.
 """
 
 import csv
@@ -10,6 +13,8 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
+
+from analysis.tools.naming import DMC_ACTION_REPEAT
 
 
 def parse_simbav2_csv(input_path: str, output_dir: str) -> None:
@@ -86,15 +91,18 @@ def parse_ez2_json(input_path: str, output_dir: str) -> None:
 
     for entry in data:
         task = entry["task"]
-        xs = entry["xs"]  # steps
+        xs = entry["xs"]  # steps (decision steps for DMC)
         ys = entry["ys"]  # rewards
+
+        # All EZ2 tasks are DMC (prefixed "dmc_"); convert decision → env steps.
+        step_mult = DMC_ACTION_REPEAT if task.startswith("dmc_") else 1
 
         # Assign a unique seed ID for this run
         seed_id = task_seed_counter[task]
         task_seed_counter[task] += 1
 
         for step, reward in zip(xs, ys):
-            task_data[task].append((int(step), float(reward), seed_id))
+            task_data[task].append((int(step) * step_mult, float(reward), seed_id))
 
     # Write per-task CSVs
     for task_name, data_list in task_data.items():
