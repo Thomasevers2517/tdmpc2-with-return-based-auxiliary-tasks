@@ -105,63 +105,75 @@ def compute_values(
     r_mean_per_h = r_all.mean(dim=0)  # float32[H, B, N, T] - mean over R
     r_std_per_h = r_all.std(dim=0, unbiased=(R > 1))  # float32[H, B, N, T] - std over R
 
-    # =========== STEP 2: Get V values ===========
-    vpd = cfg.value_per_dynamics
+    # =========== STEP 2: Get critic bootstrap values ===========
+    # V-learning: V(z) directly.
+    # Q-learning default: Q(z_t, π(z_t)) — sample fresh action from policy at bootstrap state.
+    # Q-learning candidate: Q(z_{t-1}, a_{t-1}) — use pre-transition latent with the candidate
+    #   action that produced the transition, avoiding an extra π() call.
+    use_q = cfg.critic_type == 'Q'
+    q_use_candidate = use_q and cfg.planner_q_candidate_action
     if aggregate_horizon:
-        # Aggregate horizon: V at ALL intermediate states z_1, ..., z_T (single batched call)
-        # z_inter contains states after each action: z_1=next(z_0,a_0), z_2=next(z_1,a_1), etc.
-        z_inter = latents_all[:, :, :, 1:, :]                   # float32[H, B, N, T, L]
-
-        if vpd:
-            G = Ve // H  # value heads per dynamics head
-            # Expand H → Ve so each value head sees its dynamics head's latent
-            z_inter_ve = z_inter.repeat_interleave(G, dim=0)    # float32[Ve, B, N, T, L]
-            z_inter_flat = z_inter_ve.contiguous().view(Ve, B * N * T, L)
-            v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value, split_data=True)
-            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, B*N*T]
-            v_all = v_all.view(Ve, B, N, T)                     # float32[Ve, B, N, T]
-
-            # Group [Ve → H, G], compute per-group mean/std
-            v_grouped = v_all.view(H, G, B, N, T)
-            v_mean_per_h = v_grouped.mean(dim=1)                # float32[H, B, N, T]
-            v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))
+        # Aggregate horizon: bootstrap at T states per horizon τ=1..T
+        if q_use_candidate:
+            # Pre-transition: z_0..z_{T-1} paired with a_0..a_{T-1}
+            z_boot = latents_all[:, :, :, :-1, :]                # float32[H, B, N, T, L]
         else:
-            z_inter_flat = z_inter.contiguous().view(H * B * N * T, L)  # float32[H*B*N*T, L]
+            # Post-transition: z_1..z_T
+            z_boot = latents_all[:, :, :, 1:, :]                 # float32[H, B, N, T, L]
 
-            # Get V logits for ALL ensemble heads at all horizons: [Ve, H*B*N*T, K]
-            v_logits_all = world_model.V(z_inter_flat, return_type='all', target=use_ema_value)
-            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
-            v_all = v_all.view(Ve, H, B, N, T)  # float32[Ve, H, B, N, T]
+        z_boot_flat = z_boot.contiguous().view(H * B * N * T, L)
 
-            # Per dynamics head h, compute value mean and std across Ve value heads at each horizon
-            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T] - mean over Ve
-            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N, T] - std over Ve
+        if use_q:
+            if q_use_candidate:
+                a_boot = actions.unsqueeze(0).expand(H, -1, -1, -1, -1).contiguous().view(H * B * N * T, -1)
+            else:
+                a_boot, _ = world_model.pi(z_boot_flat)
+            v_logits_all = world_model.Q(z_boot_flat, a_boot, return_type='all', target=use_ema_value)
+        else:
+            v_logits_all = world_model.V(z_boot_flat, return_type='all', target=use_ema_value)
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N*T]
+        v_all = v_all.view(Ve, H, B, N, T)
+
+        if cfg.planner_subsample_value_heads:
+            # RedQ-style: subsample 2 value heads, take mean
+            idx = torch.randperm(Ve, device=device)[:2]  # int64[2]
+            v_sub = v_all[idx]  # float32[2, H, B, N, T]
+            v_mean_per_h = v_sub.mean(dim=0)  # float32[H, B, N, T]
+            v_std_per_h = v_sub.std(dim=0)  # float32[H, B, N, T]
+        else:
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N, T]
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
     else:
-        # Single horizon: V only at terminal z_T (original behavior)
-        z_last = latents_all[:, :, :, -1, :]                    # float32[H, B, N, L]
-
-        if vpd:
-            G = Ve // H
-            z_last_ve = z_last.repeat_interleave(G, dim=0)      # float32[Ve, B, N, L]
-            z_last_flat = z_last_ve.contiguous().view(Ve, B * N, L)
-            v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value, split_data=True)
-            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, B*N]
-            v_all = v_all.view(Ve, B, N)                        # float32[Ve, B, N]
-
-            v_grouped = v_all.view(H, G, B, N)
-            v_mean_per_h = v_grouped.mean(dim=1)                # float32[H, B, N]
-            v_std_per_h = v_grouped.std(dim=1, unbiased=(G > 1))
+        # Single horizon: bootstrap at one state
+        if q_use_candidate:
+            # Pre-transition: z_{T-1} paired with a_{T-1}
+            z_last = latents_all[:, :, :, -2, :]                 # float32[H, B, N, L]
         else:
-            z_last_flat = z_last.contiguous().view(H * B * N, L)    # float32[H*B*N, L]
+            # Post-transition: z_T
+            z_last = latents_all[:, :, :, -1, :]                 # float32[H, B, N, L]
 
-            # Get V logits for ALL ensemble heads: [Ve, H*B*N, K] -> [Ve, H*B*N] -> [Ve, H, B, N]
+        z_last_flat = z_last.contiguous().view(H * B * N, L)
+
+        if use_q:
+            if q_use_candidate:
+                a_boot = actions[:, :, -1, :].unsqueeze(0).expand(H, -1, -1, -1).contiguous().view(H * B * N, -1)
+            else:
+                a_boot, _ = world_model.pi(z_last_flat)
+            v_logits_all = world_model.Q(z_last_flat, a_boot, return_type='all', target=use_ema_value)
+        else:
             v_logits_all = world_model.V(z_last_flat, return_type='all', target=use_ema_value)
-            v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
-            v_all = v_all.view(Ve, H, B, N)  # float32[Ve, H, B, N]
+        v_all = math.two_hot_inv(v_logits_all, cfg).squeeze(-1)  # float32[Ve, H*B*N]
+        v_all = v_all.view(Ve, H, B, N)
 
-            # Per dynamics head h, compute value mean and std across Ve value heads
-            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N] - mean over Ve
-            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))  # float32[H, B, N] - std over Ve
+        if cfg.planner_subsample_value_heads:
+            # RedQ-style: subsample 2 value heads, take mean
+            idx = torch.randperm(Ve, device=device)[:2]  # int64[2]
+            v_sub = v_all[idx]  # float32[2, H, B, N]
+            v_mean_per_h = v_sub.mean(dim=0)  # float32[H, B, N]
+            v_std_per_h = v_sub.std(dim=0)  # float32[H, B, N]
+        else:
+            v_mean_per_h = v_all.mean(dim=0)  # float32[H, B, N]
+            v_std_per_h = v_all.std(dim=0, unbiased=(Ve > 1))
 
     # =========== STEP 3: Compute returns ===========
     if aggregate_horizon:
@@ -230,16 +242,10 @@ def compute_values(
     # =========== STEP 5: Diagnostics (per-dimension V bootstrap stds) ===========
     # Compute std of raw bootstrap V predictions across each ensemble dimension.
     # These are cheap scalar summaries for understanding disagreement sources.
-    if vpd:
-        # v_grouped: [H, G, B, N] or [H, G, B, N, T] — G = value heads per dynamics group
-        diag_v_std_ve = v_grouped.std(dim=1, unbiased=False).mean()  # float32[] - value head disagreement within group
-        diag_v_std_h = v_grouped.std(dim=0, unbiased=False).mean()   # float32[] - dynamics group disagreement
-        diag_v_std_n = v_grouped.std(dim=3, unbiased=False).mean()   # float32[] - candidate action variation
-    else:
-        # v_all: [Ve, H, B, N] or [Ve, H, B, N, T]
-        diag_v_std_ve = v_all.std(dim=0, unbiased=False).mean()  # float32[] - value head disagreement
-        diag_v_std_h = v_all.std(dim=1, unbiased=False).mean()   # float32[] - dynamics head disagreement
-        diag_v_std_n = v_all.std(dim=3, unbiased=False).mean()   # float32[] - candidate action variation
+    # v_all: [Ve, H, B, N] or [Ve, H, B, N, T]
+    diag_v_std_ve = v_all.std(dim=0, unbiased=False).mean()  # float32[] - value head disagreement
+    diag_v_std_h = v_all.std(dim=1, unbiased=False).mean()   # float32[] - dynamics head disagreement
+    diag_v_std_n = v_all.std(dim=3, unbiased=False).mean()   # float32[] - candidate action variation
 
     diagnostics = {
         'v_std_across_value_heads': diag_v_std_ve,

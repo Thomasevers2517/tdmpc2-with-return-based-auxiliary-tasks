@@ -1,0 +1,42 @@
+# Sweep: BMPC + aggregate value estimation
+# Full BMPC setup with aggregate horizon value in the planner.
+# This averages returns at each bootstrap depth τ=1..T, reducing model exploitation.
+# 3 tasks × 4 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid-walk, quadruped-walk]
+  seed:
+    values: [1, 2, 3, 4]
+  steps:
+    value: 200000
+
+  # --- BMPC architecture ---
+  critic_type:
+    value: V
+  num_q:
+    value: 2
+  red_q_style_value:
+    value: false
+
+  # --- BMPC policy ---
+  policy_optimization_method:
+    value: distillation
+  bmpc_policy_parameterization:
+    value: true
+  log_std_min:
+    value: -3
+  log_std_max:
+    value: 1
+
+  # --- Aggregate value ---
+  planner_aggregate_value:
+    value: true

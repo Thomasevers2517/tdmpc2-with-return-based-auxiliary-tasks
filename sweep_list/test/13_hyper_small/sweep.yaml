@@ -1,0 +1,30 @@
+# Sweep 13: hyper_norm with param-matched dimensions + adjusted consistency
+# enc_dim=128, mlp_dim=196 to roughly match standard TD-MPC2 param count
+# consistency_coef=200 to compensate for unit-sphere latent scale
+# 2 tasks × 6 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [quadruped-walk, dog-stand]
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
+  steps:
+    value: 100000
+  hyper_norm:
+    value: true
+  enc_dim:
+    value: 128
+  mlp_dim:
+    value: 196
+  consistency_coef:
+    value: 200
+  compile:
+    value: true

@@ -55,8 +55,21 @@ class MLPWithPrior(nn.Module):
 		self.distributional = distributional
 		self.cfg = cfg
 		
-		# Main MLP (trainable)
-		self.main_mlp = mlp(in_dim, hidden_dims, out_dim, act=act, dropout=dropout)
+		# Main MLP (trainable) — choose architecture based on hyper_norm config
+		if cfg is not None and getattr(cfg, 'hyper_norm', False):
+			hidden_dim = hidden_dims[0] if hidden_dims else in_dim
+			num_blocks = len(hidden_dims)
+			self.main_mlp = HyperNetwork(
+				in_dim=in_dim,
+				hidden_dim=hidden_dim,
+				num_blocks=num_blocks,
+				out_dim=out_dim,
+				c_shift=getattr(cfg, 'hyper_c_shift', 3.0),
+				expansion=getattr(cfg, 'hyper_expansion', 4),
+				output_act=act,
+			)
+		else:
+			self.main_mlp = mlp(in_dim, hidden_dims, out_dim, act=act, dropout=dropout)
 		
 		# Prior MLP - only if prior_scale > 0
 		# NOTE: We keep requires_grad=True (default) to avoid issues with torch.compile + vmap.
@@ -277,6 +290,279 @@ class PixelPreprocess(nn.Module):
 		return x.div(255.).sub(0.5)
 
 
+###############################################################################
+# SimbaV2-style hyperspherical normalization modules
+# Enabled via cfg.hyper_norm = True.  All standard TD-MPC2 modules above are
+# left completely untouched — world_model.py decides which set to use.
+###############################################################################
+
+
+class L2Norm(nn.Module):
+	"""ℓ₂-normalization along the last dimension.
+
+	Projects features onto the unit hypersphere:
+		x / (||x||₂ + eps)
+	"""
+	EPS: float = 1e-8
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return x / (x.norm(dim=-1, keepdim=True) + self.EPS)
+
+	def __repr__(self):
+		return "L2Norm()"
+
+
+class Scaler(nn.Module):
+	"""Learnable element-wise scaler with decoupled init/scale.
+
+	At initialization the scaler parameter is set to ``scale`` and the forward
+	pass multiplies by ``init / scale`` so the *effective* initial value is
+	``init``.  This lets the optimizer see a scale of ~1 while the forward pass
+	outputs the desired magnitude.
+
+	Args:
+		dim (int): Feature dimension.
+		init (float): Desired initial forward-pass scale.
+		scale (float): Actual parameter initialisation value.
+	"""
+
+	def __init__(self, dim: int, init: float, scale: float):
+		super().__init__()
+		self.scaler = nn.Parameter(torch.ones(dim) * scale)
+		self.register_buffer("_forward_scale", torch.tensor(init / scale))
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return self.scaler * self._forward_scale * x
+
+	def __repr__(self):
+		return f"Scaler(dim={self.scaler.shape[0]})"
+
+
+class HyperLinear(nn.Module):
+	"""Linear layer without bias, orthogonal init, projected to unit norm.
+
+	Weights are re-projected onto the unit hypersphere after each optimizer
+	step via :func:`project_hyper_weights`.
+
+	Args:
+		in_dim (int): Input features.
+		out_dim (int): Output features.
+	"""
+
+	def __init__(self, in_dim: int, out_dim: int):
+		super().__init__()
+		self.linear = nn.Linear(in_dim, out_dim, bias=False)
+		nn.init.orthogonal_(self.linear.weight)
+		self.linear._skip_global_init = True  # protect from weight_init()
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		return self.linear(x)
+
+	def __repr__(self):
+		return f"HyperLinear({self.linear.in_features}, {self.linear.out_features})"
+
+
+class HyperEmbedder(nn.Module):
+	"""SimbaV2 input embedding: shift + ℓ₂-norm + linear + scaler + ℓ₂-norm.
+
+	Concatenates a constant ``c_shift`` to the input to preserve magnitude
+	information after ℓ₂-normalization, then projects into the hidden space
+	on the unit hypersphere.
+
+	Args:
+		in_dim (int): Raw input dimension (before shift).
+		hidden_dim (int): Output / hidden dimension.
+		c_shift (float): Positive constant appended before ℓ₂-norm.
+	"""
+
+	def __init__(self, in_dim: int, hidden_dim: int, c_shift: float = 3.0):
+		super().__init__()
+		scaler_val = math.sqrt(2.0 / hidden_dim)
+		self.c_shift = c_shift
+		self.linear = HyperLinear(in_dim + 1, hidden_dim)
+		self.scaler = Scaler(hidden_dim, init=scaler_val, scale=scaler_val)
+		self.norm = L2Norm()
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		# Append c_shift constant to preserve magnitude info.
+		# x: float32[..., in_dim]
+		shift = torch.full(
+			(*x.shape[:-1], 1), self.c_shift, device=x.device, dtype=x.dtype
+		)
+		x = torch.cat([x, shift], dim=-1)       # float32[..., in_dim+1]
+		x = self.norm(x)                         # onto hypersphere
+		x = self.linear(x)                       # float32[..., hidden_dim]
+		x = self.scaler(x)
+		x = self.norm(x)                         # back onto hypersphere
+		return x
+
+	def __repr__(self):
+		return (f"HyperEmbedder(in={self.linear.linear.in_features - 1}, "
+				f"hidden={self.linear.linear.out_features}, c_shift={self.c_shift})")
+
+
+class HyperMLPBlock(nn.Module):
+	"""Inverted bottleneck MLP on the hypersphere.
+
+	Linear(d→expansion*d) → Scaler → ReLU + eps → Linear(expansion*d→d) → L2Norm
+
+	Args:
+		hidden_dim (int): Input = output dimension.
+		expansion (int): Bottleneck expansion factor (default 4).
+		scaler_init (float): Scaler init value.
+		scaler_scale (float): Scaler parameter value.
+	"""
+	EPS: float = 1e-8
+
+	def __init__(
+		self,
+		hidden_dim: int,
+		expansion: int = 4,
+		scaler_init: float = 1.0,
+		scaler_scale: float = 1.0,
+	):
+		super().__init__()
+		inner_dim = hidden_dim * expansion
+		self.w1 = HyperLinear(hidden_dim, inner_dim)
+		self.scaler = Scaler(inner_dim, init=scaler_init, scale=scaler_scale)
+		self.w2 = HyperLinear(inner_dim, hidden_dim)
+		self.norm = L2Norm()
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		x = self.w1(x)
+		x = self.scaler(x)
+		x = F.relu(x) + self.EPS  # prevent zero vector before L2-norm
+		x = self.w2(x)
+		x = self.norm(x)
+		return x
+
+
+class HyperLERPBlock(nn.Module):
+	"""LERP residual block on the hypersphere.
+
+	Combines the original feature with a non-linear transformation via
+	learnable interpolation, then re-normalises:
+		h' = L2Norm(h + α ⊙ (MLP(h) − h))
+
+	Args:
+		hidden_dim (int): Feature dimension.
+		expansion (int): MLP expansion factor.
+		scaler_init (float): MLP scaler init.
+		scaler_scale (float): MLP scaler param value.
+		alpha_init (float): LERP interpolation init.
+		alpha_scale (float): LERP interpolation param value.
+	"""
+
+	def __init__(
+		self,
+		hidden_dim: int,
+		expansion: int = 4,
+		scaler_init: float = 1.0,
+		scaler_scale: float = 1.0,
+		alpha_init: float = 0.5,
+		alpha_scale: float = 0.1,
+	):
+		super().__init__()
+		self.mlp = HyperMLPBlock(
+			hidden_dim,
+			expansion=expansion,
+			scaler_init=scaler_init / math.sqrt(expansion),
+			scaler_scale=scaler_scale / math.sqrt(expansion),
+		)
+		self.alpha = Scaler(hidden_dim, init=alpha_init, scale=alpha_scale)
+		self.norm = L2Norm()
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		residual = x
+		transformed = self.mlp(x)
+		x = residual + self.alpha(transformed - residual)
+		return self.norm(x)
+
+
+class HyperNetwork(nn.Module):
+	"""Full SimbaV2-style hyperspherical network.
+
+	Architecture: HyperEmbedder → N × HyperLERPBlock → nn.Linear → [output_act]
+
+	All scaler/alpha hyperparameters are auto-computed from ``hidden_dim``
+	and ``num_blocks`` following the SimbaV2 paper.
+
+	Args:
+		in_dim (int): Input dimension.
+		hidden_dim (int): Hidden dimension (constant across all blocks).
+		num_blocks (int): Number of LERP blocks.
+		out_dim (int): Output dimension.
+		c_shift (float): Shift constant for embedder.
+		expansion (int): MLP expansion factor.
+		output_act (nn.Module | None): Optional output activation (e.g. L2Norm).
+	"""
+
+	def __init__(
+		self,
+		in_dim: int,
+		hidden_dim: int,
+		num_blocks: int,
+		out_dim: int,
+		c_shift: float = 3.0,
+		expansion: int = 4,
+		output_act: nn.Module = None,
+	):
+		super().__init__()
+		# Auto-compute SimbaV2 hyperparameters
+		scaler_init = math.sqrt(2.0 / hidden_dim)
+		scaler_scale = math.sqrt(2.0 / hidden_dim)
+		alpha_init = 1.0 / (num_blocks + 1)
+		alpha_scale = 1.0 / math.sqrt(hidden_dim)
+
+		self.embedder = HyperEmbedder(in_dim, hidden_dim, c_shift=c_shift)
+		self.blocks = nn.Sequential(*[
+			HyperLERPBlock(
+				hidden_dim,
+				expansion=expansion,
+				scaler_init=scaler_init,
+				scaler_scale=scaler_scale,
+				alpha_init=alpha_init,
+				alpha_scale=alpha_scale,
+			)
+			for _ in range(num_blocks)
+		])
+		self.output = nn.Linear(hidden_dim, out_dim)
+		self.output_act = output_act
+
+	def forward(self, x: torch.Tensor) -> torch.Tensor:
+		x = self.embedder(x)
+		x = self.blocks(x)
+		x = self.output(x)
+		if self.output_act is not None:
+			x = self.output_act(x)
+		return x
+
+	def __repr__(self):
+		act = self.output_act.__class__.__name__ if self.output_act else "None"
+		return (f"HyperNetwork(in={self.embedder.linear.linear.in_features - 1}, "
+				f"hidden={self.output.in_features}, "
+				f"blocks={len(self.blocks)}, "
+				f"out={self.output.out_features}, "
+				f"output_act={act})")
+
+
+def project_hyper_weights(model: nn.Module, eps: float = 1e-8) -> None:
+	"""Project all HyperLinear weights onto the unit hypersphere.
+
+	Called after each optimizer step when hyper_norm is enabled.
+	Normalises each output neuron's weight vector (dim=1) to unit norm.
+
+	Args:
+		model: The model containing HyperLinear modules.
+		eps: Epsilon for numerical stability.
+	"""
+	with torch.no_grad():
+		for module in model.modules():
+			if isinstance(module, HyperLinear):
+				w = module.linear.weight  # float32[out_dim, in_dim]
+				w.div_(w.norm(dim=1, keepdim=True).clamp(min=eps))
+
+
 class SimNorm(nn.Module):
 	"""
 	Simplicial normalization.
@@ -447,11 +733,23 @@ def enc(cfg, out={}):
 	Returns:
 		nn.ModuleDict of encoders keyed by observation type ('state', 'rgb').
 	"""
+	use_hyper = getattr(cfg, 'hyper_norm', False)
 	encoder_dropout = cfg.encoder_dropout
 	for k in cfg.obs_shape.keys():
 		if k == 'state':
-			# Apply dropout at last hidden layer (before SimNorm) to allow encoder compute before noise
-			out[k] = mlp(cfg.obs_shape[k][0], max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
+			if use_hyper:
+				out[k] = HyperNetwork(
+					in_dim=cfg.obs_shape[k][0],
+					hidden_dim=cfg.enc_dim,
+					num_blocks=max(cfg.num_enc_layers - 1, 1),
+					out_dim=cfg.latent_dim,
+					c_shift=getattr(cfg, 'hyper_c_shift', 3.0),
+					expansion=getattr(cfg, 'hyper_expansion', 4),
+					output_act=L2Norm(),
+				)
+			else:
+				# Apply dropout at last hidden layer (before SimNorm) to allow encoder compute before noise
+				out[k] = mlp(cfg.obs_shape[k][0], max(cfg.num_enc_layers-1, 1)*[cfg.enc_dim], cfg.latent_dim, act=SimNorm(cfg), dropout=encoder_dropout, dropout_layer=-1)
 		elif k == 'rgb':
 			out[k] = conv(cfg.obs_shape[k], cfg.num_channels, cfg.latent_dim, act=SimNorm(cfg))
 		else:

@@ -1,0 +1,26 @@
+# Sweep 12: hyper_norm with increased consistency_coef (20 → 200)
+# Latent space on unit hypersphere has ~10x less variance than SimNorm,
+# so MSE consistency loss is ~10x smaller. Multiply coef by 10 to compensate.
+# 2 tasks × 6 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [quadruped-walk, dog-stand]
+  seed:
+    values: [1, 2, 3, 4, 5, 6]
+  steps:
+    value: 100000
+  hyper_norm:
+    value: true
+  consistency_coef:
+    value: 200
+  compile:
+    value: true

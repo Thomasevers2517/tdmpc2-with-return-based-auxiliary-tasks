@@ -136,12 +136,6 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	# dynamics rollout. This assumption only holds when imagination_horizon=1.
 	# With longer horizons, dynamics heads diverge after the first step,
 	# so heads would no longer be identical at t > 0.
-	if cfg.value_per_dynamics:
-		assert cfg.num_q % cfg.planner_num_dynamics_heads == 0, (
-			f"value_per_dynamics requires num_q ({cfg.num_q}) divisible by "
-			f"planner_num_dynamics_heads ({cfg.planner_num_dynamics_heads})."
-		)
-
 	if cfg.imagination_horizon != 1:
 		raise ValueError(
 			f"imagination_horizon={cfg.imagination_horizon} is not supported. Only imagination_horizon=1 is supported. "
@@ -197,5 +191,12 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
 	policy_ema_tau_val = cfg.get('policy_ema_tau')
 	if policy_ema_tau_val is None or policy_ema_tau_val == 'None':
 		cfg.policy_ema_tau = cfg.tau
+
+	# ----------------------------------------------------------------------
+	# planner_subsample_value_heads inheritance: if null, inherit from red_q_style_value
+	# ----------------------------------------------------------------------
+	planner_sub_val = cfg.get('planner_subsample_value_heads')
+	if planner_sub_val is None or planner_sub_val == 'None':
+		cfg.planner_subsample_value_heads = cfg.red_q_style_value
 
 	return cfg_to_dataclass(cfg)

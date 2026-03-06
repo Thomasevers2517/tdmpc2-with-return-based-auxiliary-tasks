@@ -1,0 +1,47 @@
+# Sweep: BMPC + ph6 + buf1 + dyn4 (combined)
+# Combines planner_horizon=6, aggregate_value, buffer_update_interval=1, 4 dynamics heads.
+# 3 tasks × 4 seeds = 12 runs
+
+program: tdmpc2/train.py
+project: tdmpc2-tdmpc2
+method: grid
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args_no_hyphens}
+parameters:
+  task:
+    values: [dog-run, humanoid-walk, quadruped-walk]
+  seed:
+    values: [1, 2, 3, 4]
+  steps:
+    value: 200000
+
+  # --- BMPC architecture ---
+  critic_type:
+    value: V
+  num_q:
+    value: 2
+  red_q_style_value:
+    value: false
+
+  # --- BMPC policy ---
+  policy_optimization_method:
+    value: distillation
+  bmpc_policy_parameterization:
+    value: true
+  log_std_min:
+    value: -3
+  log_std_max:
+    value: 1
+
+  # --- Combined: ph6 + aggregate + buf1 + dyn4 ---
+  planner_aggregate_value:
+    value: true
+  planner_horizon:
+    value: 6
+  buffer_update_interval:
+    value: 1
+  planner_num_dynamics_heads:
+    value: 4

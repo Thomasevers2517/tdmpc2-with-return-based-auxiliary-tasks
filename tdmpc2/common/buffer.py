@@ -171,7 +171,7 @@ class Buffer():
 			Transformed TensorDict (and info if provided).
 		"""
 		td = td.view(-1, self.cfg.horizon+1).permute(1, 0)
-		td = td.select("obs", "action", "reward", "terminated", strict=False)
+		td = td.select("obs", "action", "reward", "terminated", "expert_action_dist", strict=False)
 		if self._storage_device.type == 'cpu':
 			td = td.pin_memory()
 		if info is not None:
@@ -254,10 +254,10 @@ class Buffer():
 			self._await_prefetch()
 		if self._prefetched_td_gpu is None:
 			raise RuntimeError('Prefetch worker completed without producing a batch.')
-		obs, action, reward, terminated, indices = self._prefetched_td_gpu
+		obs, action, reward, terminated, expert_action_dist, indices = self._prefetched_td_gpu
 		self._prefetched_td_gpu = None
 		self._launch_prefetch_thread()
-		return obs, action, reward, terminated, indices
+		return obs, action, reward, terminated, expert_action_dist, indices
 
 	def _launch_prefetch_thread(self):
 		if self._buffer is None:
@@ -291,20 +291,21 @@ class Buffer():
 				# Entire batch from main buffer (with return_info=True to get indices)
 				td_cpu, info = self._buffer.sample(return_info=True)
 				td_cpu = self.transform_sample(td_cpu)  # Apply transform since we bypassed it
-				obs_cpu, action_cpu, reward_cpu, terminated_cpu, indices_cpu = self.from_td(td_cpu, info)
+				obs_cpu, action_cpu, reward_cpu, terminated_cpu, expert_action_dist_cpu, indices_cpu = self.from_td(td_cpu, info)
 
 			else:
 				# Split between main and hot buffers, then concatenate along batch dimension
 				td_main, info_main = self._buffer.sample(return_info=True)
 				td_main = self.transform_sample(td_main)
-				obs_m, act_m, rew_m, term_m, indices_m = self.from_td(td_main, info_main)
+				obs_m, act_m, rew_m, term_m, expert_m, indices_m = self.from_td(td_main, info_main)
 				td_hot = self._hot_buffer.sample()
 				td_hot = self.transform_sample(td_hot)
-				obs_h, act_h, rew_h, term_h, _ = self.from_td(td_hot, None)
+				obs_h, act_h, rew_h, term_h, expert_h, _ = self.from_td(td_hot, None)
 				obs_cpu = torch.cat([obs_m, obs_h], dim=1)
 				action_cpu = torch.cat([act_m, act_h], dim=1)
 				reward_cpu = torch.cat([rew_m, rew_h], dim=1)
 				terminated_cpu = torch.cat([term_m, term_h], dim=1)
+				expert_action_dist_cpu = torch.cat([expert_m, expert_h], dim=1)
 				# Indices only from main buffer (hot buffer indices not tracked)
 				indices_cpu = indices_m
 			with torch.cuda.stream(self._copy_stream):
@@ -312,8 +313,9 @@ class Buffer():
 				action = action_cpu.to(self._device, non_blocking=True)
 				reward = reward_cpu.to(self._device, non_blocking=True)
 				terminated = terminated_cpu.to(self._device, non_blocking=True)
+				expert_action_dist = expert_action_dist_cpu.to(self._device, non_blocking=True)
 				indices = indices_cpu  # Keep on CPU for buffer update indexing
-			self._prefetched_td_gpu = (obs, action, reward, terminated, indices)
+			self._prefetched_td_gpu = (obs, action, reward, terminated, expert_action_dist, indices)
 		except Exception as exc:  # pylint: disable=broad-except
 			self._prefetch_error = exc
 			self._prefetched_td_gpu = None
@@ -329,7 +331,7 @@ class Buffer():
 			info: Optional sampling info dict containing 'index'.
 		
 		Returns:
-			Tuple of (obs, action, reward, terminated, indices)
+			Tuple of (obs, action, reward, terminated, expert_action_dist, indices)
 			where indices is None if info not provided.
 		"""
 		obs = td.get('obs').contiguous()
@@ -339,6 +341,22 @@ class Buffer():
 			terminated = td.get('terminated')[1:].unsqueeze(-1).contiguous()
 		else:
 			terminated = torch.zeros_like(reward, device=reward.device)
+
+		# Expert action distribution: [T, B, A, 2] where [..., 0]=mean, [..., 1]=std
+		expert_action_dist_raw = td.get('expert_action_dist', None)
+		if expert_action_dist_raw is not None:
+			expert_action_dist = expert_action_dist_raw[1:].contiguous()  # [T, B, A, 2]
+			# Replace invalid samples (NaN mean or non-positive std) with N(0,1)
+			mean_nan = torch.isnan(expert_action_dist[..., 0])  # [T, B, A]
+			std_invalid = (expert_action_dist[..., 1] <= 0) | torch.isnan(expert_action_dist[..., 1])
+			invalid_mask = mean_nan | std_invalid
+			expert_action_dist[..., 0][invalid_mask] = 0.0
+			expert_action_dist[..., 1][invalid_mask] = 1.0
+		else:
+			# Create default N(0,1) if field doesn't exist
+			T, B, A = action.shape
+			expert_action_dist = torch.zeros(T, B, A, 2, device=td.device)
+			expert_action_dist[..., 1] = 1.0  # std=1
 		
 		# Extract indices from sampling info
 		if info is not None:
@@ -347,7 +365,7 @@ class Buffer():
 		else:
 			indices = None
 		
-		return obs, action, reward, terminated, indices
+		return obs, action, reward, terminated, expert_action_dist, indices
 
 	def empty(self):
 		"""Empty the buffer."""
@@ -362,4 +380,27 @@ class Buffer():
 		if self._hot_buffer is not None:
 			self._hot_buffer.empty()
 		return
+
+	def update_expert_data(self, indices, expert_action_dist):
+		"""Update expert data in buffer storage in-place for lazy reanalyze.
+
+		Synchronizes with the prefetch thread to ensure safe in-place updates.
+
+		Args:
+			indices (Tensor): Flat buffer indices to update.
+			expert_action_dist (Tensor[N, A, 2]): New expert distributions.
+		"""
+		if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+			self._prefetch_thread.join()
+		self._prefetch_thread = None
+		self._primed = False
+		self._prefetched_td_gpu = None
+
+		if torch.is_tensor(indices):
+			index_list = indices.flatten().tolist()
+		else:
+			index_list = list(indices)
+
+		# Write directly to main buffer storage (hot buffer gets fresh data naturally)
+		self._buffer._storage._storage['expert_action_dist'][index_list] = expert_action_dist.to(self._storage_device)
 
