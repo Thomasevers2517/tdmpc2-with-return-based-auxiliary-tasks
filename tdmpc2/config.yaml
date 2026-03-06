@@ -25,6 +25,9 @@ enc_dim: 256
 num_enc_layers: 2
 num_channels: 32    # Conv channels (pixel obs only)
 simnorm_dim: 8
+hyper_norm: false       # Use SimbaV2-style hyperspherical normalization
+hyper_c_shift: 3.0      # Shift constant for HyperEmbedder (concat with input)
+hyper_expansion: 4      # Expansion factor for HyperMLPBlock inverted bottleneck
 num_bins: 101
 vmin: -10
 vmax: +10
@@ -147,6 +150,18 @@ pi_num_rollouts: 1             # -1 = match num_rollouts, >0 = explicit count
 policy_value_std_coef: 0
 policy_ema_tau: null  # null = inherit from tau
 
+# --- Policy optimization method ---
+policy_optimization_method: svg  # 'svg' | 'distillation' | 'both'
+optimistic_policy_optimization_method: same  # 'same' | 'svg' | 'distillation'
+policy_svg_distill_ratio: 0.5  # When 'both': 0=pure SVG, 1=pure distill
+
+# --- Distillation (expert target from planner) ---
+initial_expert_from_behavior: true  # Use act() planner output as expert target
+fix_kl_order: false  # true: KL(expert||policy), false: KL(policy||expert)
+kl_scale_min: 1  # RunningScale min for KL normalization
+expert_std_scale: 1  # Scale applied to expert std before clamping
+min_expert_std: 0  # Floor on expert std
+
 # ===========================================================================
 #  8. Planner (MPPI / CEM)
 # ===========================================================================
@@ -167,9 +182,23 @@ mult_by_temp: true
 planner_value_std_coef_train: 0
 planner_value_std_coef_eval: 0
 planner_aggregate_value: false
+planner_horizon: -1  # -1 = use horizon; >0 = override planner horizon independently
 planner_lambda_disagreement: 0
 planner_subsample_value_heads: null  # null = inherit from red_q_style_value. true = subsample 2 heads & avg. false = avg all heads.
 planner_policy_elites_first_iter_only: false
+
+# --- Reanalyze (lazy expert target refresh) ---
+reanalyze_interval: 10  # Steps between lazy reanalyze (0=disabled)
+reanalyze_batch_size: 60  # Observations to reanalyze per interval
+reanalyze_horizon: null  # null=inherit from horizon
+reanalyze_iterations: null  # null=inherit from iterations
+reanalyze_num_samples: null  # null=inherit from num_samples
+reanalyze_num_elites: null  # null=inherit from num_elites
+reanalyze_num_pi_trajs: null  # null=inherit from num_pi_trajs
+reanalyze_temperature: null  # null=inherit from temperature
+reanalyze_value_std_coef: 0.0
+reanalyze_use_chosen_action: true
+reanalyze_slice_mode: true
 
 # ===========================================================================
 #  9. Exploration & Rollouts

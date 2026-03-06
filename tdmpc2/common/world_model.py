@@ -31,24 +31,42 @@ class WorldModel(nn.Module):
 
 		self._encoder = layers.enc(cfg)
 
+		use_hyper = getattr(cfg, 'hyper_norm', False)
+		hyper_c_shift = getattr(cfg, 'hyper_c_shift', 3.0)
+		hyper_expansion = getattr(cfg, 'hyper_expansion', 4)
+
 		# Multi-head dynamics ensemble (vmap + functional_call)
 		h_total = int(cfg.planner_num_dynamics_heads)
 		prior_hidden_div = int(cfg.prior_hidden_div)
 		value_prior_scale = float(cfg.value_prior_scale)
 		dynamics_num_layers = int(cfg.dynamics_num_layers)
 		dynamics_dropout = float(cfg.dynamics_dropout)
-		dyn_heads = [
-			nn.Sequential(
-				layers.mlp(
-					cfg.latent_dim + cfg.action_dim,
-					dynamics_num_layers * [cfg.mlp_dim],
-					cfg.latent_dim,
-					dropout=dynamics_dropout,
-				),
-				layers.SimNorm(cfg),
-			)
-			for _ in range(h_total)
-		]
+		if use_hyper:
+			dyn_heads = [
+				layers.HyperNetwork(
+					in_dim=cfg.latent_dim + cfg.action_dim,
+					hidden_dim=cfg.mlp_dim,
+					num_blocks=dynamics_num_layers,
+					out_dim=cfg.latent_dim,
+					c_shift=hyper_c_shift,
+					expansion=hyper_expansion,
+					output_act=layers.L2Norm(),
+				)
+				for _ in range(h_total)
+			]
+		else:
+			dyn_heads = [
+				nn.Sequential(
+					layers.mlp(
+						cfg.latent_dim + cfg.action_dim,
+						dynamics_num_layers * [cfg.mlp_dim],
+						cfg.latent_dim,
+						dropout=dynamics_dropout,
+					),
+					layers.SimNorm(cfg),
+				)
+				for _ in range(h_total)
+			]
 		self._dynamics_heads = layers.Ensemble(dyn_heads)
 		self._dynamics = self._dynamics_heads  # legacy alias
 
@@ -57,27 +75,71 @@ class WorldModel(nn.Module):
 		reward_hidden_dim = cfg.mlp_dim // cfg.reward_dim_div
 		num_reward_layers = cfg.num_reward_layers
 		reward_dropout = cfg.dropout if cfg.reward_dropout_enabled else 0.0
-		reward_mlps = [
-			layers.mlp(
-				cfg.latent_dim + cfg.action_dim,
-				num_reward_layers * [reward_hidden_dim],
-				max(cfg.num_bins, 1),
-				dropout=reward_dropout,
-			)
-			for _ in range(num_reward_heads)
-		]
+		if use_hyper:
+			reward_mlps = [
+				layers.HyperNetwork(
+					in_dim=cfg.latent_dim + cfg.action_dim,
+					hidden_dim=reward_hidden_dim,
+					num_blocks=num_reward_layers,
+					out_dim=max(cfg.num_bins, 1),
+					c_shift=hyper_c_shift,
+					expansion=hyper_expansion,
+				)
+				for _ in range(num_reward_heads)
+			]
+		else:
+			reward_mlps = [
+				layers.mlp(
+					cfg.latent_dim + cfg.action_dim,
+					num_reward_layers * [reward_hidden_dim],
+					max(cfg.num_bins, 1),
+					dropout=reward_dropout,
+				)
+				for _ in range(num_reward_heads)
+			]
 		self._Rs = layers.Ensemble(reward_mlps)
 
 		# Termination head
-		self._termination = layers.mlp(
-			cfg.latent_dim, num_reward_layers * [reward_hidden_dim], 1
-		) if cfg.episodic else None
+		if cfg.episodic:
+			if use_hyper:
+				self._termination = layers.HyperNetwork(
+					in_dim=cfg.latent_dim,
+					hidden_dim=reward_hidden_dim,
+					num_blocks=num_reward_layers,
+					out_dim=1,
+					c_shift=hyper_c_shift,
+					expansion=hyper_expansion,
+				)
+			else:
+				self._termination = layers.mlp(
+					cfg.latent_dim, num_reward_layers * [reward_hidden_dim], 1
+				)
+		else:
+			self._termination = None
 
 		# Policy heads
-		self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
-		self._pi_optimistic = layers.mlp(
-			cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim
-		) if cfg.dual_policy_enabled else None
+		if use_hyper:
+			self._pi = layers.HyperNetwork(
+				in_dim=cfg.latent_dim,
+				hidden_dim=cfg.mlp_dim,
+				num_blocks=2,
+				out_dim=2 * cfg.action_dim,
+				c_shift=hyper_c_shift,
+				expansion=hyper_expansion,
+			)
+			self._pi_optimistic = layers.HyperNetwork(
+				in_dim=cfg.latent_dim,
+				hidden_dim=cfg.mlp_dim,
+				num_blocks=2,
+				out_dim=2 * cfg.action_dim,
+				c_shift=hyper_c_shift,
+				expansion=hyper_expansion,
+			) if cfg.dual_policy_enabled else None
+		else:
+			self._pi = layers.mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
+			self._pi_optimistic = layers.mlp(
+				cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim
+			) if cfg.dual_policy_enabled else None
 
 		# Critic ensemble — V(z) or Q(z,a) depending on critic_type
 		critic_mlp_dim = cfg.mlp_dim // cfg.value_dim_div
@@ -105,12 +167,17 @@ class WorldModel(nn.Module):
 
 		self.apply(init.weight_init)
 		# Zero-init output layers for reward and critic heads
-		reward_output_layer_key = str(num_reward_layers)
-		critic_output_layer_key = str(num_value_layers)
+		# Key paths differ between standard MLP and HyperNetwork
+		if use_hyper:
+			reward_output_key = ("output", "weight")
+			critic_output_key = ("main_mlp", "output", "weight")
+		else:
+			reward_output_key = (str(num_reward_layers), "weight")
+			critic_output_key = ("main_mlp", str(num_value_layers), "weight")
 		critic_ensemble = self._Vs if cfg.critic_type == 'V' else self._Qs
 		init.zero_([
-			self._Rs.params[reward_output_layer_key, "weight"],
-			critic_ensemble.params["main_mlp", critic_output_layer_key, "weight"],
+			self._Rs.params[reward_output_key],
+			critic_ensemble.params[critic_output_key],
 		])
 
 		self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))

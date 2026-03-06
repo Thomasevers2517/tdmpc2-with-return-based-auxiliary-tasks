@@ -24,9 +24,10 @@ class Planner(torch.nn.Module):
         self.cfg = cfg
         self.world_model = world_model
         self.scale = scale  # reserved; scaling currently disabled
-        T, A = cfg.horizon, cfg.action_dim
+        T_plan = int(cfg.planner_horizon) if cfg.planner_horizon > 0 else int(cfg.horizon)
+        A = cfg.action_dim
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        self.register_buffer('prev_mean', torch.zeros(T, A, device=device))  # float32[T,A]
+        self.register_buffer('prev_mean', torch.zeros(T_plan, A, device=device))  # float32[T_plan,A]
 
     def reset_warm_start(self) -> None:
         self.prev_mean.zero_()
@@ -59,6 +60,7 @@ class Planner(torch.nn.Module):
         value_std_coef_override: Optional[float] = None,
         use_warm_start: bool = True,
         update_warm_start: bool = True,
+        reanalyze: bool = False,
     ) -> Tuple[torch.Tensor, Optional[PlannerBasicInfo], torch.Tensor, torch.Tensor]:
         """Plan action sequences and return the first action for each batch element.
         
@@ -72,6 +74,7 @@ class Planner(torch.nn.Module):
             value_std_coef_override: Override default value_std_coef for this call.
             use_warm_start: If True, initialize mean from shifted prev_mean (only for B=1).
             update_warm_start: If True, update prev_mean after planning (only for B=1).
+            reanalyze: If True, use reanalyze-specific config (reanalyze_num_pi_trajs, etc.).
 
         Returns:
             Tuple of:
@@ -89,10 +92,23 @@ class Planner(torch.nn.Module):
         dtype = self.prev_mean.dtype
         _, A = self.prev_mean.shape
 
-        # Planning mode config: eval vs train
-        if eval_mode:
+        # Planning mode config: reanalyze vs eval vs train
+        # Resolve planner horizon: planner_horizon > 0 overrides horizon
+        _planner_T = int(self.cfg.planner_horizon) if self.cfg.planner_horizon > 0 else int(self.cfg.horizon)
+
+        if reanalyze:
+            # Reanalyze mode: reanalyze_horizon overrides planner_horizon
+            T = int(self.cfg.reanalyze_horizon) if self.cfg.reanalyze_horizon is not None else _planner_T
+            iterations = int(self.cfg.reanalyze_iterations) if self.cfg.reanalyze_iterations is not None else int(self.cfg.iterations)
+            N = int(self.cfg.reanalyze_num_samples) if self.cfg.reanalyze_num_samples is not None else int(self.cfg.num_samples)
+            S = int(self.cfg.reanalyze_num_pi_trajs) if self.cfg.reanalyze_num_pi_trajs is not None else int(self.cfg.num_pi_trajs)
+            K = int(self.cfg.reanalyze_num_elites) if self.cfg.reanalyze_num_elites is not None else int(self.cfg.num_elites)
+            temp = float(self.cfg.reanalyze_temperature) if self.cfg.reanalyze_temperature is not None else float(self.cfg.temperature)
+            lambda_latent = 0.0  # No exploration bonus during reanalyze
+            value_std_coef = float(self.cfg.reanalyze_value_std_coef)
+        elif eval_mode:
             # Eval mode: all heads, value-only scoring
-            T = int(self.cfg.horizon)
+            T = _planner_T
             iterations = int(self.cfg.iterations)
             N = int(self.cfg.num_samples)
             S = int(self.cfg.num_pi_trajs)
@@ -102,7 +118,7 @@ class Planner(torch.nn.Module):
             value_std_coef = float(self.cfg.planner_value_std_coef_eval)
         else:
             # Training mode: full ensemble with exploration bonus
-            T = int(self.cfg.horizon)
+            T = _planner_T
             iterations = int(self.cfg.iterations)
             N = int(self.cfg.num_samples)
             S = int(self.cfg.num_pi_trajs)

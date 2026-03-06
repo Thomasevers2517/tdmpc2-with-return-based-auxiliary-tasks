@@ -6,7 +6,7 @@ from common.planner.planner import Planner
 from common.nvtx_utils import maybe_range
 from common.scale import RunningScale
 from common.world_model import WorldModel
-from common.layers import api_model_conversion
+from common.layers import api_model_conversion, project_hyper_weights
 from tensordict import TensorDict
 from common.logger import get_logger
 
@@ -115,6 +115,7 @@ class TDMPC2(torch.nn.Module):
 
 		self.model.eval()
 		self.q_scale = RunningScale(cfg, min_scale=1.0)
+		self.kl_scale = RunningScale(cfg, min_scale=float(cfg.kl_scale_min))
 
 		# Heuristic for large action spaces
 		extra_iter_thresh = int(cfg.extra_iter_action_dim_threshold)
@@ -123,6 +124,7 @@ class TDMPC2(torch.nn.Module):
 
 		self._step = 0
 		self._grad_update_count = 0  # Counts actual gradient update steps (for grad norm logging)
+		self._last_reanalyze_step = -1  # Track last step where reanalyze was run
 		self.log_detailed = None
 
 		# Frozen random encoder for KNN entropy estimation (state obs only)
@@ -163,6 +165,8 @@ class TDMPC2(torch.nn.Module):
 			self._compute_loss_components = torch.compile(self._compute_loss_components, mode=mode, fullgraph=False)
 			self.calc_pi_losses_eager = self.calc_pi_losses
 			self.calc_pi_losses = torch.compile(self.calc_pi_losses, mode=mode, fullgraph=False)
+			self.calc_pi_distillation_losses_eager = self.calc_pi_distillation_losses
+			self.calc_pi_distillation_losses = torch.compile(self.calc_pi_distillation_losses, mode=mode, fullgraph=False)
 
 			@torch.compile(mode=mode, fullgraph=False)
 			def optim_step():
@@ -182,6 +186,7 @@ class TDMPC2(torch.nn.Module):
 		else:
 			self._compute_loss_components_eager = self._compute_loss_components
 			self.calc_pi_losses_eager = self.calc_pi_losses
+			self.calc_pi_distillation_losses_eager = self.calc_pi_distillation_losses
 			self.optim_step = self.optim.step
 			self.pi_optim_step = self.pi_optim.step
 
@@ -200,6 +205,19 @@ class TDMPC2(torch.nn.Module):
 		"""
 		frac = episode_length / self.cfg.discount_denom
 		return min(max((frac - 1) / frac, self.cfg.discount_min), self.cfg.discount_max)
+
+	def _needs_expert_data(self) -> bool:
+		"""Check if expert action distributions are needed for policy optimization.
+
+		Returns:
+			bool: True if distillation is active for any policy.
+		"""
+		method = str(self.cfg.policy_optimization_method).lower()
+		opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
+		opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
+		return method in ('distillation', 'both') or (
+			self.cfg.dual_policy_enabled and opti_method in ('distillation', 'both')
+		)
 
 	def save(self, fp):
 		"""Save state dict of the agent to filepath."""
@@ -254,6 +272,43 @@ class TDMPC2(torch.nn.Module):
 			if eval_mode:
 				action_pi = info_pi['mean']
 			return action_pi[0], None
+
+	@torch.no_grad()
+	def reanalyze(self, obs):
+		"""Run planner on observations to get expert targets for policy distillation.
+
+		Uses reanalyze-specific planner settings (no warm start, separate hyperparameters).
+
+		Args:
+			obs (Tensor[B, *obs_shape]): Observations.
+
+		Returns:
+			expert_action_dist (Tensor[B, A, 2]): Expert distributions ([...,0]=mean, [...,1]=std).
+			planner_info: PlannerBasicInfo or None.
+		"""
+		self.model.eval()
+		with maybe_range('Agent/reanalyze', self.cfg):
+			z = self.model.encode(obs)  # float32[B, L]
+
+			chosen_action, planner_info, mean, std = self.planner.plan(
+				z,
+				eval_mode=False,
+				log_detailed=False,
+				train_noise_multiplier=0.0,  # No noise for expert targets
+				use_warm_start=False,
+				update_warm_start=False,
+				reanalyze=True,
+			)
+			# mean: [B, T, A], std: [B, T, A] → take first timestep
+			if self.cfg.reanalyze_use_chosen_action:
+				expert_mean = chosen_action  # float32[B, A]
+			else:
+				expert_mean = mean[:, 0, :]  # float32[B, A]
+			expert_std = std[:, 0, :]  # float32[B, A]
+			expert_std = expert_std.clamp(self.cfg.min_std, self.cfg.max_std)
+
+			expert_action_dist = torch.stack([expert_mean, expert_std], dim=-1)  # float32[B, A, 2]
+			return expert_action_dist, planner_info
 
 	# ------------------------------ Gradient logging helpers ------------------------------
 	def _grad_param_groups(self):
@@ -468,6 +523,100 @@ class TDMPC2(torch.nn.Module):
 
 			return pi_loss, info
 
+	def calc_pi_distillation_losses(self, z, expert_action_dist, optimistic=False):
+		"""Compute policy loss via KL divergence distillation from expert planner targets.
+
+		Distills the planner's action distribution into the policy via KL divergence.
+		The policy is evaluated on each dynamics head's latent independently;
+		the expert target (from planner) broadcasts across heads.
+
+		Args:
+			z (Tensor[T+1, H, B, L]): Latent states from dynamics rollout.
+			expert_action_dist (Tensor[T, B, A, 2]): Expert distributions
+				where [...,0]=mean, [...,1]=std.
+			optimistic (bool): If True, use optimistic policy and entropy coeff.
+
+		Returns:
+			Tuple[Tensor, TensorDict]: Policy loss (scalar) and info dict.
+		"""
+		assert z.ndim == 4, f"Expected z: [T+1, H, B, L], got {z.shape}"
+		assert expert_action_dist.ndim == 4, f"Expected expert: [T, B, A, 2], got {expert_action_dist.shape}"
+		T_plus_1, H, B, L = z.shape
+		T = T_plus_1 - 1
+		_, B_exp, A, _ = expert_action_dist.shape
+		assert B == B_exp, f"Batch mismatch: z has B={B}, expert has B={B_exp}"
+		assert expert_action_dist.shape[0] == T, f"Time mismatch: z has T={T}, expert has T={expert_action_dist.shape[0]}"
+
+		z_for_pi = z[:-1]  # float32[T, H, B, L]
+		z_flat = z_for_pi.reshape(T, H * B, L)  # float32[T, H*B, L]
+
+		if optimistic:
+			entropy_coeff = self.dynamic_entropy_coeff * self.cfg.optimistic_entropy_mult
+		else:
+			entropy_coeff = self.dynamic_entropy_coeff
+
+		with maybe_range('Agent/pi_distillation', self.cfg):
+			# Get policy distribution over each head's latent
+			_, info = self.model.pi(z_flat, optimistic=optimistic)
+			policy_mean = info["mean"]           # float32[T, H*B, A]
+			policy_std = info["log_std"].exp()    # float32[T, H*B, A]
+
+			# Expand expert to match H dimension: [T, B, A, 2] → [T, H*B, A, 2]
+			expert_expanded = expert_action_dist.unsqueeze(1).expand(
+				T, H, B, A, 2
+			).reshape(T, H * B, A, 2).contiguous()
+			expert_mean = expert_expanded[..., 0]  # float32[T, H*B, A]
+			expert_std = expert_expanded[..., 1]   # float32[T, H*B, A]
+
+			# Scale and clamp expert std
+			expert_std = (expert_std * self.cfg.expert_std_scale).clamp(
+				min=self.cfg.min_expert_std, max=self.cfg.max_std
+			)
+
+			# KL divergence per dimension
+			if self.cfg.fix_kl_order:
+				kl_per_dim = math.kl_div_gaussian(expert_mean, expert_std, policy_mean, policy_std)
+			else:
+				kl_per_dim = math.kl_div_gaussian(policy_mean, policy_std, expert_mean, expert_std)
+			kl_loss = kl_per_dim.mean(dim=-1, keepdim=True)  # float32[T, H*B, 1]
+
+			# Scale with RunningScale
+			self.kl_scale.update(kl_loss[0])
+			kl_scaled = self.kl_scale(kl_loss)  # float32[T, H*B, 1]
+
+			# Entropy bonus
+			entropy_term = info["scaled_entropy"]  # float32[T, H*B, 1]
+
+			# Temporal weighting
+			rho_pows = torch.pow(self.cfg.rho, torch.arange(T, device=self.device))  # float32[T]
+			if self.cfg.normalize_rho_weights:
+				rho_pows = rho_pows / rho_pows.sum()
+
+			# Loss: minimize KL, maximize entropy
+			objective = kl_scaled - entropy_coeff * entropy_term  # float32[T, H*B, 1]
+			pi_loss = (objective.mean(dim=(1, 2)) * rho_pows).mean()
+
+			info_out = TensorDict({
+				"pi_loss": pi_loss,
+				"pi_loss_weighted": pi_loss * self.cfg.policy_coef,
+				"pi_kl_loss": kl_loss.mean(),
+				"pi_kl_per_dim": kl_per_dim.mean(),
+				"pi_kl_scale": self.kl_scale.value,
+				"pi_entropy": info["entropy"].mean(),
+				"pi_scaled_entropy": info["scaled_entropy"].mean(),
+				"pi_true_entropy": info["true_entropy"].mean(),
+				"pi_true_scaled_entropy": info["true_scaled_entropy"].mean(),
+				"pi_std": info["log_std"].mean(),
+				"pi_mean": info["mean"].mean(),
+				"pi_abs_mean": info["mean"].abs().mean(),
+				"entropy_coeff": self.dynamic_entropy_coeff,
+				"entropy_coeff_effective": entropy_coeff,
+				"expert_mean_abs": expert_mean.abs().mean(),
+				"expert_std_mean": expert_std.mean(),
+			}, device=self.device)
+
+			return pi_loss, info_out
+
 	def _select_actor_latents(self, z_true, z_rollout):
 		"""Select and shape-align latents for the actor based on config.
 
@@ -503,12 +652,19 @@ class TDMPC2(torch.nn.Module):
 		z_target = _pick(self.cfg.actor_rollout_source)
 		return z_source, z_target
 
-	def update_pi(self, z_source, z_target):
-		"""Update policy using SVG (backprop through world model).
+	def update_pi(self, z_source, z_target, expert_action_dist=None):
+		"""Update policy using SVG, distillation, or both.
+
+		Dispatches based on cfg.policy_optimization_method:
+		  - 'svg': Backprop through world model (calc_pi_losses).
+		  - 'distillation': KL to expert planner targets (calc_pi_distillation_losses).
+		  - 'both': Weighted sum of SVG and distillation.
 
 		Args:
 			z_source (Tensor[T+1, H, B, L]): Latents fed to the policy.
-			z_target (Tensor[T+1, H, B, L]): Latents for objective evaluation.
+			z_target (Tensor[T+1, H, B, L]): Latents for objective evaluation (SVG path).
+			expert_action_dist (Tensor[T, B, A, 2]): Expert distributions for distillation.
+				None falls back to SVG regardless of method (used for validation).
 
 		Returns:
 			Tuple[Tensor, TensorDict]: Total policy loss and info dict.
@@ -516,15 +672,60 @@ class TDMPC2(torch.nn.Module):
 		assert z_source.ndim == 4, f"Expected z_source: [T+1, H, B, L], got {z_source.shape}"
 		log_grads = self.cfg.log_gradients_per_loss and self.log_detailed
 
-		# Pessimistic policy (SVG)
-		if not log_grads or not self.cfg.compile:
-			pi_loss, info = self.calc_pi_losses(z_source, z_target, optimistic=False)
-		else:
-			pi_loss, info = self.calc_pi_losses_eager(z_source, z_target, optimistic=False)
+		method = str(self.cfg.policy_optimization_method).lower()
+		# Fall back to SVG when expert data unavailable (e.g. validation)
+		if expert_action_dist is None and method in ('distillation', 'both'):
+			method = 'svg'
 
-		# Optimistic policy (if dual policy enabled)
+		# --- Pessimistic policy loss ---
+		if method == 'svg':
+			if not log_grads or not self.cfg.compile:
+				pi_loss, info = self.calc_pi_losses(z_source, z_target, optimistic=False)
+			else:
+				pi_loss, info = self.calc_pi_losses_eager(z_source, z_target, optimistic=False)
+		elif method == 'distillation':
+			if not log_grads or not self.cfg.compile:
+				pi_loss, info = self.calc_pi_distillation_losses(z_source, expert_action_dist, optimistic=False)
+			else:
+				pi_loss, info = self.calc_pi_distillation_losses_eager(z_source, expert_action_dist, optimistic=False)
+		elif method == 'both':
+			if not log_grads or not self.cfg.compile:
+				svg_loss, svg_info = self.calc_pi_losses(z_source, z_target, optimistic=False)
+				distill_loss, distill_info = self.calc_pi_distillation_losses(z_source, expert_action_dist, optimistic=False)
+			else:
+				svg_loss, svg_info = self.calc_pi_losses_eager(z_source, z_target, optimistic=False)
+				distill_loss, distill_info = self.calc_pi_distillation_losses_eager(z_source, expert_action_dist, optimistic=False)
+			ratio = self.cfg.policy_svg_distill_ratio
+			pi_loss = (1.0 - ratio) * svg_loss + ratio * distill_loss
+			info = svg_info
+			info['svg_distill_ratio'] = ratio
+			for k, v in distill_info.items():
+				info[f'distill_{k}'] = v
+		else:
+			raise ValueError(f"Unknown policy_optimization_method: '{method}'. Use 'svg', 'distillation', or 'both'.")
+
+		# --- Optimistic policy loss (if dual policy enabled) ---
 		if self.cfg.dual_policy_enabled:
-			opti_pi_loss, opti_info = self.calc_pi_losses(z_source, z_target, optimistic=True)
+			opti_method_cfg = str(self.cfg.optimistic_policy_optimization_method).lower()
+			opti_method = method if opti_method_cfg in ('same', 'none', '') else opti_method_cfg
+			if expert_action_dist is None and opti_method in ('distillation', 'both'):
+				opti_method = 'svg'
+
+			if opti_method == 'svg':
+				opti_pi_loss, opti_info = self.calc_pi_losses(z_source, z_target, optimistic=True)
+			elif opti_method == 'distillation':
+				opti_pi_loss, opti_info = self.calc_pi_distillation_losses(z_source, expert_action_dist, optimistic=True)
+			elif opti_method == 'both':
+				opti_svg_loss, opti_svg_info = self.calc_pi_losses(z_source, z_target, optimistic=True)
+				opti_distill_loss, opti_distill_info = self.calc_pi_distillation_losses(z_source, expert_action_dist, optimistic=True)
+				ratio = self.cfg.policy_svg_distill_ratio
+				opti_pi_loss = (1.0 - ratio) * opti_svg_loss + ratio * opti_distill_loss
+				opti_info = opti_svg_info
+				for k, v in opti_distill_info.items():
+					opti_info[f'distill_{k}'] = v
+			else:
+				raise ValueError(f"Unknown optimistic_policy_optimization_method: '{opti_method}'.")
+
 			for k, v in opti_info.items():
 				info[f'opti_{k}'] = v
 			pi_loss = pi_loss + opti_pi_loss
@@ -1146,10 +1347,11 @@ class TDMPC2(torch.nn.Module):
 			'z_rollout': z_rollout,
 		}
 
-	def _update(self, obs, action, reward, terminated, update_value=True, update_pi=True, update_world_model=True):
+	def _update(self, obs, action, reward, terminated, expert_action_dist=None, update_value=True, update_pi=True, update_world_model=True):
 		"""Single gradient update step over world model, critic, and policy.
 
 		Args:
+			expert_action_dist (Tensor[T, B, A, 2]): Expert distributions for distillation. None for SVG-only.
 			update_value: If True, compute and apply value losses.
 			update_pi: If True, update policy.
 			update_world_model: If True, compute WM losses.
@@ -1190,6 +1392,8 @@ class TDMPC2(torch.nn.Module):
 			grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
 
 			self.optim_step()
+			if self.cfg.hyper_norm:
+				project_hyper_weights(self.model)
 			self.optim.zero_grad(set_to_none=True)
 
 			# Policy update
@@ -1199,7 +1403,7 @@ class TDMPC2(torch.nn.Module):
 			pi_info = TensorDict({}, device=self.device)
 			if update_pi:
 				z_source, z_target = self._select_actor_latents(z_true, z_rollout)
-				pi_loss, pi_info = self.update_pi(z_source, z_target)
+				pi_loss, pi_info = self.update_pi(z_source, z_target, expert_action_dist=expert_action_dist)
 				pi_total = pi_loss * self.cfg.policy_coef
 				pi_total.backward()
 				if log_grads:
@@ -1212,6 +1416,8 @@ class TDMPC2(torch.nn.Module):
 				pi_grad_norm = torch.nn.utils.clip_grad_norm_(pi_params, self.cfg.grad_clip_norm)
 
 				self.pi_optim_step()
+				if self.cfg.hyper_norm:
+					project_hyper_weights(self.model)
 				self.pi_optim.zero_grad(set_to_none=True)
 
 			# Soft updates
@@ -1252,7 +1458,7 @@ class TDMPC2(torch.nn.Module):
 			dict: Dictionary of training statistics.
 		"""
 		with maybe_range('update/sample_buffer', self.cfg):
-			obs, action, reward, terminated, indices = buffer.sample()
+			obs, action, reward, terminated, expert_action_dist, indices = buffer.sample()
 
 		self._step = step
 		self.log_detailed = (self._step % self.cfg.log_detail_freq == 0) and update_value
@@ -1268,9 +1474,54 @@ class TDMPC2(torch.nn.Module):
 
 		self.dynamic_entropy_coeff.fill_(self.get_entropy_coeff(self._step))
 
+		# --- Lazy reanalyze: refresh stale expert targets before update ---
+		reanalyze_interval = int(self.cfg.reanalyze_interval)
+		should_reanalyze = (
+			reanalyze_interval > 0
+			and self._needs_expert_data()
+			and self._step % reanalyze_interval == 0
+			and self._step > 0
+			and self._step != self._last_reanalyze_step
+		)
+		if should_reanalyze:
+			self._last_reanalyze_step = self._step
+			with maybe_range('update/lazy_reanalyze', self.cfg):
+				reanalyze_batch_size = min(int(self.cfg.reanalyze_batch_size), obs.shape[1])
+				slice_mode = bool(self.cfg.reanalyze_slice_mode)
+				T_exp = expert_action_dist.shape[0]  # horizon
+
+				if slice_mode:
+					# Slice mode: fewer slices, all T_exp timesteps per slice
+					num_slices = max(1, reanalyze_batch_size // T_exp)
+					num_slices = min(num_slices, obs.shape[1])
+					# obs[:T_exp]: first T_exp timesteps, first num_slices batch entries
+					obs_reanalyze = obs[:T_exp, :num_slices].reshape(-1, *obs.shape[2:])
+					# indices shifted by 1: expert[t] → storage index at indices[t+1]
+					indices_flat = indices[1:T_exp + 1, :num_slices].reshape(-1)
+					update_shape = (T_exp, num_slices)
+				else:
+					# Independent mode: only t=0 observations
+					obs_reanalyze = obs[0, :reanalyze_batch_size]
+					indices_flat = indices[1, :reanalyze_batch_size]
+					update_shape = None
+
+				expert_action_dist_new, _ = self.reanalyze(obs_reanalyze)
+
+				# Update in-place for current training batch
+				if slice_mode:
+					expert_action_dist[:, :num_slices] = expert_action_dist_new.reshape(
+						*update_shape, -1, 2
+					)
+				else:
+					expert_action_dist[0, :reanalyze_batch_size] = expert_action_dist_new
+
+				# Update buffer storage for future samples
+				buffer.update_expert_data(indices_flat, expert_action_dist_new)
+
 		torch.compiler.cudagraph_mark_step_begin()
 
 		info = self._update(obs, action, reward, terminated,
+							expert_action_dist=expert_action_dist,
 							update_value=update_value, update_pi=update_pi,
 							update_world_model=update_world_model)
 
@@ -1357,7 +1608,7 @@ class TDMPC2(torch.nn.Module):
 		with torch.no_grad():
 			infos = []
 			for _ in range(num_batches):
-				obs, action, reward, terminated, indices = buffer.sample()
+				obs, action, reward, terminated, _, indices = buffer.sample()
 				with maybe_range('Agent/validate', self.cfg):
 					self.log_detailed = True
 					components = self._compute_loss_components(obs, action, reward, terminated, update_value=True)

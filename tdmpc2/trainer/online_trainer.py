@@ -172,7 +172,7 @@ class OnlineTrainer(Trainer):
 		result.update(diag_result)
 		return result
 
-	def to_td(self, obs, action=None, reward=None, terminated=None):
+	def to_td(self, obs, action=None, reward=None, terminated=None, expert_action_dist=None):
 		"""Creates a TensorDict for a new episode.
 		
 		Args:
@@ -180,6 +180,7 @@ class OnlineTrainer(Trainer):
 			action: Action tensor [A]. None for first step (fills with NaN).
 			reward: Reward scalar. None for first step (fills with NaN).
 			terminated: Termination flag. None for first step (fills with NaN).
+			expert_action_dist: Expert action distribution [A, 2]. None fills with NaN.
 		"""
 		if isinstance(obs, dict):
 			obs = TensorDict(obs, batch_size=())
@@ -191,11 +192,17 @@ class OnlineTrainer(Trainer):
 			reward = torch.tensor(float('nan'))
 		if terminated is None:
 			terminated = torch.tensor(float('nan'))
+		# Expert data: [A, 2] for action dist.  Fill with NaN if not provided;
+		# buffer.from_td replaces NaN with N(0,1) defaults.
+		A = action.shape[-1]
+		if expert_action_dist is None:
+			expert_action_dist = torch.full((A, 2), float('nan'))
 		td = TensorDict(
 			obs=obs,
 			action=action.unsqueeze(0),
 			reward=reward.unsqueeze(0),
 			terminated=terminated.unsqueeze(0),
+			expert_action_dist=expert_action_dist.unsqueeze(0),  # [1, A, 2]
 		batch_size=(1,))
 		return td
 
@@ -323,10 +330,28 @@ class OnlineTrainer(Trainer):
 				action = action.cpu()
 				if basic_log_flag:
 					self.logger.log_planner_info(planner_info, self._step, category='train')
+
+				# Collect expert data for distillation (reuse planner output from act())
+				if self.agent._needs_expert_data() and planner_info is not None:
+					if self.cfg.initial_expert_from_behavior:
+						# BMPC style: use planner output as expert target
+						if self.cfg.reanalyze_use_chosen_action:
+							expert_mean = action  # [A]
+						else:
+							expert_mean = planner_info.action_mean[0, :].cpu()  # [A]
+						expert_std = planner_info.action_std[0, :].cpu()  # [A]
+						expert_action_dist = torch.stack([expert_mean, expert_std], dim=-1)  # [A, 2]
+					else:
+						# Separate reanalyze call with different planner settings
+						expert_action_dist, _ = self.agent.reanalyze(obs_device)
+						expert_action_dist = expert_action_dist.squeeze(0).cpu()  # [A, 2]
+				else:
+					expert_action_dist = None
 			else:
 				action = self.env.rand_act()
+				expert_action_dist = None
 			obs, reward, done, info = self.env.step(action) 
-			self._tds.append(self.to_td(obs, action, reward, info['terminated']))
+			self._tds.append(self.to_td(obs, action, reward, info['terminated'], expert_action_dist))
 			# Accumulate obs for episode diagnostics (only flat state tensors)
 			if self.cfg.episode_diag_train_freq > 0 and isinstance(obs, torch.Tensor):
 				self._ep_obs_for_diag.append(obs)
